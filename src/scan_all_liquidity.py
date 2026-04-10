@@ -70,18 +70,16 @@ def scan_liquidity(start_date='2025-09-01'):
     cur.execute("""
         SELECT 
             e.underlying_code, e.option_type,
-            b.volume, b.open_interest,
+            e.volume, e.open_interest,
             e.spot_close, e.option_close, ABS(e.delta) as abs_delta
         FROM mart_option_daily_enriched e
-        JOIN stg_option_daily_bar b 
-            ON e.trade_date = b.trade_date AND e.option_code = b.option_code
         WHERE ABS(e.delta) < 0.15 AND ABS(e.delta) > 0.01
             AND e.option_close >= 0.5
             AND e.dte BETWEEN 15 AND 90
             AND e.trade_date >= ?
             AND ((e.option_type = 'P' AND e.moneyness < 1.0) 
                  OR (e.option_type = 'C' AND e.moneyness > 1.0))
-            AND b.volume IS NOT NULL AND b.open_interest IS NOT NULL
+            AND e.volume IS NOT NULL AND e.open_interest IS NOT NULL
     """, (start_date,))
 
     product_data = defaultdict(lambda: {
