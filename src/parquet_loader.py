@@ -21,6 +21,13 @@ import numpy as np
 import pandas as pd
 import pyarrow.dataset as ds
 
+# 尝试导入 DuckDB（查询 Parquet 比 PyArrow Scanner 快 3-10 倍）
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
 logger = logging.getLogger(__name__)
 
 # 默认 Parquet 数据目录
@@ -713,36 +720,52 @@ class ParquetDayLoader:
             logger.warning("  构建 row_group 索引失败 %s: %s", filename, exc)
             return []
 
-    def _load_day_from_dataset(self, dataset, date_str, rg_index=None,
-                                parquet_filename=None):
+    def _load_day_from_dataset(self, dataset, date_str, parquet_filename=None):
         """
-        从 dataset 加载某一交易日的数据。
+        从 Parquet 加载某一交易日的数据。
 
-        关键优化：Parquet 按品种分区（每个 row_group 覆盖全部日期），
-        不能用 row_group 索引跳过。改用 Scanner 流式过滤：
-        逐 batch 扫描，只保留目标日期的行，峰值内存 = 1 个 batch 大小。
+        优先用 DuckDB（并行扫描+列裁剪，比 PyArrow Scanner 快 3-10 倍），
+        fallback 到 PyArrow Scanner（流式过滤，不会 OOM）。
         """
-        if dataset is None:
+        if dataset is None and parquet_filename is None:
             return pd.DataFrame()
 
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         next_date_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        try:
-            # 用 Scanner 流式过滤：PyArrow 在 C++ 层面逐 batch 扫描+过滤，
-            # 只有匹配的行才会进入 Python 内存
-            scanner = dataset.scanner(
-                filter=(
-                    (ds.field("datetime") >= f"{date_str} 00:00") &
-                    (ds.field("datetime") < f"{next_date_str} 00:00")
-                ),
-                batch_size=1_000_000,  # 每批 100 万行，控制峰值内存
-            )
-            table = scanner.to_table()
-            return table.to_pandas()
-        except Exception as exc:
-            logger.warning("  加载 %s 数据失败: %s", date_str, exc)
-            return pd.DataFrame()
+        # 方法1：DuckDB（推荐，并行扫描最快）
+        if HAS_DUCKDB and parquet_filename:
+            path = os.path.join(self.data_dir, parquet_filename)
+            if os.path.exists(path):
+                try:
+                    conn = duckdb.connect()
+                    df = conn.execute(f"""
+                        SELECT * FROM read_parquet('{path}')
+                        WHERE datetime >= '{date_str} 00:00'
+                          AND datetime < '{next_date_str} 00:00'
+                    """).fetchdf()
+                    conn.close()
+                    if len(df) > 0:
+                        return df
+                except Exception as exc:
+                    logger.warning("  DuckDB 加载失败，fallback: %s", exc)
+
+        # 方法2：PyArrow Scanner（流式过滤，不会 OOM）
+        if dataset is not None:
+            try:
+                scanner = dataset.scanner(
+                    filter=(
+                        (ds.field("datetime") >= f"{date_str} 00:00") &
+                        (ds.field("datetime") < f"{next_date_str} 00:00")
+                    ),
+                    batch_size=1_000_000,
+                )
+                table = scanner.to_table()
+                return table.to_pandas()
+            except Exception as exc:
+                logger.warning("  PyArrow 加载 %s 失败: %s", date_str, exc)
+
+        return pd.DataFrame()
 
         return df
 
@@ -772,8 +795,9 @@ class ParquetDayLoader:
         Returns:
             DaySlice
         """
-        # 期权（最大的文件，用 Scanner 流式过滤）
-        opt_df = self._load_day_from_dataset(self._opt_ds, date_str)
+        # 期权（最大的文件，用 DuckDB 并行扫描）
+        opt_df = self._load_day_from_dataset(
+            self._opt_ds, date_str, parquet_filename=OPTION_PARQUET)
         if len(opt_df) > 0:
             opt_df = self._convert_numeric(
                 opt_df,
@@ -783,7 +807,8 @@ class ParquetDayLoader:
             opt_df = opt_df[opt_df["close"] > 0].copy()
 
         # 期货
-        fut_df = self._load_day_from_dataset(self._fut_ds, date_str)
+        fut_df = self._load_day_from_dataset(
+            self._fut_ds, date_str, parquet_filename=FUTURE_PARQUET)
         if len(fut_df) > 0:
             fut_df = self._convert_numeric(
                 fut_df,
@@ -793,7 +818,8 @@ class ParquetDayLoader:
             fut_df = fut_df[fut_df["close"] > 0].copy()
 
         # ETF
-        etf_df = self._load_day_from_dataset(self._etf_ds, date_str)
+        etf_df = self._load_day_from_dataset(
+            self._etf_ds, date_str, parquet_filename=ETF_PARQUET)
         if len(etf_df) > 0:
             etf_df = self._convert_numeric(
                 etf_df,
