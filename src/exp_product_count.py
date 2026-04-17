@@ -21,11 +21,38 @@ plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
 from scan_all_liquidity import scan_liquidity, PRODUCT_SPECS, NAME_MAP, EXCHANGE_LIMITS, DEFAULT_COMMODITY_LIMIT
-from unified_engine_v3 import run_unified_v3, stats, S4_PRODUCTS
+try:
+    from unified_engine_v3 import run_unified_v3, stats, S4_PRODUCTS
+except ImportError:
+    run_unified_v3 = None
+    stats = None
+    S4_PRODUCTS = ["中证1000", "沪金", "原油", "沪铜"]
 from backtest_fast import estimate_margin
 
 # ── 品种映射表：root -> (where_clause, name, mult, mr, liq_category) ──────────
 # 复用 exp_expanded_products.py 中验证过的 WHERE 子句模式
+
+# 品种→交易所映射（用于保证金公式区分）
+EXCHANGE_OF = {
+    'HS300': 'CFFEX', 'CSI1000': 'CFFEX', 'SSE50': 'CFFEX',
+    'm': 'DCE', 'i': 'DCE', 'c': 'DCE', 'a': 'DCE', 'b': 'DCE',
+    'p': 'DCE', 'v': 'DCE', 'y': 'DCE', 'l': 'DCE', 'pp': 'DCE',
+    'eb': 'DCE', 'eg': 'DCE', 'pg': 'DCE', 'jd': 'DCE', 'lh': 'DCE',
+    'jm': 'DCE', 'cs': 'DCE',
+    'au': 'SHFE', 'ag': 'SHFE', 'cu': 'SHFE', 'al': 'SHFE',
+    'rb': 'SHFE', 'ru': 'SHFE', 'ni': 'SHFE', 'zn': 'SHFE',
+    'sn': 'SHFE', 'ao': 'SHFE', 'br': 'SHFE',
+    'sc': 'INE',
+    'SA': 'CZCE', 'TA': 'CZCE', 'MA': 'CZCE', 'FG': 'CZCE',
+    'SR': 'CZCE', 'CF': 'CZCE', 'SM': 'CZCE', 'SF': 'CZCE',
+    'SH': 'CZCE', 'UR': 'CZCE', 'RM': 'CZCE', 'OI': 'CZCE',
+    'PK': 'CZCE', 'AP': 'CZCE', 'CJ': 'CZCE', 'PX': 'CZCE', 'PF': 'CZCE',
+    'si': 'GFEX', 'lc': 'GFEX',
+    # ETF期权
+    '510300_SSE': 'SSE', '510050_SSE': 'SSE', '510500_SSE': 'SSE',
+    '588000_SSE': 'SSE',
+    '159919_SZSE': 'SZSE', '159915_SZSE': 'SZSE',
+}
 
 PRODUCT_MAP = {
     # 金融
@@ -85,6 +112,14 @@ PRODUCT_MAP = {
     # 广期所
     'si': ("underlying_code LIKE 'si2%' OR underlying_code LIKE 'si26%'", "工业硅", 5, 0.05, "commodity_low"),
     'lc': ("underlying_code LIKE 'lc2%' OR underlying_code LIKE 'lc26%'", "碳酸锂", 1, 0.05, "commodity_high"),
+    # ETF期权（SSE）
+    '510300_SSE': ("contract_code LIKE 'SSE.%' AND product = '华泰柏瑞沪深300ETF'", "300ETF沪", 10000, 0.12, "etf"),
+    '510050_SSE': ("contract_code LIKE 'SSE.%' AND product = '华夏上证50ETF'", "50ETF", 10000, 0.12, "etf"),
+    '510500_SSE': ("contract_code LIKE 'SSE.%' AND product = '南方中证500ETF'", "500ETF沪", 10000, 0.12, "etf"),
+    '588000_SSE': ("contract_code LIKE 'SSE.%' AND product = '华夏上证科创板50ETF'", "科创50ETF华夏", 10000, 0.12, "etf"),
+    # ETF期权（SZSE）
+    '159919_SZSE': ("contract_code LIKE 'SZSE.%' AND product = '嘉实沪深300ETF'", "300ETF深", 10000, 0.12, "etf"),
+    '159915_SZSE': ("contract_code LIKE 'SZSE.%' AND product = '易方达创业板ETF'", "创业板ETF", 10000, 0.12, "etf"),
 }
 
 
@@ -165,11 +200,18 @@ def estimate_practical_capacity(pool, margin_per=0.02, s1_max_hands=20, s3_sell_
     }
 
 
-def scan_and_rank(sort_by="volume"):
+def scan_and_rank(sort_by="volume", end_date=None):
     """扫描所有品种，按指定指标从大到小排序
     sort_by: "volume"=日均成交量, "oi"=日均持仓量
+    end_date: 截止日期（用于动态品种池，避免幸存者偏差）
     """
-    results = scan_liquidity()
+    # 用截止end_date前6个月的数据
+    if end_date:
+        sd = pd.Timestamp(end_date) - pd.DateOffset(months=6)
+        start_date = sd.strftime("%Y-%m-%d")
+    else:
+        start_date = None  # 不限制，用全部数据
+    results = scan_liquidity(start_date=start_date, end_date=end_date)
     ranked = []
     for r in results:
         root = r['root']
@@ -189,6 +231,7 @@ def scan_and_rank(sort_by="volume"):
             'call_oi': r['call_oi'],
             'effective_limit': r['effective_limit'],
             'avg_spot': r['avg_spot'],
+            'exchange': EXCHANGE_OF.get(root, 'UNKNOWN'),
             'product_tuple': (where, name, mult, mr, liq),
         })
     if sort_by == "oi":
@@ -198,7 +241,7 @@ def scan_and_rank(sort_by="volume"):
     return ranked
 
 
-def run_experiment(ranked, n_values, start_date="2024-01-01"):
+def run_experiment(ranked, n_values, start_date=None):
     """对每个 N 值运行回测，收集结果"""
     results = []
     for n in n_values:
@@ -487,6 +530,9 @@ def generate_report(ranked, results, output_dir, sort_by="volume", sort_tag="vol
 
 
 def main(sort_by="volume"):
+    """
+    参数: sort_by
+    """
     sort_label = "日均持仓量(Put+Call)" if sort_by == "oi" else "日均成交量(Put+Call)"
     sort_tag = "oi" if sort_by == "oi" else "vol"
     output_dir = "容量和品种预估/output"

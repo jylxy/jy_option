@@ -11,7 +11,7 @@ import re
 import statistics
 from collections import defaultdict
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "benchmark_wind.db")
+DB_PATH = os.environ.get("OPTION_DB_PATH", "benchmark.db")
 
 # 品种名称映射
 NAME_MAP = {
@@ -57,30 +57,47 @@ DEFAULT_COMMODITY_LIMIT = 2000  # 商品期权默认限仓
 
 
 def extract_root(underlying_code):
+    """
+    参数: underlying_code
+    """
     if underlying_code in ('HS300', 'CSI1000', 'SSE50'):
         return underlying_code
     m = re.match(r'^([a-zA-Z]+)', underlying_code)
     return m.group(1) if m else underlying_code
 
 
-def scan_liquidity(start_date='2025-09-01'):
+def scan_liquidity(start_date=None, end_date=None):
+    """
+    参数: start_date, end_date
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    cur.execute("""
+    date_filter = ""
+    params = []
+    if start_date:
+        date_filter += "AND e.trade_date >= ?"
+        params.append(start_date)
+    if end_date:
+        date_filter += " AND e.trade_date <= ?"
+        params.append(end_date)
+
+    cur.execute(f"""
         SELECT 
             e.underlying_code, e.option_type,
-            e.volume, e.open_interest,
+            b.volume, b.open_interest,
             e.spot_close, e.option_close, ABS(e.delta) as abs_delta
         FROM mart_option_daily_enriched e
+        JOIN stg_option_daily_bar b 
+            ON e.option_code = b.option_code AND e.trade_date = b.trade_date
         WHERE ABS(e.delta) < 0.15 AND ABS(e.delta) > 0.01
             AND e.option_close >= 0.5
             AND e.dte BETWEEN 15 AND 90
-            AND e.trade_date >= ?
+            {date_filter}
             AND ((e.option_type = 'P' AND e.moneyness < 1.0) 
                  OR (e.option_type = 'C' AND e.moneyness > 1.0))
-            AND e.volume IS NOT NULL AND e.open_interest IS NOT NULL
-    """, (start_date,))
+            AND b.volume IS NOT NULL AND b.open_interest IS NOT NULL
+    """, params)
 
     product_data = defaultdict(lambda: {
         'put_vol': [], 'put_oi': [], 'call_vol': [], 'call_oi': [],
@@ -136,6 +153,9 @@ def scan_liquidity(start_date='2025-09-01'):
 
 
 def print_report(results):
+    """
+    参数: results
+    """
     print("=" * 105)
     print("  全品种深虚值期权流动性排名")
     print("  条件：|delta|<0.15, 权利金>=0.5, DTE 15-90天, 最近半年数据")

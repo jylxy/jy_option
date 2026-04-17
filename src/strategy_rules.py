@@ -22,33 +22,59 @@ DEFAULT_PARAMS = {
     "s3_margin_cap": 0.25,
     "s1_tp": 0.40,
     "s3_tp": 0.30,
-    "s3_ratio": 3,
+    "s3_ratio_candidates": [2, 3],       # S3买卖比例候选（优先小比例）
+    "s3_buy_otm_pct": 5.0,               # S3买腿目标OTM%
+    "s3_sell_otm_pct": 10.0,             # S3卖腿目标OTM%
+    "s3_protect_otm_pct": 15.0,          # S3保护腿目标OTM%
+    "s3_buy_otm_range": (3.0, 7.0),      # S3买腿OTM%筛选范围
+    "s3_sell_otm_range": (7.0, 13.0),    # S3卖腿OTM%筛选范围
+    "s3_protect_otm_range": (12.0, 20.0),# S3保护腿OTM%筛选范围
+    "s3_net_premium_tolerance": 0.3,     # 零成本容忍度（允许亏损买腿成本的30%）
+    "s3_protect_trigger_otm_pct": 5.0,   # 应急保护触发阈值（卖腿OTM%降至此值以下）
     "s4_prem": 0.005,
     "s4_max_hands": 5,
-    "s4_max_hold": 15,  # S4最长持仓天数（15天，避免Theta加速衰减）
+    "s4_max_hold": 30,  # S4 fallback持仓天数（主要用DTE<10退出）
     "iv_inverse": True,
     "iv_window": 252,
     "iv_min_periods": 60,
     "iv_threshold": 75,
-    "iv_open_threshold": 80,  # IV分位>此值时暂停S1/S3新开仓（含止盈重开）
+    "iv_open_threshold": 80,
     "dte_target": 35,
     "dte_min": 15,
     "dte_max": 90,
     "tp_min_dte": 5,
     "reopen_min_dte": 10,
     "expiry_dte": 1,
-    "fee": 14,
-    "slippage": 0.002,  # 默认滑点（use_t1_vwap=False时使用）
-    "use_t1_vwap": False,  # T+1 VWAP需要pending队列架构，当前默认关闭
+    "fee": 3,
+    "vwap_window": 10,
+    "hedge_enabled": True,
+    "hedge_scope": "family_net",
+    "hedge_rebalance": "daily_t1_vwap",
+    "hedge_target_cash_delta_pct": 0.0,
+    "hedge_rounding": "min_abs_residual",
+    "hedge_cost_mode": "none",
+    "greeks_vega_warn": 0.015,
+    "greeks_vega_hard": 0.02,
+    "greeks_delta_hard": 0.20,
+    # Greeks风控阈值
+    "greeks_vega_warn": 0.015,   # Cash Vega预警（1.5% NAV）
+    "greeks_vega_hard": 0.02,    # Cash Vega硬止损（2% NAV）
+    "greeks_delta_hard": 0.20,   # Cash Delta硬止损（20% NAV）
+    # 品种准入
+    "product_min_listing_days": 180,
+    "product_min_daily_oi": 500,
+    "product_observation_months": 3,
 }
 
 
 # ── 合约选择函数 ──────────────────────────────────────────────────────────────
 
-def select_s1_sell(day_df, option_type, mult, mr):
+def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0):
     """
     S1卖腿选择：深虚值、|delta|<0.15、premium>=0.5、效率最高
 
+    min_volume: 最低日成交量（0=不过滤）
+    min_oi: 最低持仓量（0=不过滤）
     返回: pd.Series (选中的行) 或 None
     """
     if option_type == "P":
@@ -67,6 +93,13 @@ def select_s1_sell(day_df, option_type, mult, mr):
             (day_df["delta"] < 0.15) &
             (day_df["option_close"] >= 0.5)
         ]
+    if c.empty:
+        return None
+    # 流动性过滤
+    if min_volume > 0 and "volume" in c.columns:
+        c = c[c["volume"] >= min_volume]
+    if min_oi > 0 and "open_interest" in c.columns:
+        c = c[c["open_interest"] >= min_oi]
     if c.empty:
         return None
     c = c.copy()
@@ -207,6 +240,114 @@ def select_s3_protect(day_df, option_type, sell_strike, spot):
     return c.loc[c["d"].idxmin()]
 
 
+# ── S3 OTM%选腿函数（v2）────────────────────────────────────────────────────
+
+def select_s3_buy_by_otm(day_df, option_type, spot_close,
+                          target_otm_pct=5.0, otm_range=(3.0, 7.0),
+                          min_premium=0.5):
+    """S3买腿选择（v2）：按OTM%筛选，选最接近target_otm_pct的合约
+
+    参数:
+        day_df: 当日该品种该到期日的期权数据
+        option_type: "P" 或 "C"
+        spot_close: 标的收盘价（同月期货价格）
+        target_otm_pct: 目标OTM%，默认5.0
+        otm_range: OTM%筛选范围，默认(3.0, 7.0)
+        min_premium: 最低权利金，默认0.5
+    返回: pd.Series（选中行）或 None
+    """
+    if spot_close <= 0:
+        return None
+    df = day_df.copy()
+    df["otm_pct"] = abs(1 - df["strike"] / spot_close) * 100
+    if option_type == "P":
+        c = df[(df["option_type"] == "P") &
+               (df["strike"] < spot_close) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    else:
+        c = df[(df["option_type"] == "C") &
+               (df["strike"] > spot_close) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    if c.empty:
+        return None
+    c = c.copy()
+    c["dist"] = (c["otm_pct"] - target_otm_pct).abs()
+    return c.loc[c["dist"].idxmin()]
+
+
+def select_s3_sell_by_otm(day_df, option_type, spot_close, buy_strike,
+                           target_otm_pct=10.0, otm_range=(7.0, 13.0),
+                           min_premium=0.5):
+    """S3卖腿选择（v2）：按OTM%筛选，比买腿更虚值，选权利金最高
+
+    参数:
+        buy_strike: 买腿行权价，卖腿必须比买腿更虚值
+        其余同 select_s3_buy_by_otm
+    返回: pd.Series（选中行）或 None
+    """
+    if spot_close <= 0:
+        return None
+    df = day_df.copy()
+    df["otm_pct"] = abs(1 - df["strike"] / spot_close) * 100
+    if option_type == "P":
+        c = df[(df["option_type"] == "P") &
+               (df["strike"] < spot_close) &
+               (df["strike"] < buy_strike) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    else:
+        c = df[(df["option_type"] == "C") &
+               (df["strike"] > spot_close) &
+               (df["strike"] > buy_strike) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    if c.empty:
+        return None
+    return c.loc[c["option_close"].idxmax()]
+
+
+def select_s3_protect_by_otm(day_df, option_type, spot_close, sell_strike,
+                              target_otm_pct=15.0, otm_range=(12.0, 20.0),
+                              min_premium=0.1):
+    """S3保护腿选择（v2）：应急保护触发时，按OTM%筛选，比卖腿更虚值，选最接近target
+
+    参数:
+        sell_strike: 卖腿行权价，保护腿必须比卖腿更虚值
+        min_premium: 最低权利金，默认0.1（保护腿可以更便宜）
+        其余同 select_s3_buy_by_otm
+    返回: pd.Series（选中行）或 None
+    """
+    if spot_close <= 0:
+        return None
+    df = day_df.copy()
+    df["otm_pct"] = abs(1 - df["strike"] / spot_close) * 100
+    if option_type == "P":
+        c = df[(df["option_type"] == "P") &
+               (df["strike"] < spot_close) &
+               (df["strike"] < sell_strike) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    else:
+        c = df[(df["option_type"] == "C") &
+               (df["strike"] > spot_close) &
+               (df["strike"] > sell_strike) &
+               (df["otm_pct"] >= otm_range[0]) &
+               (df["otm_pct"] <= otm_range[1]) &
+               (df["option_close"] >= min_premium)]
+    if c.empty:
+        return None
+    c = c.copy()
+    c["dist"] = (c["otm_pct"] - target_otm_pct).abs()
+    return c.loc[c["dist"].idxmin()]
+
+
 def select_s4(day_df, option_type):
     """
     S4尾部对冲选择：最深虚值，premium>=0.1
@@ -258,6 +399,46 @@ def calc_s4_size(nav, s4_prem, n_s4_products, cost_per_hand, max_hands=5):
     budget = nav * s4_prem / n_s4_products / 2
     qty = max(1, int(budget / cost_per_hand))
     return min(qty, max_hands)
+
+
+def calc_s3_size_v2(nav, margin_per, sell_margin, buy_premium,
+                     sell_premium, mult, iv_scale,
+                     ratio_candidates=(2, 3), net_premium_tolerance=0.3):
+    """
+    S3手数计算（v2）：灵活比例 + 零成本进场约束
+
+    先尝试小比例(1:2)，若净权利金不够覆盖买腿成本再尝试大比例(1:3)。
+    返回 (buy_qty, sell_qty, chosen_ratio) 或 None（无法满足零成本约束时）
+    """
+    if sell_margin <= 0 or buy_premium <= 0 or sell_premium <= 0:
+        return None
+    for ratio in sorted(ratio_candidates):
+        buy_qty = max(1, int(nav * margin_per / 2 * iv_scale
+                             / (sell_margin * ratio)))
+        sell_qty = buy_qty * ratio
+        # 零成本检查：net_premium = sell收入 - buy成本
+        buy_cost = buy_premium * mult * buy_qty
+        sell_income = sell_premium * mult * sell_qty
+        net_premium = sell_income - buy_cost
+        # 容忍范围：net_premium >= -buy_cost × tolerance
+        if net_premium >= -buy_cost * net_premium_tolerance:
+            return buy_qty, sell_qty, ratio
+    return None
+
+
+def check_emergency_protect(sell_strike, spot_close, option_type,
+                             trigger_otm_pct=5.0):
+    """
+    检查卖腿是否接近平值，需要触发应急保护。
+
+    当卖腿OTM%降至trigger_otm_pct以下时返回True。
+    Put端：spot下跌使put卖腿接近平值
+    Call端：spot上涨使call卖腿接近平值
+    """
+    if spot_close <= 0:
+        return False
+    current_otm_pct = abs(1 - sell_strike / spot_close) * 100
+    return current_otm_pct < trigger_otm_pct
 
 
 # ── IV分位数 ──────────────────────────────────────────────────────────────────

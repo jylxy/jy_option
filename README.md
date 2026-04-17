@@ -1,79 +1,87 @@
-# 服务器部署包
+# 服务器部署包（分钟级回测引擎 v2）
 
 从整个项目中提取的最小可运行文件集，用于在公司服务器上回测。
 
-## 项目演进脉络
+**当前主引擎**: `minute_backtest.py`（分钟级VWAP执行 + Greeks监控 + 买卖价差模拟）
+**数据源**: `option_daily_agg.db` + `contract_master.db`（服务器IT团队已准备好清洗后的分钟级聚合数据）
 
-```
-Week1 (4.2-4.10)  数据+波动率基础设施
-  └─ week1/src/volatility.py ← 基础模块，至今仍被依赖
-      │
-Week2 (4.13-4.17)  基础假设验证
-  └─ week2/src/backtest_fast.py ← estimate_margin()至今仍被所有引擎调用
-      │
-Week3 (4.20-4.24)  参数优化（10个实验）
-      │
-Week4 (4.27-5.3)   日频引擎v3 + 全面验证
-  └─ week4/src/strategy_engine_v3.py ← 核心层单策略引擎（已验证）
-      │
-子策略研究 (5月)    S1/S2/S3/S4独立验证
-      │
-组合策略 (5月)      S1+S3+S4三策略组合
-  └─ 组合策略/src/unified_engine_v3.py ← 三策略组合引擎
-      │
-容量和品种预估       品种扫描+容量分析
-  └─ 容量和品种预估/src/exp_product_count.py ← PRODUCT_MAP + scan_and_rank()
-  └─ 容量和品种预估/src/scan_all_liquidity.py ← 流动性扫描
-      │
-策略生成订单及逐日回测  消除前视偏差 + T+1执行
-  └─ strategy_rules.py ← 策略规则（无状态函数，规范版）
-  └─ daily_backtest_t1vwap.py ← ★最新回测引擎（T+1 VWAP执行）
-      │
-提升夏普和卡玛       IV过滤、S4改进等优化研究
-  └─ exp_s4_improve.py ← S4从2品种扩到20品种+15天持仓限制
-      │
-模拟盘              实盘运营系统
-  └─ run_daily.py ← 每日订单生成器
-```
+> ⚠️ 旧版日频引擎 `daily_backtest_t1vwap.py` 已弃用，保留在 src/ 中仅供参考。
 
-## 最新版本文件清单
-
-### 核心引擎（必须）
-| 文件 | 来源 | 说明 |
-|------|------|------|
-| src/daily_backtest_t1vwap.py | 策略生成订单及逐日回测/ | ★最新回测引擎，T+1 VWAP执行 |
-| src/strategy_rules.py | 策略生成订单及逐日回测/ | 策略规则（合约选择、仓位计算、止盈等） |
-| src/backtest_fast.py | week2/ | estimate_margin() + load_product_data() |
-| src/exp_product_count.py | 容量和品种预估/ | PRODUCT_MAP + scan_and_rank() |
-| src/scan_all_liquidity.py | 容量和品种预估/ | 流动性扫描（被exp_product_count依赖） |
-
-### 数据适配（Wind MySQL → SQLite）
-| 文件 | 说明 |
-|------|------|
-| src/build_enriched_from_wind.py | 从Wind MySQL构建benchmark_wind.db |
-| src/verify_data.py | 验证构建结果 |
-
-### 组合引擎（参考）
-| 文件 | 来源 | 说明 |
-|------|------|------|
-| src/unified_engine_v3.py | 组合策略/ | 三策略组合引擎（S1+S3+S4） |
-
-### 文档
-| 文件 | 说明 |
-|------|------|
-| docs/strategy_spec.md | 策略完整规格书 |
-| docs/组合策略规则.md | 三策略组合规则 |
-| config.json | 策略参数配置 |
-
-## 运行步骤
+## 运行方式
 
 ```bash
-# 1. 构建数据库（从Wind MySQL读取，生成SQLite）
-python3 src/build_enriched_from_wind.py
+# 标准运行（使用聚合数据库，默认VWAP 10分钟窗口）
+python src/minute_backtest.py --start 2024-01-01
 
-# 2. 验证数据
-python3 src/verify_data.py
+# 指定VWAP窗口和执行方法
+python src/minute_backtest.py --start 2024-01-01 --vwap-window 15 --exec-method twap
 
-# 3. 运行回测
-python3 src/daily_backtest_t1vwap.py
+# 启用盘中止盈
+python src/minute_backtest.py --start 2024-01-01 --intraday-tp
+
+# 退化为旧版benchmark.db模式（对比基准）
+python src/minute_backtest.py --start 2024-01-01 --no-agg-db
+
+# 禁用对冲层
+python src/minute_backtest.py --start 2024-01-01 --no-hedge
+```
+
+## 数据源说明
+
+服务器IT团队已准备好清洗后的分钟级数据，聚合为以下数据库：
+
+| 数据库 | 说明 |
+|--------|------|
+| `option_daily_agg.db` | 期权日频聚合数据（OHLCV + 分时段VWAP + 买卖价差代理） |
+| `contract_master.db` | 合约属性（行权价、到期日、期权类型、乘数、标的代码） |
+
+引擎自动从聚合数据库计算 IV/Delta/Gamma/Vega/Theta（BSM模型），不再依赖 `benchmark.db`。
+
+## 文件清单
+
+### 核心引擎（当前版本）
+
+| 文件 | 说明 |
+|------|------|
+| `src/minute_backtest.py` | ★ 主回测引擎（分钟级VWAP执行、T+1订单模拟、Greeks监控、对冲层、压力测试） |
+| `src/strategy_rules.py` | 策略规则（合约选择、仓位计算、止盈、S3 v2 OTM%选腿函数） |
+| `src/option_calc.py` | IV反推 + Greeks批量计算（BSM模型，支持向量化加速） |
+| `src/data_loader_v2.py` | 聚合数据库加载器（替代旧版 load_product_data，自算IV/Greeks） |
+| `src/correlation_monitor.py` | 品种相关性监控（相关性矩阵、板块集中度、有效分散度、尾部相关性） |
+| `src/backtest_fast.py` | 基础工具（estimate_margin 按交易所区分公式、load_product_data） |
+| `src/exp_product_count.py` | 品种映射表 PRODUCT_MAP（含ETF期权）+ scan_and_rank / scan_and_rank_v2 |
+| `src/scan_all_liquidity.py` | 全品种深虚值期权流动性扫描 |
+
+### 配置与文档
+
+| 文件 | 说明 |
+|------|------|
+| `config.json` | 策略参数配置（v2.0_minute_greeks） |
+| `docs/strategy_spec.md` | 策略完整规格书（v2.1） |
+| `docs/组合策略规则.md` | 三策略组合规则 |
+
+### 旧版文件（已弃用，仅供参考）
+
+| 文件 | 说明 |
+|------|------|
+| `src/daily_backtest_t1vwap.py` | [已弃用] 旧版日频回测引擎（T+1 VWAP执行，基于 benchmark.db） |
+| `src/daily_backtest.py` | [已弃用] 更早期的日频回测引擎 |
+| `src/unified_engine_v3.py` | [已弃用] 三策略组合引擎（S1+S3+S4） |
+| `src/build_enriched_from_wind.py` | [已弃用] 从Wind MySQL构建 benchmark_wind.db |
+| `src/verify_data.py` | [已弃用] 验证 benchmark.db 数据 |
+
+## 版本演进
+
+```
+日频引擎 v1 (daily_backtest.py)
+  └─ 日频引擎 v2 (daily_backtest_t1vwap.py)  ← T+1 VWAP执行
+      └─ ★ 分钟级引擎 v2 (minute_backtest.py)  ← 当前版本
+           - 数据源: option_daily_agg.db + contract_master.db
+           - 执行: 精确窗口VWAP（5/10/15/30分钟可选）
+           - 新增: 自算IV/Greeks、买卖价差模拟、成交量约束
+           - 新增: 组合Greeks实时监控 + 压力测试矩阵
+           - 新增: 品种相关性 + 板块集中度监控
+           - 新增: S3 v2 OTM%选腿 + 应急蝶式保护
+           - 新增: 按交易所区分保证金公式
+           - 新增: ETF期权品种支持
 ```
