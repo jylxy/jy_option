@@ -724,8 +724,10 @@ class ParquetDayLoader:
         """
         从 Parquet 加载某一交易日的数据。
 
-        优先用 DuckDB（并行扫描+列裁剪，比 PyArrow Scanner 快 3-10 倍），
-        fallback 到 PyArrow Scanner（流式过滤，不会 OOM）。
+        优先级：
+        1. 分区文件（partitioned/xxx/date=YYYY-MM-DD.parquet）→ < 1 秒
+        2. DuckDB 全量扫描 → 10-60 秒
+        3. PyArrow Scanner fallback → 2-5 分钟
         """
         if dataset is None and parquet_filename is None:
             return pd.DataFrame()
@@ -733,7 +735,25 @@ class ParquetDayLoader:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         next_date_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 方法1：DuckDB（推荐，并行扫描最快）
+        # 方法1：分区文件（最快）
+        if parquet_filename:
+            data_type = parquet_filename.replace("1MINRESULT.parquet", "").lower()
+            # 映射文件名到分区目录名
+            type_map = {"option": "option", "future": "futures", "etf": "etf"}
+            part_type = type_map.get(data_type, data_type)
+            part_path = os.path.join(
+                self.data_dir, "partitioned", part_type,
+                f"date={date_str}.parquet"
+            )
+            if os.path.exists(part_path):
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(part_path)
+                    return table.to_pandas()
+                except Exception as exc:
+                    logger.warning("  分区文件读取失败 %s: %s", part_path, exc)
+
+        # 方法2：DuckDB 全量扫描
         if HAS_DUCKDB and parquet_filename:
             path = os.path.join(self.data_dir, parquet_filename)
             if os.path.exists(path):
@@ -750,7 +770,7 @@ class ParquetDayLoader:
                 except Exception as exc:
                     logger.warning("  DuckDB 加载失败，fallback: %s", exc)
 
-        # 方法2：PyArrow Scanner（流式过滤，不会 OOM）
+        # 方法3：PyArrow Scanner fallback
         if dataset is not None:
             try:
                 scanner = dataset.scanner(
