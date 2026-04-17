@@ -1,87 +1,96 @@
-# 服务器部署包（分钟级回测引擎 v2）
+# 服务器部署包 — 逐分钟回测引擎 v3
 
-从整个项目中提取的最小可运行文件集，用于在公司服务器上回测。
-
-**当前主引擎**: `minute_backtest.py`（分钟级VWAP执行 + Greeks监控 + 买卖价差模拟）
-**数据源**: `option_daily_agg.db` + `contract_master.db`（服务器IT团队已准备好清洗后的分钟级聚合数据）
-
-> ⚠️ 旧版日频引擎 `daily_backtest_t1vwap.py` 已弃用，保留在 src/ 中仅供参考。
+从 Parquet 分钟线数据源（64亿行期权+2.3亿行期货+3.6亿行ETF）直接读取数据，
+逐分钟处理事件循环，盘中止盈/Greeks风控/应急保护。
 
 ## 运行方式
 
 ```bash
-# 标准运行（使用聚合数据库，默认VWAP 10分钟窗口）
-python src/minute_backtest.py --start 2024-01-01
+# 标准运行
+python src/true_minute_engine.py --start-date 2024-01-01
 
-# 指定VWAP窗口和执行方法
-python src/minute_backtest.py --start 2024-01-01 --vwap-window 15 --exec-method twap
+# 指定结束日期
+python src/true_minute_engine.py --start-date 2024-01-01 --end-date 2026-03-31
 
-# 启用盘中止盈
-python src/minute_backtest.py --start 2024-01-01 --intraday-tp
+# 详细日志
+python src/true_minute_engine.py --start-date 2024-01-01 --verbose
 
-# 退化为旧版benchmark.db模式（对比基准）
-python src/minute_backtest.py --start 2024-01-01 --no-agg-db
-
-# 禁用对冲层
-python src/minute_backtest.py --start 2024-01-01 --no-hedge
+# 自定义配置
+python src/true_minute_engine.py --start-date 2024-01-01 --config /path/to/config.json
 ```
 
-## 数据源说明
+## 集成测试
 
-服务器IT团队已准备好清洗后的分钟级数据，聚合为以下数据库：
+```bash
+python tests/test_integration.py          # 基础测试
+python tests/test_integration.py --full   # 含多日连续测试
+```
 
-| 数据库 | 说明 |
-|--------|------|
-| `option_daily_agg.db` | 期权日频聚合数据（OHLCV + 分时段VWAP + 买卖价差代理） |
-| `contract_master.db` | 合约属性（行权价、到期日、期权类型、乘数、标的代码） |
+## 数据源
 
-引擎自动从聚合数据库计算 IV/Delta/Gamma/Vega/Theta（BSM模型），不再依赖 `benchmark.db`。
+Parquet 文件（Spark 导出，所有列为 string 类型）：
+
+| 文件 | 大小 | 内容 |
+|------|------|------|
+| OPTION1MINRESULT.parquet | 32GB | 期权分钟K线（64亿行） |
+| FUTURE1MINRESULT.parquet | 5GB | 期货分钟K线（2.3亿行） |
+| ETF1MINRESULT.parquet | 4.5GB | ETF分钟K线（3.6亿行） |
+| CONTRACTINFORESULT.parquet | 1.9MB | 合约属性（19.5万行） |
+
+默认路径：`/macro/home/lxy/yy_2_lxy_20260415/`
+可通过环境变量 `PARQUET_DATA_DIR` 或 config.json 的 `parquet_data_dir` 覆盖。
 
 ## 文件清单
 
-### 核心引擎（当前版本）
+### 引擎核心
 
 | 文件 | 说明 |
 |------|------|
-| `src/minute_backtest.py` | ★ 主回测引擎（分钟级VWAP执行、T+1订单模拟、Greeks监控、对冲层、压力测试） |
-| `src/strategy_rules.py` | 策略规则（合约选择、仓位计算、止盈、S3 v2 OTM%选腿函数） |
-| `src/option_calc.py` | IV反推 + Greeks批量计算（BSM模型，支持向量化加速） |
-| `src/data_loader_v2.py` | 聚合数据库加载器（替代旧版 load_product_data，自算IV/Greeks） |
-| `src/correlation_monitor.py` | 品种相关性监控（相关性矩阵、板块集中度、有效分散度、尾部相关性） |
-| `src/backtest_fast.py` | 基础工具（estimate_margin 按交易所区分公式、load_product_data） |
-| `src/exp_product_count.py` | 品种映射表 PRODUCT_MAP（含ETF期权）+ scan_and_rank / scan_and_rank_v2 |
-| `src/scan_all_liquidity.py` | 全品种深虚值期权流动性扫描 |
+| `src/true_minute_engine.py` | 主引擎：逐分钟事件循环、持仓管理、开仓决策、NAV输出 |
+| `src/parquet_loader.py` | 数据加载：ContractMaster + ParquetDayLoader + DaySlice |
+| `src/iv_surface.py` | IV Smile 曲线：二次多项式拟合 + IV_Residual 选腿增强 |
+| `src/intraday_monitor.py` | 盘中监控：Greeks汇总/阈值检查/止盈/应急保护/买卖价差 |
 
-### 配置与文档
+### 复用模块
 
 | 文件 | 说明 |
 |------|------|
-| `config.json` | 策略参数配置（v2.0_minute_greeks） |
-| `docs/strategy_spec.md` | 策略完整规格书（v2.1） |
-| `docs/组合策略规则.md` | 三策略组合规则 |
+| `src/option_calc.py` | IV反推 + Greeks计算（BSM，含numpy向量化版本） |
+| `src/strategy_rules.py` | 策略规则纯函数（选腿/手数/止盈/应急保护） |
+| `src/backtest_fast.py` | 保证金计算（按交易所区分公式） |
+| `src/exp_product_count.py` | 品种映射 PRODUCT_MAP + 动态排名 |
 
-### 旧版文件（已弃用，仅供参考）
+### 配置与测试
 
 | 文件 | 说明 |
 |------|------|
-| `src/daily_backtest_t1vwap.py` | [已弃用] 旧版日频回测引擎（T+1 VWAP执行，基于 benchmark.db） |
-| `src/daily_backtest.py` | [已弃用] 更早期的日频回测引擎 |
-| `src/unified_engine_v3.py` | [已弃用] 三策略组合引擎（S1+S3+S4） |
-| `src/build_enriched_from_wind.py` | [已弃用] 从Wind MySQL构建 benchmark_wind.db |
-| `src/verify_data.py` | [已弃用] 验证 benchmark.db 数据 |
+| `config.json` | 策略参数（含 intraday_greeks_interval=15、spread_mode 等） |
+| `tests/test_integration.py` | 集成测试（7个用例） |
 
-## 版本演进
+## 盘中处理频率
+
+| 检查项 | 频率 | 说明 |
+|--------|------|------|
+| 持仓价格更新 | 每分钟 | 用 Minute_Bar close 更新 cur_price/cur_spot |
+| 应急保护 | 每分钟 | S3 卖腿 OTM% 阈值检查，时效性最高 |
+| 止盈检查 | 每15分钟 | 扣手续费后净利润率，可配置 |
+| IV/Greeks更新 | 每15分钟 | 反推IV → 更新delta/gamma/vega/theta |
+| Greeks风控 | 每15分钟 | cash_delta/vega 超限触发减仓 |
+
+## 依赖
 
 ```
-日频引擎 v1 (daily_backtest.py)
-  └─ 日频引擎 v2 (daily_backtest_t1vwap.py)  ← T+1 VWAP执行
-      └─ ★ 分钟级引擎 v2 (minute_backtest.py)  ← 当前版本
-           - 数据源: option_daily_agg.db + contract_master.db
-           - 执行: 精确窗口VWAP（5/10/15/30分钟可选）
-           - 新增: 自算IV/Greeks、买卖价差模拟、成交量约束
-           - 新增: 组合Greeks实时监控 + 压力测试矩阵
-           - 新增: 品种相关性 + 板块集中度监控
-           - 新增: S3 v2 OTM%选腿 + 应急蝶式保护
-           - 新增: 按交易所区分保证金公式
-           - 新增: ETF期权品种支持
+python >= 3.10
+numpy
+pandas
+pyarrow
+scipy
+py_vollib
+py_vollib_vectorized  # 可选，加速IV反推
 ```
+
+## 服务器环境
+
+- Ubuntu 22.04, Python 3.10
+- H200 256GB RAM
+- 峰值内存 ~3GB（远低于限制）

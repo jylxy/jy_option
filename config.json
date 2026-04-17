@@ -47,6 +47,14 @@
   "greeks_vega_hard": 0.02,
   "greeks_delta_hard": 0.20,
 
+  "intraday_greeks_interval": 15,
+  "spread_mode": "tick",
+  "spread_pct": 0.002,
+  "s1_sl": null,
+  "s3_sl": null,
+  "s4_intraday_tp": null,
+  "parquet_data_dir": null,
+
   "products_top_n": 20,
   "products_sort_by": "oi",
   "product_min_listing_days": 180,
