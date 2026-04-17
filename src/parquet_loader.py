@@ -767,7 +767,9 @@ class ParquetDayLoader:
         """
         获取所有交易日期列表（升序）。
 
-        从期货数据的 datetime 列提取唯一日期（期货数据量最小，扫描最快）。
+        优化策略：
+        1. 先尝试从 Parquet row_group 元数据提取日期范围（最快，~1秒）
+        2. fallback: 只读 datetime 列，用 PyArrow compute 在 Arrow 层面去重（~30秒）
         结果缓存，只计算一次。
         """
         if self._trading_dates is not None:
@@ -777,23 +779,69 @@ class ParquetDayLoader:
         dates_set = set()
 
         # 优先从期货数据提取（数据量最小）
-        target_ds = self._fut_ds or self._opt_ds
-        if target_ds is None:
-            logger.warning("  无可用 dataset，返回空列表")
-            self._trading_dates = []
-            return []
+        target_path = os.path.join(self.data_dir, FUTURE_PARQUET)
+        if not os.path.exists(target_path):
+            target_path = os.path.join(self.data_dir, OPTION_PARQUET)
 
         try:
-            # 只读 datetime 列，提取日期部分
+            import pyarrow.parquet as pq
+            import pyarrow.compute as pc
+
+            # 方法1：从 row_group 元数据提取（极快）
+            pf = pq.ParquetFile(target_path)
+            for i in range(pf.metadata.num_row_groups):
+                rg = pf.metadata.row_group(i)
+                for j in range(rg.num_columns):
+                    col = rg.column(j)
+                    if col.path_in_schema == "datetime":
+                        if col.statistics and col.statistics.has_min_max:
+                            min_val = str(col.statistics.min)[:10]
+                            max_val = str(col.statistics.max)[:10]
+                            if len(min_val) == 10:
+                                dates_set.add(min_val)
+                            if len(max_val) == 10:
+                                dates_set.add(max_val)
+                        break
+
+            if len(dates_set) > 100:
+                # row_group 元数据足够，生成完整日期范围
+                # 但 row_group 只给了 min/max，中间日期需要补全
+                # 用 pandas 生成工作日序列
+                import pandas as pd
+                min_d = min(dates_set)
+                max_d = max(dates_set)
+                all_bdays = pd.bdate_range(min_d, max_d).strftime("%Y-%m-%d").tolist()
+                self._trading_dates = all_bdays
+                logger.info("  从元数据推断: %d 个工作日: %s ~ %s",
+                            len(self._trading_dates), min_d, max_d)
+                return self._trading_dates
+
+            # 方法2：读 datetime 列，Arrow 层面提取唯一日期前缀
+            logger.info("  元数据不足，扫描 datetime 列...")
+            target_ds = self._fut_ds or self._opt_ds
+            if target_ds is None:
+                self._trading_dates = []
+                return []
+
             table = target_ds.to_table(columns=["datetime"])
-            dt_col = table.column("datetime").to_pylist()
-            for dt_str in dt_col:
-                if dt_str and len(str(dt_str)) >= 10:
-                    dates_set.add(str(dt_str)[:10])
+            dt_arr = table.column("datetime")
+            # 用 Arrow compute 截取前10个字符（日期部分）
+            date_arr = pc.utf8_slice_codeunits(dt_arr, 0, 10)
+            unique_dates = pc.unique(date_arr).to_pylist()
+            dates_set = {str(d) for d in unique_dates if d and len(str(d)) == 10}
+
         except Exception as exc:
             logger.error("  扫描交易日失败: %s", exc)
-            self._trading_dates = []
-            return []
+            # 最终 fallback：逐行提取
+            try:
+                target_ds = self._fut_ds or self._opt_ds
+                if target_ds:
+                    table = target_ds.to_table(columns=["datetime"])
+                    for val in table.column("datetime").to_pylist():
+                        if val and len(str(val)) >= 10:
+                            dates_set.add(str(val)[:10])
+            except Exception:
+                pass
 
         self._trading_dates = sorted(dates_set)
         logger.info("  共 %d 个交易日: %s ~ %s",
