@@ -718,9 +718,9 @@ class ParquetDayLoader:
         """
         从 dataset 加载某一交易日的数据。
 
-        优化策略：
-        1. 如果有 rg_index，先筛选包含目标日期的 row_group，只读这些 row_group
-        2. fallback: 用 dataset filter（慢，但兼容）
+        关键优化：Parquet 按品种分区（每个 row_group 覆盖全部日期），
+        不能用 row_group 索引跳过。改用 Scanner 流式过滤：
+        逐 batch 扫描，只保留目标日期的行，峰值内存 = 1 个 batch 大小。
         """
         if dataset is None:
             return pd.DataFrame()
@@ -728,44 +728,17 @@ class ParquetDayLoader:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         next_date_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 方法1：用 row_group 索引精确读取（快 10-50 倍）
-        if rg_index and parquet_filename:
-            import pyarrow.parquet as pq
-
-            # 找出包含目标日期的 row_group
-            target_rgs = [
-                rg_i for rg_i, min_d, max_d in rg_index
-                if min_d <= date_str <= max_d
-            ]
-
-            if target_rgs:
-                path = os.path.join(self.data_dir, parquet_filename)
-                try:
-                    pf = pq.ParquetFile(path)
-                    tables = []
-                    for rg_i in target_rgs:
-                        t = pf.read_row_group(rg_i)
-                        tables.append(t)
-
-                    import pyarrow as pa
-                    combined = pa.concat_tables(tables)
-                    df = combined.to_pandas()
-
-                    # 在内存中精确过滤日期
-                    mask = (df["datetime"] >= f"{date_str} 00:00") & \
-                           (df["datetime"] < f"{next_date_str} 00:00")
-                    return df[mask].reset_index(drop=True)
-                except Exception as exc:
-                    logger.warning("  row_group 读取失败，fallback: %s", exc)
-
-        # 方法2：fallback — dataset filter
         try:
-            table = dataset.to_table(
+            # 用 Scanner 流式过滤：PyArrow 在 C++ 层面逐 batch 扫描+过滤，
+            # 只有匹配的行才会进入 Python 内存
+            scanner = dataset.scanner(
                 filter=(
                     (ds.field("datetime") >= f"{date_str} 00:00") &
                     (ds.field("datetime") < f"{next_date_str} 00:00")
-                )
+                ),
+                batch_size=1_000_000,  # 每批 100 万行，控制峰值内存
             )
+            table = scanner.to_table()
             return table.to_pandas()
         except Exception as exc:
             logger.warning("  加载 %s 数据失败: %s", date_str, exc)
@@ -799,12 +772,8 @@ class ParquetDayLoader:
         Returns:
             DaySlice
         """
-        # 期权（最大的文件，优化最关键）
-        opt_df = self._load_day_from_dataset(
-            self._opt_ds, date_str,
-            rg_index=self._opt_rg_index,
-            parquet_filename=OPTION_PARQUET
-        )
+        # 期权（最大的文件，用 Scanner 流式过滤）
+        opt_df = self._load_day_from_dataset(self._opt_ds, date_str)
         if len(opt_df) > 0:
             opt_df = self._convert_numeric(
                 opt_df,
@@ -814,11 +783,7 @@ class ParquetDayLoader:
             opt_df = opt_df[opt_df["close"] > 0].copy()
 
         # 期货
-        fut_df = self._load_day_from_dataset(
-            self._fut_ds, date_str,
-            rg_index=self._fut_rg_index,
-            parquet_filename=FUTURE_PARQUET
-        )
+        fut_df = self._load_day_from_dataset(self._fut_ds, date_str)
         if len(fut_df) > 0:
             fut_df = self._convert_numeric(
                 fut_df,
@@ -828,11 +793,7 @@ class ParquetDayLoader:
             fut_df = fut_df[fut_df["close"] > 0].copy()
 
         # ETF
-        etf_df = self._load_day_from_dataset(
-            self._etf_ds, date_str,
-            rg_index=self._etf_rg_index,
-            parquet_filename=ETF_PARQUET
-        )
+        etf_df = self._load_day_from_dataset(self._etf_ds, date_str)
         if len(etf_df) > 0:
             etf_df = self._convert_numeric(
                 etf_df,
