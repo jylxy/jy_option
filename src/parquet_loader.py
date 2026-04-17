@@ -738,20 +738,29 @@ class ParquetDayLoader:
         # 方法1：分区文件（最快）
         if parquet_filename:
             data_type = parquet_filename.replace("1MINRESULT.parquet", "").lower()
-            # 映射文件名到分区目录名
             type_map = {"option": "option", "future": "futures", "etf": "etf"}
             part_type = type_map.get(data_type, data_type)
-            part_path = os.path.join(
-                self.data_dir, "partitioned", part_type,
-                f"date={date_str}.parquet"
-            )
-            if os.path.exists(part_path):
+            part_base = os.path.join(self.data_dir, "partitioned", part_type)
+
+            # DuckDB PARTITION_BY 格式: trade_date=YYYY-MM-DD/data_0.parquet
+            duckdb_dir = os.path.join(part_base, f"trade_date={date_str}")
+            if os.path.isdir(duckdb_dir):
                 try:
                     import pyarrow.parquet as pq
-                    table = pq.read_table(part_path)
+                    table = pq.read_table(duckdb_dir)
                     return table.to_pandas()
                 except Exception as exc:
-                    logger.warning("  分区文件读取失败 %s: %s", part_path, exc)
+                    logger.warning("  分区目录读取失败 %s: %s", duckdb_dir, exc)
+
+            # 旧格式兼容: date=YYYY-MM-DD.parquet
+            legacy_path = os.path.join(part_base, f"date={date_str}.parquet")
+            if os.path.exists(legacy_path):
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(legacy_path)
+                    return table.to_pandas()
+                except Exception as exc:
+                    logger.warning("  分区文件读取失败 %s: %s", legacy_path, exc)
 
         # 方法2：DuckDB 全量扫描
         if HAS_DUCKDB and parquet_filename:
