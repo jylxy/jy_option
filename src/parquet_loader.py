@@ -653,6 +653,15 @@ class ParquetDayLoader:
         self._fut_ds = self._open_dataset(FUTURE_PARQUET)
         self._etf_ds = self._open_dataset(ETF_PARQUET)
 
+        # 构建 row_group 日期索引（只读元数据，< 1 秒）
+        logger.info("构建 row_group 日期索引...")
+        self._opt_rg_index = self._build_rg_index(OPTION_PARQUET)
+        self._fut_rg_index = self._build_rg_index(FUTURE_PARQUET)
+        self._etf_rg_index = self._build_rg_index(ETF_PARQUET)
+        logger.info("  期权: %d 个 row_group, 期货: %d, ETF: %d",
+                     len(self._opt_rg_index), len(self._fut_rg_index),
+                     len(self._etf_rg_index))
+
         # 缓存交易日列表
         self._trading_dates = None
 
@@ -673,20 +682,83 @@ class ParquetDayLoader:
             logger.error("  打开 Parquet 失败: %s — %s", path, exc)
             return None
 
-    def _load_day_from_dataset(self, dataset, date_str):
+    def _build_rg_index(self, filename):
+        """
+        构建 row_group → 日期范围索引，用于快速定位目标日期的 row_group。
+
+        返回: list of (rg_index, min_date_str, max_date_str)
+        只需扫描元数据（不读数据），32GB 文件 < 1 秒。
+        """
+        import pyarrow.parquet as pq
+
+        path = os.path.join(self.data_dir, filename)
+        if not os.path.exists(path):
+            return []
+
+        try:
+            pf = pq.ParquetFile(path)
+            index = []
+            for i in range(pf.metadata.num_row_groups):
+                rg = pf.metadata.row_group(i)
+                for j in range(rg.num_columns):
+                    col = rg.column(j)
+                    if col.path_in_schema == "datetime":
+                        if col.statistics and col.statistics.has_min_max:
+                            min_d = str(col.statistics.min)[:10]
+                            max_d = str(col.statistics.max)[:10]
+                            index.append((i, min_d, max_d))
+                        break
+            return index
+        except Exception as exc:
+            logger.warning("  构建 row_group 索引失败 %s: %s", filename, exc)
+            return []
+
+    def _load_day_from_dataset(self, dataset, date_str, rg_index=None,
+                                parquet_filename=None):
         """
         从 dataset 加载某一交易日的数据。
 
-        使用 string 比较做谓词下推：
-          datetime >= '{date_str} 00:00' AND datetime < '{next_date} 00:00'
+        优化策略：
+        1. 如果有 rg_index，先筛选包含目标日期的 row_group，只读这些 row_group
+        2. fallback: 用 dataset filter（慢，但兼容）
         """
         if dataset is None:
             return pd.DataFrame()
 
-        # 计算次日日期
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         next_date_str = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
+        # 方法1：用 row_group 索引精确读取（快 10-50 倍）
+        if rg_index and parquet_filename:
+            import pyarrow.parquet as pq
+
+            # 找出包含目标日期的 row_group
+            target_rgs = [
+                rg_i for rg_i, min_d, max_d in rg_index
+                if min_d <= date_str <= max_d
+            ]
+
+            if target_rgs:
+                path = os.path.join(self.data_dir, parquet_filename)
+                try:
+                    pf = pq.ParquetFile(path)
+                    tables = []
+                    for rg_i in target_rgs:
+                        t = pf.read_row_group(rg_i)
+                        tables.append(t)
+
+                    import pyarrow as pa
+                    combined = pa.concat_tables(tables)
+                    df = combined.to_pandas()
+
+                    # 在内存中精确过滤日期
+                    mask = (df["datetime"] >= f"{date_str} 00:00") & \
+                           (df["datetime"] < f"{next_date_str} 00:00")
+                    return df[mask].reset_index(drop=True)
+                except Exception as exc:
+                    logger.warning("  row_group 读取失败，fallback: %s", exc)
+
+        # 方法2：fallback — dataset filter
         try:
             table = dataset.to_table(
                 filter=(
@@ -694,7 +766,7 @@ class ParquetDayLoader:
                     (ds.field("datetime") < f"{next_date_str} 00:00")
                 )
             )
-            df = table.to_pandas()
+            return table.to_pandas()
         except Exception as exc:
             logger.warning("  加载 %s 数据失败: %s", date_str, exc)
             return pd.DataFrame()
@@ -719,24 +791,34 @@ class ParquetDayLoader:
         """
         加载某一交易日的全部分钟数据。
 
+        使用 row_group 索引加速：只读包含目标日期的 row_group，
+        而不是扫描整个 32GB 文件。
+
         Args:
             date_str: "YYYY-MM-DD"
         Returns:
             DaySlice
         """
-        # 期权
-        opt_df = self._load_day_from_dataset(self._opt_ds, date_str)
+        # 期权（最大的文件，优化最关键）
+        opt_df = self._load_day_from_dataset(
+            self._opt_ds, date_str,
+            rg_index=self._opt_rg_index,
+            parquet_filename=OPTION_PARQUET
+        )
         if len(opt_df) > 0:
             opt_df = self._convert_numeric(
                 opt_df,
                 float_cols=["open", "high", "low", "close", "open_oi", "close_oi"],
                 int_cols=["volume"]
             )
-            # 过滤无效行（close <= 0）
             opt_df = opt_df[opt_df["close"] > 0].copy()
 
         # 期货
-        fut_df = self._load_day_from_dataset(self._fut_ds, date_str)
+        fut_df = self._load_day_from_dataset(
+            self._fut_ds, date_str,
+            rg_index=self._fut_rg_index,
+            parquet_filename=FUTURE_PARQUET
+        )
         if len(fut_df) > 0:
             fut_df = self._convert_numeric(
                 fut_df,
@@ -746,7 +828,11 @@ class ParquetDayLoader:
             fut_df = fut_df[fut_df["close"] > 0].copy()
 
         # ETF
-        etf_df = self._load_day_from_dataset(self._etf_ds, date_str)
+        etf_df = self._load_day_from_dataset(
+            self._etf_ds, date_str,
+            rg_index=self._etf_rg_index,
+            parquet_filename=ETF_PARQUET
+        )
         if len(etf_df) > 0:
             etf_df = self._convert_numeric(
                 etf_df,
@@ -778,70 +864,24 @@ class ParquetDayLoader:
         logger.info("扫描交易日列表...")
         dates_set = set()
 
-        # 优先从期货数据提取（数据量最小）
-        target_path = os.path.join(self.data_dir, FUTURE_PARQUET)
-        if not os.path.exists(target_path):
-            target_path = os.path.join(self.data_dir, OPTION_PARQUET)
+        # 方法1：从 row_group 索引提取所有日期范围，用 bdate_range 生成完整列表
+        all_rg = self._fut_rg_index or self._opt_rg_index
+        if all_rg:
+            for _, min_d, max_d in all_rg:
+                if len(min_d) == 10:
+                    dates_set.add(min_d)
+                if len(max_d) == 10:
+                    dates_set.add(max_d)
 
-        try:
-            import pyarrow.parquet as pq
-            import pyarrow.compute as pc
-
-            # 方法1：从 row_group 元数据提取（极快）
-            pf = pq.ParquetFile(target_path)
-            for i in range(pf.metadata.num_row_groups):
-                rg = pf.metadata.row_group(i)
-                for j in range(rg.num_columns):
-                    col = rg.column(j)
-                    if col.path_in_schema == "datetime":
-                        if col.statistics and col.statistics.has_min_max:
-                            min_val = str(col.statistics.min)[:10]
-                            max_val = str(col.statistics.max)[:10]
-                            if len(min_val) == 10:
-                                dates_set.add(min_val)
-                            if len(max_val) == 10:
-                                dates_set.add(max_val)
-                        break
-
-            if len(dates_set) > 100:
-                # row_group 元数据足够，生成完整日期范围
-                # 但 row_group 只给了 min/max，中间日期需要补全
-                # 用 pandas 生成工作日序列
-                import pandas as pd
-                min_d = min(dates_set)
-                max_d = max(dates_set)
-                all_bdays = pd.bdate_range(min_d, max_d).strftime("%Y-%m-%d").tolist()
-                self._trading_dates = all_bdays
-                logger.info("  从元数据推断: %d 个工作日: %s ~ %s",
-                            len(self._trading_dates), min_d, max_d)
-                return self._trading_dates
-
-            # 方法2：读 datetime 列，Arrow 层面提取唯一日期前缀
-            logger.info("  元数据不足，扫描 datetime 列...")
-            target_ds = self._fut_ds or self._opt_ds
-            if target_ds is None:
-                self._trading_dates = []
-                return []
-
-            table = target_ds.to_table(columns=["datetime"])
-            dt_arr = table.column("datetime")
-            # 用 Arrow compute 截取前10个字符（日期部分）
-            date_arr = pc.utf8_slice_codeunits(dt_arr, 0, 10)
-            unique_dates = pc.unique(date_arr).to_pylist()
-            dates_set = {str(d) for d in unique_dates if d and len(str(d)) == 10}
-
-        except Exception as exc:
-            logger.error("  扫描交易日失败: %s", exc)
-            # 最终 fallback：逐行提取
-            try:
-                target_ds = self._fut_ds or self._opt_ds
-                if target_ds:
-                    table = target_ds.to_table(columns=["datetime"])
-                    for val in table.column("datetime").to_pylist():
-                        if val and len(str(val)) >= 10:
-                            dates_set.add(str(val)[:10])
-            except Exception:
-                pass
+        if len(dates_set) >= 2:
+            # 用 bdate_range 生成工作日序列
+            min_d = min(dates_set)
+            max_d = max(dates_set)
+            all_bdays = pd.bdate_range(min_d, max_d).strftime("%Y-%m-%d").tolist()
+            self._trading_dates = all_bdays
+            logger.info("  从 row_group 元数据推断: %d 个工作日: %s ~ %s",
+                        len(self._trading_dates), min_d, max_d)
+            return self._trading_dates
 
         self._trading_dates = sorted(dates_set)
         logger.info("  共 %d 个交易日: %s ~ %s",
