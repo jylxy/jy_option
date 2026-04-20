@@ -67,12 +67,17 @@ DEFAULT_PARAMS = {
 
 # ── 合约选择函数 ──────────────────────────────────────────────────────────────
 
-def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0):
+def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
+                   iv_residual_weight=0.3):
     """
     S1卖腿选择：深虚值、|delta|<0.15、premium>=0.5、效率最高
 
+    因子5：IV_Residual 加权选腿。IV_Residual > 0 表示该合约 IV 高于 smile 拟合值，
+    Theta 衰减更快，优先选择。score = eff * (1 + weight * iv_residual)
+
     min_volume: 最低日成交量（0=不过滤）
     min_oi: 最低持仓量（0=不过滤）
+    iv_residual_weight: IV_Residual 在选腿评分中的权重（默认0.3）
     返回: pd.Series (选中的行) 或 None
     """
     if option_type == "P":
@@ -105,7 +110,13 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0):
         lambda r: estimate_margin(r["spot_close"], r["strike"], option_type,
                                   r["option_close"], mult, mr, 0.5), axis=1)
     c["eff"] = c["option_close"] * mult / c["margin"]
-    return c.loc[c["eff"].idxmax()]
+    # 因子5：IV_Residual 加权（IV_Residual > 0 = IV 偏高，Theta 衰减更快）
+    if "iv_residual" in c.columns and iv_residual_weight > 0:
+        iv_res = c["iv_residual"].fillna(0).clip(-1, 1)
+        c["score"] = c["eff"] * (1 + iv_residual_weight * iv_res)
+    else:
+        c["score"] = c["eff"]
+    return c.loc[c["score"].idxmax()]
 
 
 def select_s1_protect(day_df, sell_row):

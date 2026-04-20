@@ -689,8 +689,26 @@ class TrueMinuteEngine:
     def _try_open_s1(self, ef, product, ot, mult, mr, exchange, exp,
                      nav, margin_per, iv_scale, smiles, date_str,
                      day_slice, spread_mode):
-        """尝试 S1 开仓"""
-        c = select_s1_sell(ef, ot, mult, mr)
+        """尝试 S1 开仓（因子5：IV_Residual 加权选腿）"""
+        # 因子5：为候选合约计算 IV_Residual（IV 相对 smile 的偏离）
+        ef_with_ivr = ef.copy()
+        if smiles and product in smiles:
+            smile = smiles[product]
+            if hasattr(smile, 'get') and exp in smile:
+                smile_data = smile[exp]
+            else:
+                smile_data = smile
+            # 批量计算 iv_residual
+            ef_with_ivr["iv_residual"] = ef_with_ivr.apply(
+                lambda r: get_iv_residual(smiles, product, exp,
+                                          r["strike"], r["spot_close"],
+                                          r.get("implied_vol", 0)),
+                axis=1
+            )
+        else:
+            ef_with_ivr["iv_residual"] = 0.0
+
+        c = select_s1_sell(ef_with_ivr, ot, mult, mr)
         if c is None:
             return
 
