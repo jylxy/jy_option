@@ -61,6 +61,18 @@ ETF_UNDERLYING_MAP = {
     "588080": "588080", "159922": "159922", "510100": "510100",
 }
 
+# 股指期权 → 股指期货的品种映射
+# IO(沪深300期权) → IF(沪深300期货), HO(上证50期权) → IH, MO(中证1000期权) → IM
+INDEX_OPTION_TO_FUTURE = {
+    "IO": "IF", "HO": "IH", "MO": "IM",
+}
+
+# ETF 期权代码正则：纯数字编号格式
+# 例: "SSE.10004645" → exchange="SSE", code_num="10004645"
+_ETF_OPT_CODE_RE = re.compile(
+    r"^(SSE|SZSE|SH|SZ)\.(\d{8,})$"
+)
+
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
 def _parse_expiry(val):
@@ -78,7 +90,7 @@ def _parse_expiry(val):
 
 def _safe_float(val, default=np.nan):
     """安全转换为 float"""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
+    if val is None or pd.isna(val):
         return default
     try:
         v = float(val)
@@ -246,18 +258,33 @@ class ContractMaster:
 
         例: 'DCE.m2409-C-3100' → 'm'
             'CFFEX.IO2409-C-4000' → 'IO'
+            'SSE.10004645' → '510300'（ETF 期权，从 underlying_code 提取）
         """
         # 先查缓存
         if contract_code in self._product_roots:
             return self._product_roots[contract_code]
+
+        # ETF 期权：纯数字编号格式
+        if _ETF_OPT_CODE_RE.match(contract_code):
+            info = self.lookup(contract_code)
+            if info:
+                uc = info.get("underlying_code", "")
+                root = ETF_UNDERLYING_MAP.get(uc, uc)
+                if root:
+                    self._product_roots[contract_code] = root
+                    return root
+
+        # 商品/股指期权：品种+月份-C/P-行权价格式
         m = _OPT_CODE_RE.match(contract_code)
         if m:
+            self._product_roots[contract_code] = m.group(1)
             return m.group(1)
         # 去掉交易所前缀后再试
         if "." in contract_code:
             code_no_exch = contract_code.split(".", 1)[1]
             m = _OPT_CODE_RE.match(code_no_exch)
             if m:
+                self._product_roots[contract_code] = m.group(1)
                 return m.group(1)
         return ""
 
@@ -315,6 +342,8 @@ class DaySlice:
 
         # 缓存的标的价格序列
         self._spot_cache = {}
+        # 缓存时间戳列表
+        self._timestamps_cache = None
 
         self._build_indices()
 
@@ -347,7 +376,9 @@ class DaySlice:
                 self._etf_idx[(str(ts), str(code))] = c
 
     def get_minute_timestamps(self):
-        """返回该日所有分钟时间戳（升序去重）"""
+        """返回该日所有分钟时间戳（升序去重，带缓存）"""
+        if self._timestamps_cache is not None:
+            return self._timestamps_cache
         ts_set = set()
         if self.option_bars is not None and len(self.option_bars) > 0:
             ts_set.update(self.option_bars["datetime"].unique())
@@ -355,7 +386,8 @@ class DaySlice:
             ts_set.update(self.futures_bars["datetime"].unique())
         if self.etf_bars is not None and len(self.etf_bars) > 0:
             ts_set.update(self.etf_bars["datetime"].unique())
-        return sorted(ts_set)
+        self._timestamps_cache = sorted(ts_set)
+        return self._timestamps_cache
 
     def get_option_bar(self, timestamp, contract_code):
         """
@@ -425,37 +457,70 @@ class DaySlice:
 
     def _match_futures_code(self, option_code):
         """
-        从期权合约代码匹配同月期货合约代码。
+        从期权合约代码匹配标的合约代码。
 
-        例: "DCE.m2409-C-3100" → 在 futures_bars 中找 "DCE.m2409"
-            或从 contract_master 的 underlying_code 字段获取
+        商品期权: "DCE.m2409-C-3100" → 在 futures_bars 中找 "DCE.m2409"
+        股指期权: "CFFEX.IO2409-C-4000" → 映射到 "CFFEX.IF2409"
+        ETF期权:  "SSE.10004645" → 从 contract_master 获取 underlying_code → 在 etf_bars 中找
         """
-        # 方法1：从 contract_master 获取 underlying_code
         info = self._cm.lookup(option_code)
+
+        # ── ETF 期权：从 etf_bars 中查找标的 ──
+        if info and _ETF_OPT_CODE_RE.match(option_code):
+            uc = info.get("underlying_code", "")
+            # underlying_code 可能是合约编号（如 "10000969"），需要映射到 ETF 代码
+            etf_code = ETF_UNDERLYING_MAP.get(uc, uc)
+            if self.etf_bars is not None and len(self.etf_bars) > 0:
+                etf_codes = set(self.etf_bars["code"].values)
+                # 尝试多种格式
+                for candidate in [etf_code, f"SSE.{etf_code}", f"SZSE.{etf_code}",
+                                  f"SH.{etf_code}", f"SZ.{etf_code}"]:
+                    if candidate in etf_codes:
+                        return candidate
+            return None
+
+        # ── 方法1：从 contract_master 获取 underlying_code ──
         if info and info.get("underlying_code"):
             uc = info["underlying_code"]
-            # 检查期货数据中是否有这个代码
+
+            # 股指期权特殊处理：IO→IF, HO→IH, MO→IM
+            m_idx = _OPT_CODE_RE.match(option_code) or (
+                _OPT_CODE_RE.match(option_code.split(".", 1)[1])
+                if "." in option_code else None)
+            if m_idx:
+                root = m_idx.group(1).upper()
+                if root in INDEX_OPTION_TO_FUTURE:
+                    month = m_idx.group(2)
+                    fut_root = INDEX_OPTION_TO_FUTURE[root]
+                    exchange = info.get("exchange_code", "CFFEX")
+                    candidates = [
+                        f"{exchange}.{fut_root}{month}",
+                        f"{fut_root}{month}",
+                    ]
+                    if self.futures_bars is not None and len(self.futures_bars) > 0:
+                        fut_codes = set(self.futures_bars["code"].values)
+                        for c in candidates:
+                            if c in fut_codes:
+                                return c
+
+            # 通用：直接用 underlying_code 查找
             if self.futures_bars is not None and len(self.futures_bars) > 0:
-                # 尝试精确匹配
                 if uc in self.futures_bars["code"].values:
                     return uc
-                # 尝试带交易所前缀
                 exchange = info.get("exchange_code", "")
                 full_code = f"{exchange}.{uc}" if exchange else uc
                 if full_code in self.futures_bars["code"].values:
                     return full_code
 
-        # 方法2：从期权代码提取月份，拼接期货代码
+        # ── 方法2：从期权代码提取月份，拼接期货代码 ──
         m = _OPT_CODE_RE.match(option_code)
         if m:
             root, month = m.group(1), m.group(2)
-            # 期货代码可能是大写或小写
             candidates = [
                 f"{root}{month}",
                 f"{root.upper()}{month}",
                 f"{root.lower()}{month}",
             ]
-            # 加交易所前缀
             if "." in option_code:
                 exch = option_code.split(".")[0]
                 candidates = [f"{exch}.{c}" for c in candidates] + candidates
@@ -482,7 +547,7 @@ class DaySlice:
             return None
 
         bars = bars.sort_values("datetime").head(window)
-        valid = bars[bars["volume"] > 0]
+        valid = bars[(bars["volume"] > 0) & bars["close"].notna()]
 
         if valid.empty:
             # fallback: 首根 close
@@ -624,6 +689,7 @@ class DaySlice:
         self._fut_idx.clear()
         self._etf_idx.clear()
         self._spot_cache.clear()
+        self._timestamps_cache = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -791,8 +857,6 @@ class ParquetDayLoader:
                 logger.warning("  PyArrow 加载 %s 失败: %s", date_str, exc)
 
         return pd.DataFrame()
-
-        return df
 
     def _convert_numeric(self, df, float_cols, int_cols):
         """

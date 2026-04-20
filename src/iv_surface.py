@@ -77,7 +77,11 @@ class IVSmile:
             iv_fitted = np.polyval(coeffs, m)
             ss_res = np.sum((iv - iv_fitted) ** 2)
             ss_tot = np.sum((iv - np.mean(iv)) ** 2)
-            self._r_squared = 1.0 - ss_res / max(ss_tot, 1e-10)
+            if ss_tot < 1e-10:
+                # 所有 IV 几乎相同，拟合无意义
+                self._r_squared = 0.0
+            else:
+                self._r_squared = 1.0 - ss_res / ss_tot
 
             self._valid = self._r_squared >= MIN_R_SQUARED
         except (np.linalg.LinAlgError, ValueError) as exc:

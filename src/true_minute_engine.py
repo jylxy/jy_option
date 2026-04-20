@@ -40,7 +40,7 @@ from strategy_rules import (
     calc_s1_size, calc_s3_size_v2, calc_s4_size,
     check_emergency_protect,
     extract_atm_iv_series, calc_iv_percentile, get_iv_scale,
-    should_pause_open, should_close_expiry, can_reopen,
+    should_pause_open, should_close_expiry, should_open_new, can_reopen,
     check_margin_ok, calc_stats,
     DEFAULT_PARAMS,
 )
@@ -175,6 +175,12 @@ class TrueMinuteEngine:
         self.orders = []
         self.iv_pcts = {}  # {product: pd.Series}
 
+        # 当日已平仓的 PnL/fee 累加器（每日开始时清零）
+        self._day_realized = {"pnl": 0.0, "fee": 0.0,
+                              "s1": 0.0, "s3": 0.0, "s4": 0.0}
+        self._current_date_str = ""  # 当前交易日
+        self._pending_opens = []  # T日决策、T+1日执行的待开仓列表
+
     def _load_config(self, path):
         """加载 config.json，合并默认参数"""
         merged = dict(DEFAULT_PARAMS)
@@ -220,8 +226,16 @@ class TrueMinuteEngine:
 
             t_day = time.time()
 
+            # 清零当日已平仓 PnL 累加器
+            self._day_realized = {"pnl": 0.0, "fee": 0.0,
+                                  "s1": 0.0, "s3": 0.0, "s4": 0.0}
+            self._current_date_str = date_str
+
             # 加载当日数据
             day_slice = self.loader.load_day(date_str)
+
+            # Phase 0: 执行昨日决策的待开仓（T+1 VWAP 执行）
+            self._execute_pending_opens(day_slice, date_str)
 
             # Phase A: 盘中处理
             self._process_intraday(day_slice, date_str)
@@ -274,7 +288,7 @@ class TrueMinuteEngine:
         nav = self.capital + (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0)
         spread_mode = self.config.get("spread_mode", "tick")
 
-        # S4 盘中 Gamma PnL 追踪
+        # S4 盘中 Gamma PnL 追踪（修正公式 + 累加多持仓）
         s4_intraday_pnl = 0.0
         s4_high_pnl = 0.0
         s4_low_pnl = 0.0
@@ -285,7 +299,8 @@ class TrueMinuteEngine:
             for pos in self.positions:
                 bar = day_slice.get_option_bar(ts, pos.code)
                 if bar and bar["volume"] > 0:
-                    pos.prev_price = pos.cur_price
+                    # 注意：不更新 prev_price，prev_price 保持为昨日收盘价
+                    # daily_pnl() = prev_price → cur_price = 昨收 → 当前价
                     pos.cur_price = bar["close"]
 
                 # 更新标的价格
@@ -346,14 +361,18 @@ class TrueMinuteEngine:
                             f"greeks_breach_{breach['type']}", spread
                         )
 
-            # ── 4. S4 Gamma PnL 追踪 ──
+            # ── 4. S4 Gamma PnL 追踪（修正公式：0.5 * gamma * dS^2 * mult * n）──
+            s4_snap = 0.0
             for pos in self.positions:
                 if pos.strat == "S4" and pos.product in day_open_spot:
                     delta_s = pos.cur_spot - day_open_spot[pos.product]
-                    gamma_pnl = 0.5 * pos.cash_gamma() * (delta_s ** 2)
-                    s4_intraday_pnl = gamma_pnl
-                    s4_high_pnl = max(s4_high_pnl, gamma_pnl)
-                    s4_low_pnl = min(s4_low_pnl, gamma_pnl)
+                    # 标准 Gamma PnL = 0.5 * gamma * dS^2 * mult * n
+                    sign = 1 if pos.role in ("buy", "protect") else -1
+                    gamma_pnl = 0.5 * sign * pos.cur_gamma * (delta_s ** 2) * pos.mult * pos.n
+                    s4_snap += gamma_pnl
+            s4_intraday_pnl = s4_snap
+            s4_high_pnl = max(s4_high_pnl, s4_snap)
+            s4_low_pnl = min(s4_low_pnl, s4_snap)
 
     def _check_emergency_all(self, day_slice, date_str, ts, spread_mode):
         """检查所有 S3 卖腿的应急保护"""
@@ -437,22 +456,30 @@ class TrueMinuteEngine:
         products_in_data = daily_df["product"].unique().tolist()
         product_pool.update(products_in_data)
 
+        # 按成交量排序品种（Bug 4 修复：按流动性排序而非随机顺序）
+        prod_volume = daily_df.groupby("product")["volume"].sum().sort_values(ascending=False)
+        sorted_products = [p for p in prod_volume.index if p in products_in_data]
+
         # 2. 构建 IV Smile
-        smiles = build_iv_smiles(daily_df, products_in_data, date_str)
+        smiles = build_iv_smiles(daily_df, sorted_products, date_str)
 
         # 3. 到期平仓
         for pos in list(self.positions):
+            if pos not in self.positions:
+                continue  # 已被前一个条件平仓
             if pos.dte <= cfg.get("expiry_dte", 1):
                 self._execute_close(pos, pos.cur_price, "close", "expiry", 0)
-
-            # S4: DTE < 10 退出
-            if pos.strat == "S4" and pos.role == "buy" and pos.dte < 10:
+            elif pos.strat == "S4" and pos.role == "buy" and pos.dte < 10:
                 self._execute_close(pos, pos.cur_price, "close", "s4_dte_exit", 0)
 
-        # 4. 新开仓
+        # 4. 新开仓（生成 pending_opens，T+1 执行）
         total_m = sum(p.cur_margin() for p in self.positions if p.role == "sell")
         s1_m = sum(p.cur_margin() for p in self.positions if p.role == "sell" and p.strat == "S1")
         s3_m = sum(p.cur_margin() for p in self.positions if p.role == "sell" and p.strat == "S3")
+        # 追踪 pending 的预估保证金（pending 未加入 positions，需要单独累加）
+        pending_total_m = 0.0
+        pending_s1_m = 0.0
+        pending_s3_m = 0.0
         margin_cap = cfg.get("margin_cap", 0.50)
         s1_cap = cfg.get("s1_margin_cap", 0.25)
         s3_cap = cfg.get("s3_margin_cap", 0.25)
@@ -460,13 +487,12 @@ class TrueMinuteEngine:
         iv_open_thr = cfg.get("iv_open_threshold", 80)
         top_n = cfg.get("products_top_n", 20)
 
-        for product in products_in_data[:top_n]:
+        for product in sorted_products[:top_n]:
             prod_df = daily_df[daily_df["product"] == product]
             if prod_df.empty:
                 continue
 
-            # 检查开仓条件
-            from strategy_rules import should_open_new
+            # 检查开仓条件（Bug 6 修复：import 已移到文件顶部）
             open_expiries = should_open_new(prod_df,
                                             dte_target=cfg.get("dte_target", 35),
                                             dte_min=cfg.get("dte_min", 15),
@@ -487,45 +513,69 @@ class TrueMinuteEngine:
                 # （简化：暂不实现 IV 分位数，后续可从历史数据累积）
                 iv_scale = 1.0
 
-                # 保证金检查
-                if margin_cap and total_m / max(nav, 1) >= margin_cap:
+                # 保证金检查（含 pending 预估）
+                eff_total_m = total_m + pending_total_m
+                if margin_cap and eff_total_m / max(nav, 1) >= margin_cap:
                     break
 
                 spot = ef["spot_close"].iloc[0] if "spot_close" in ef.columns else 0
                 mult = ef["multiplier"].iloc[0] if "multiplier" in ef.columns else 10
-                mr = 0.05  # 默认保证金比例
                 exchange = ef["exchange"].iloc[0] if "exchange" in ef.columns else ""
+                # 保证金比例按交易所区分
+                if exchange in ("CFFEX",):
+                    mr = 0.10  # 股指期权保证金较高
+                elif exchange in ("SSE", "SZSE"):
+                    mr = 0.12  # ETF 期权
+                else:
+                    mr = 0.05  # 商品期权
 
                 # ── S3 开仓（优先）──
-                if s3_cap and s3_m / max(nav, 1) < s3_cap:
+                eff_s3_m = s3_m + pending_s3_m
+                if s3_cap and eff_s3_m / max(nav, 1) < s3_cap:
                     for ot in ["P", "C"]:
                         if any(p.strat == "S3" and p.product == product and
                                p.opt_type == ot and p.role == "sell"
                                for p in self.positions):
                             continue
+                        old_pending_len = len(self._pending_opens)
                         self._try_open_s3(ef, product, ot, spot, mult, mr,
                                           exchange, exp, nav, margin_per,
                                           iv_scale, smiles, date_str, day_slice,
                                           spread_mode)
-                        # 更新保证金
-                        s3_m = sum(p.cur_margin() for p in self.positions
-                                   if p.role == "sell" and p.strat == "S3")
-                        total_m = sum(p.cur_margin() for p in self.positions
-                                       if p.role == "sell")
+                        # 更新 pending 保证金预估
+                        for item in self._pending_opens[old_pending_len:]:
+                            if item["role"] == "sell":
+                                est_m = estimate_margin(
+                                    item["spot"], item["strike"], item["opt_type"],
+                                    item["ref_price"], item["mult"], item["mr"], 0.5,
+                                    exchange=item["exchange"]
+                                ) * item["n"]
+                                pending_total_m += est_m
+                                if item["strat"] == "S3":
+                                    pending_s3_m += est_m
 
                 # ── S1 开仓 ──
-                if s1_cap and s1_m / max(nav, 1) < s1_cap:
+                eff_s1_m = s1_m + pending_s1_m
+                if s1_cap and eff_s1_m / max(nav, 1) < s1_cap:
                     for ot in ["P", "C"]:
-                        if margin_cap and total_m / max(nav, 1) >= margin_cap:
+                        eff_total_m = total_m + pending_total_m
+                        if margin_cap and eff_total_m / max(nav, 1) >= margin_cap:
                             break
+                        old_pending_len = len(self._pending_opens)
                         self._try_open_s1(ef, product, ot, mult, mr,
                                           exchange, exp, nav, margin_per,
                                           iv_scale, smiles, date_str, day_slice,
                                           spread_mode)
-                        s1_m = sum(p.cur_margin() for p in self.positions
-                                   if p.role == "sell" and p.strat == "S1")
-                        total_m = sum(p.cur_margin() for p in self.positions
-                                       if p.role == "sell")
+                        for item in self._pending_opens[old_pending_len:]:
+                            if item["role"] == "sell":
+                                est_m = estimate_margin(
+                                    item["spot"], item["strike"], item["opt_type"],
+                                    item["ref_price"], item["mult"], item["mr"], 0.5,
+                                    exchange=item["exchange"]
+                                ) * item["n"]
+                                pending_total_m += est_m
+                                if item["strat"] == "S1":
+                                    pending_s1_m += est_m
 
                 # ── S4 开仓 ──
                 if not any(p.strat == "S4" and p.product == product and
@@ -557,45 +607,37 @@ class TrueMinuteEngine:
                                self.config.get("s1_margin_cap", 0.25)):
             return
 
-        # 执行价格：次日 VWAP
-        vwap = day_slice.calc_vwap(c["option_code"],
-                                    self.config.get("vwap_window", 10))
-        price = vwap if vwap and vwap > 0 else c["option_close"]
-        spread = self.monitor.calc_spread(price, c["option_code"], self.cm, spread_mode)
-        price = IntradayMonitor.apply_spread(price, "sell", spread)
+        # 执行价格：T+1 日 VWAP（在 _execute_pending_opens 中计算）
+        # 这里先用收盘价作为参考价，实际执行价在 T+1 确定
+        ref_price = c["option_close"]
 
         group_id = f"S1_{product}_{ot}_{exp}_{date_str}"
         iv_res = get_iv_residual(smiles, product, exp,
                                   c["strike"], c["spot_close"],
                                   c.get("implied_vol", 0))
 
-        pos = Position("S1", product, c["option_code"], ot, c["strike"],
-                        price, nn, date_str, mult, exp, mr, "sell",
-                        spot=c["spot_close"], exchange=exchange,
-                        group_id=group_id, iv_residual=iv_res,
-                        underlying_code=c.get("underlying_code"))
-        self.positions.append(pos)
-        self._record_order(date_str, "close", "open_sell", "S1", product,
-                           c["option_code"], ot, c["strike"], exp,
-                           price, nn, 0, 0, iv_res)
+        # 加入待开仓列表（T+1 执行）
+        self._pending_opens.append({
+            "strat": "S1", "product": product, "code": c["option_code"],
+            "opt_type": ot, "strike": c["strike"], "ref_price": ref_price,
+            "n": nn, "decision_date": date_str, "mult": mult, "expiry": exp,
+            "mr": mr, "role": "sell", "spot": c["spot_close"],
+            "exchange": exchange, "group_id": group_id, "iv_residual": iv_res,
+            "underlying_code": c.get("underlying_code"),
+        })
 
         # 保护腿
         pr = select_s1_protect(ef, c)
         if pr is not None and pr["option_code"] != c["option_code"]:
             pn = max(1, nn // 2)
-            p_price = pr["option_close"]
-            p_spread = self.monitor.calc_spread(p_price, pr["option_code"], self.cm, spread_mode)
-            p_price = IntradayMonitor.apply_spread(p_price, "buy", p_spread)
-
-            ppos = Position("S1", product, pr["option_code"], ot, pr["strike"],
-                            p_price, pn, date_str, mult, exp, mr, "buy",
-                            spot=pr["spot_close"], exchange=exchange,
-                            group_id=group_id,
-                            underlying_code=pr.get("underlying_code"))
-            self.positions.append(ppos)
-            self._record_order(date_str, "close", "open_buy", "S1", product,
-                               pr["option_code"], ot, pr["strike"], exp,
-                               p_price, pn, 0, 0, 0)
+            self._pending_opens.append({
+                "strat": "S1", "product": product, "code": pr["option_code"],
+                "opt_type": ot, "strike": pr["strike"], "ref_price": pr["option_close"],
+                "n": pn, "decision_date": date_str, "mult": mult, "expiry": exp,
+                "mr": mr, "role": "buy", "spot": pr["spot_close"],
+                "exchange": exchange, "group_id": group_id, "iv_residual": 0,
+                "underlying_code": pr.get("underlying_code"),
+            })
 
     def _try_open_s3(self, ef, product, ot, spot, mult, mr, exchange, exp,
                      nav, margin_per, iv_scale, smiles, date_str,
@@ -636,32 +678,28 @@ class TrueMinuteEngine:
 
         group_id = f"S3_{product}_{ot}_{exp}_{date_str}"
 
-        # 买腿
-        bp = bl["option_close"]
-        bpos = Position("S3", product, bl["option_code"], ot, bl["strike"],
-                        bp, bq, date_str, mult, exp, mr, "buy",
-                        spot=bl["spot_close"], exchange=exchange,
-                        group_id=group_id,
-                        underlying_code=bl.get("underlying_code"))
-        self.positions.append(bpos)
-        self._record_order(date_str, "close", "open_buy", "S3", product,
-                           bl["option_code"], ot, bl["strike"], exp,
-                           bp, bq, 0, 0, 0)
-
-        # 卖腿
-        sp = sl["option_close"]
+        # 买腿加入待开仓
         iv_res = get_iv_residual(smiles, product, exp,
                                   sl["strike"], sl["spot_close"],
                                   sl.get("implied_vol", 0))
-        spos = Position("S3", product, sl["option_code"], ot, sl["strike"],
-                        sp, sq, date_str, mult, exp, mr, "sell",
-                        spot=sl["spot_close"], exchange=exchange,
-                        group_id=group_id, iv_residual=iv_res,
-                        underlying_code=sl.get("underlying_code"))
-        self.positions.append(spos)
-        self._record_order(date_str, "close", "open_sell", "S3", product,
-                           sl["option_code"], ot, sl["strike"], exp,
-                           sp, sq, 0, 0, iv_res)
+        self._pending_opens.append({
+            "strat": "S3", "product": product, "code": bl["option_code"],
+            "opt_type": ot, "strike": bl["strike"], "ref_price": bl["option_close"],
+            "n": bq, "decision_date": date_str, "mult": mult, "expiry": exp,
+            "mr": mr, "role": "buy", "spot": bl["spot_close"],
+            "exchange": exchange, "group_id": group_id, "iv_residual": 0,
+            "underlying_code": bl.get("underlying_code"),
+        })
+
+        # 卖腿加入待开仓
+        self._pending_opens.append({
+            "strat": "S3", "product": product, "code": sl["option_code"],
+            "opt_type": ot, "strike": sl["strike"], "ref_price": sl["option_close"],
+            "n": sq, "decision_date": date_str, "mult": mult, "expiry": exp,
+            "mr": mr, "role": "sell", "spot": sl["spot_close"],
+            "exchange": exchange, "group_id": group_id, "iv_residual": iv_res,
+            "underlying_code": sl.get("underlying_code"),
+        })
 
     def _try_open_s4(self, ef, product, mult, mr, exchange, exp,
                      nav, date_str, day_slice, spread_mode):
@@ -681,39 +719,127 @@ class TrueMinuteEngine:
                                max_hands=cfg.get("s4_max_hands", 5))
 
             group_id = f"S4_{product}_{ot}_{exp}_{date_str}"
-            pos = Position("S4", product, opt["option_code"], ot, opt["strike"],
-                           opt["option_close"], qty, date_str, mult, exp, mr,
-                           "buy", spot=opt["spot_close"], exchange=exchange,
-                           group_id=group_id,
-                           underlying_code=opt.get("underlying_code"))
-            self.positions.append(pos)
-            self._record_order(date_str, "close", "open_buy", "S4", product,
-                               opt["option_code"], ot, opt["strike"], exp,
-                               opt["option_close"], qty, 0, 0, 0)
+            self._pending_opens.append({
+                "strat": "S4", "product": product, "code": opt["option_code"],
+                "opt_type": ot, "strike": opt["strike"],
+                "ref_price": opt["option_close"],
+                "n": qty, "decision_date": date_str, "mult": mult, "expiry": exp,
+                "mr": mr, "role": "buy", "spot": opt["spot_close"],
+                "exchange": exchange, "group_id": group_id, "iv_residual": 0,
+                "underlying_code": opt.get("underlying_code"),
+            })
 
 
     # ── 执行与记录 ────────────────────────────────────────────────────────────
+
+    def _execute_pending_opens(self, day_slice, date_str):
+        """
+        执行昨日决策的待开仓订单，用 T+1 日开盘后 VWAP 作为执行价格。
+
+        这消除了前视偏差：T 日收盘决策 → T+1 日开盘执行。
+        """
+        if not self._pending_opens:
+            return
+
+        spread_mode = self.config.get("spread_mode", "tick")
+        vwap_window = self.config.get("vwap_window", 10)
+        nav = self.capital + (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0)
+
+        executed = 0
+        for item in self._pending_opens:
+            code = item["code"]
+
+            # T+1 VWAP 执行价格
+            vwap = day_slice.calc_vwap(code, vwap_window)
+            if vwap and vwap > 0:
+                price = vwap
+            else:
+                # fallback: 用决策日收盘价（ref_price）
+                price = item["ref_price"]
+
+            if price <= 0:
+                continue
+
+            # 施加买卖价差
+            role = item["role"]
+            spread = self.monitor.calc_spread(price, code, self.cm, spread_mode)
+            direction = "buy" if role in ("buy", "protect") else "sell"
+            price = IntradayMonitor.apply_spread(price, direction, spread)
+
+            # 保证金二次验证（卖腿）
+            if role == "sell":
+                total_m = sum(p.cur_margin() for p in self.positions if p.role == "sell")
+                strat = item["strat"]
+                strat_m = sum(p.cur_margin() for p in self.positions
+                              if p.role == "sell" and p.strat == strat)
+                new_m = estimate_margin(
+                    item["spot"], item["strike"], item["opt_type"],
+                    price, item["mult"], item["mr"], 0.5,
+                    exchange=item["exchange"]
+                ) * item["n"]
+                cap_key = f"{strat.lower()}_margin_cap"
+                if not check_margin_ok(total_m, strat_m, new_m, nav,
+                                       self.config.get("margin_cap", 0.50),
+                                       self.config.get(cap_key, 0.25)):
+                    continue
+
+            # 创建持仓
+            pos = Position(
+                item["strat"], item["product"], code, item["opt_type"],
+                item["strike"], price, item["n"], date_str,
+                item["mult"], item["expiry"], item["mr"], role,
+                spot=item["spot"], exchange=item["exchange"],
+                group_id=item["group_id"], iv_residual=item.get("iv_residual", 0),
+                underlying_code=item.get("underlying_code"),
+            )
+            self.positions.append(pos)
+
+            action = f"open_{direction}"
+            self._record_order(
+                date_str, "vwap", action, item["strat"], item["product"],
+                code, item["opt_type"], item["strike"], item["expiry"],
+                price, item["n"], 0, 0, item.get("iv_residual", 0),
+            )
+            executed += 1
+
+        if executed > 0:
+            logger.debug("  T+1 执行 %d/%d 笔待开仓", executed, len(self._pending_opens))
+        self._pending_opens = []
 
     def _execute_close(self, position, price, timestamp, action, spread=0):
         """执行平仓：计算PnL、扣手续费、记录订单、移除持仓"""
         close_role = "buy" if position.role == "sell" else "sell"
         exec_price = IntradayMonitor.apply_spread(price, close_role, spread)
 
-        # PnL
+        # PnL：当日盯市部分（prev_price → exec_price），不是全生命周期
+        # 全生命周期 PnL 已通过前几天的 daily_pnl() 逐日计入 cum_pnl
         if position.role in ("buy", "protect"):
-            pnl = (exec_price - position.open_price) * position.mult * position.n
+            pnl = (exec_price - position.prev_price) * position.mult * position.n
         else:
-            pnl = (position.open_price - exec_price) * position.mult * position.n
+            pnl = (position.prev_price - exec_price) * position.mult * position.n
 
         fee = self.config.get("fee", 3) * position.n * 2  # 开+平
 
-        # 记录订单
+        # 累加到当日已平仓 PnL
+        self._day_realized["pnl"] += pnl
+        self._day_realized["fee"] += fee
+        strat_key = position.strat.lower()  # "S1" → "s1"
+        if strat_key in self._day_realized:
+            self._day_realized[strat_key] += pnl
+
+        # 记录订单（订单中记录全生命周期 PnL，方便分析）
+        if position.role in ("buy", "protect"):
+            order_pnl = (exec_price - position.open_price) * position.mult * position.n
+        else:
+            order_pnl = (position.open_price - exec_price) * position.mult * position.n
+
+        # 记录订单（Bug 1 修复：用当前交易日而非 open_date）
         time_str = str(timestamp)[-8:-3] if len(str(timestamp)) > 10 else "close"
         self._record_order(
-            position.open_date, time_str, action, position.strat,
+            self._current_date_str, time_str, action, position.strat,
             position.product, position.code, position.opt_type,
             position.strike, position.expiry,
-            exec_price, position.n, fee, pnl, position.iv_residual
+            exec_price, position.n, fee, order_pnl, position.iv_residual
         )
 
         # 移除持仓
@@ -744,18 +870,25 @@ class TrueMinuteEngine:
 
     def _update_nav_snapshot(self, date_str):
         """记录每日 NAV 快照"""
-        # 计算当日 PnL
-        day_pnl = sum(p.daily_pnl() for p in self.positions)
+        # 持仓的当日盯市 PnL（prev_price → cur_price）
+        holding_pnl = sum(p.daily_pnl() for p in self.positions)
 
-        # 手续费（当日开仓的）
-        day_fee = sum(o["fee"] for o in self.orders if o["date"] == date_str)
+        # 已平仓的已实现 PnL（开仓价 → 平仓价，在 _execute_close 中累加）
+        realized_pnl = self._day_realized["pnl"]
+        realized_fee = self._day_realized["fee"]
 
-        # 分策略 PnL
-        s1_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == "S1")
-        s3_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == "S3")
-        s4_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == "S4")
+        # 当日总 PnL = 持仓盯市 + 已平仓已实现 - 手续费
+        day_pnl = holding_pnl + realized_pnl - realized_fee
 
-        cum_pnl = (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0) + day_pnl - day_fee
+        # 分策略 PnL（持仓 + 已平仓）
+        s1_pnl = (sum(p.daily_pnl() for p in self.positions if p.strat == "S1")
+                  + self._day_realized["s1"])
+        s3_pnl = (sum(p.daily_pnl() for p in self.positions if p.strat == "S3")
+                  + self._day_realized["s3"])
+        s4_pnl = (sum(p.daily_pnl() for p in self.positions if p.strat == "S4")
+                  + self._day_realized["s4"])
+
+        cum_pnl = (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0) + day_pnl
         nav = self.capital + cum_pnl
         margin = sum(p.cur_margin() for p in self.positions if p.role == "sell")
 
@@ -772,13 +905,13 @@ class TrueMinuteEngine:
             "s1_pnl": s1_pnl,
             "s3_pnl": s3_pnl,
             "s4_pnl": s4_pnl,
-            "fee": day_fee,
+            "fee": realized_fee,
             "margin_used": margin,
             "cash_delta": cd / max(nav, 1),
             "cash_vega": cv / max(nav, 1),
             "cash_gamma": cg / max(nav, 1),
             "cash_theta": ct,
-            "iv_smile_avg_r2": 0.0,  # 由 Phase B 填充
+            "iv_smile_avg_r2": 0.0,
             "n_positions": len(self.positions),
         })
 
