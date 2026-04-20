@@ -75,7 +75,24 @@ Parquet 文件（Spark 导出，所有列为 string 类型）：
 | 应急保护 | 每分钟 | S3 卖腿 OTM% 阈值检查，时效性最高 |
 | 止盈检查 | 每15分钟 | 扣手续费后净利润率，可配置 |
 | IV/Greeks更新 | 每15分钟 | 反推IV → 更新delta/gamma/vega/theta |
-| Greeks风控 | 每15分钟 | cash_delta/vega 超限触发减仓 |
+| Greeks风控 | 每15分钟 | cash_delta/vega 超限触发**整组**减仓 |
+
+## Greeks 风控参数（config.json）
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| `greeks_delta_hard` | 10% | Cash Delta 硬限，超过触发平整组减仓 |
+| `greeks_delta_target` | 7% | 减仓目标，平到此值以下停止 |
+| `greeks_vega_hard` | 1% | Cash Vega 硬限 |
+| `greeks_vega_target` | 0.7% | Vega 减仓目标 |
+| `greeks_vega_warn` | 0.8% | Vega 预警，暂停新开仓 |
+
+### Delta 超限处理逻辑
+1. 按卖腿 |Cash Delta| 降序排序
+2. 对每个卖腿，找同 group_id 的所有腿（卖+买+保护）一起平掉
+3. 逐组平仓直到组合 Delta 降至 target（7%）以下
+4. 开仓时 Delta 感知：根据净 Delta 方向决定 Put/Call 优先级（`get_delta_preferred_order`）
+5. 接近 target 时跳过会加剧偏离的方向（`should_skip_direction`）
 
 ## 依赖
 
