@@ -53,13 +53,11 @@ DEFAULT_PARAMS = {
     "hedge_target_cash_delta_pct": 0.0,
     "hedge_rounding": "min_abs_residual",
     "hedge_cost_mode": "none",
-    "greeks_vega_warn": 0.015,
-    "greeks_vega_hard": 0.02,
-    "greeks_delta_hard": 0.20,
-    # Greeks风控阈值
-    "greeks_vega_warn": 0.015,   # Cash Vega预警（1.5% NAV）
-    "greeks_vega_hard": 0.02,    # Cash Vega硬止损（2% NAV）
-    "greeks_delta_hard": 0.20,   # Cash Delta硬止损（20% NAV）
+    "greeks_vega_warn": 0.008,
+    "greeks_vega_hard": 0.01,
+    "greeks_delta_hard": 0.10,
+    "greeks_delta_target": 0.07,
+    "greeks_vega_target": 0.007,
     # 品种准入
     "product_min_listing_days": 180,
     "product_min_daily_oi": 500,
