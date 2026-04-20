@@ -53,12 +53,13 @@ class IntradayMonitor:
         """应急保护每分钟都检查，始终返回 True"""
         return True
 
-    def check_stop_profit(self, position):
+    def check_stop_profit(self, position, iv_pct=None):
         """
         检查单个卖腿持仓是否触发止盈。
 
         仅比较价格，不需要 Greeks。
         按 intraday_greeks_interval 间隔执行（与 Greeks 更新同步）。
+        iv_pct: 当前品种的 IV 分位数（因子6：动态止盈阈值）
 
         Returns:
             bool: 是否触发止盈
@@ -78,9 +79,9 @@ class IntradayMonitor:
         dte = position.dte if hasattr(position, "dte") else 999
 
         if position.strat == "S1":
-            return should_take_profit_s1(profit_pct, dte)
+            return should_take_profit_s1(profit_pct, dte, iv_pct=iv_pct)
         elif position.strat == "S3":
-            return should_take_profit_s3(profit_pct, dte)
+            return should_take_profit_s3(profit_pct, dte, iv_pct=iv_pct)
         return False
 
     def aggregate_greeks(self, positions, nav):

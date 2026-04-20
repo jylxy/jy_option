@@ -473,10 +473,19 @@ def calc_iv_percentile_batch(iv_series, window=252, min_periods=60):
 
 
 def get_iv_scale(iv_pct, threshold=75):
-    """IV反转因子：高于阈值时减半"""
+    """
+    因子1：波动率自适应仓位缩放
+
+    iv_pct <= threshold: scale = 1.0（满仓）
+    iv_pct > threshold:  scale = 1 - iv_pct/200（线性缩减）
+    最低不低于 0.3（保留30%仓位）
+
+    示例：iv_pct=80 → scale=0.6, iv_pct=90 → scale=0.55, iv_pct=100 → scale=0.5
+    """
     if pd.isna(iv_pct) or iv_pct <= threshold:
         return 1.0
-    return 0.5
+    scale = 1.0 - iv_pct / 200.0
+    return max(scale, 0.3)
 
 
 def should_pause_open(iv_pct, iv_open_threshold=80):
@@ -545,14 +554,36 @@ def should_open_new(product_df_today, dte_target=35, dte_min=15, dte_max=90):
     return result
 
 
-def should_take_profit_s1(profit_pct, dte, tp=0.40, min_dte=5):
-    """S1止盈判断"""
-    return profit_pct >= tp and dte > min_dte
+def should_take_profit_s1(profit_pct, dte, tp=0.40, min_dte=5, iv_pct=None):
+    """
+    S1止盈判断（因子6：动态止盈阈值）
+
+    高IV(>75分位): 止盈上移10%（让利润跑，高IV环境Theta衰减更快）
+    低IV(<25分位): 止盈下移10%（快速落袋，低IV环境收益有限）
+    """
+    adj_tp = tp
+    if iv_pct is not None and not pd.isna(iv_pct):
+        if iv_pct > 75:
+            adj_tp = tp * 1.1  # 高IV: 40% → 44%
+        elif iv_pct < 25:
+            adj_tp = tp * 0.9  # 低IV: 40% → 36%
+    return profit_pct >= adj_tp and dte > min_dte
 
 
-def should_take_profit_s3(profit_pct, dte, tp=0.30, min_dte=5):
-    """S3止盈判断"""
-    return profit_pct >= tp and dte > min_dte
+def should_take_profit_s3(profit_pct, dte, tp=0.30, min_dte=5, iv_pct=None):
+    """
+    S3止盈判断（因子6：动态止盈阈值）
+
+    高IV(>75分位): 止盈上移10%
+    低IV(<25分位): 止盈下移10%
+    """
+    adj_tp = tp
+    if iv_pct is not None and not pd.isna(iv_pct):
+        if iv_pct > 75:
+            adj_tp = tp * 1.1  # 高IV: 30% → 33%
+        elif iv_pct < 25:
+            adj_tp = tp * 0.9  # 低IV: 30% → 27%
+    return profit_pct >= adj_tp and dte > min_dte
 
 
 def should_close_expiry(dte, threshold=1):

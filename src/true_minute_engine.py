@@ -206,11 +206,17 @@ class TrueMinuteEngine:
         self.orders = []
         self.iv_pcts = {}  # {product: pd.Series}
 
+        # IV 历史累积（品种 → 日期列表 + IV 列表）
+        self._iv_history = defaultdict(lambda: {"dates": [], "ivs": []})
+        self._iv_daily_records = []  # 每日 IV 快照，用于输出 CSV
+
         # 当日已平仓的 PnL/fee 累加器（每日开始时清零）
         self._day_realized = {"pnl": 0.0, "fee": 0.0,
                               "s1": 0.0, "s3": 0.0, "s4": 0.0}
         self._current_date_str = ""  # 当前交易日
         self._pending_opens = []  # T日决策、T+1日执行的待开仓列表
+        self._current_avg_iv_pct = np.nan  # 当日组合平均 IV 分位数
+        self._current_iv_pcts = {}  # {product: iv_percentile} 当日各品种 IV 分位数
 
     def _load_config(self, path):
         """加载 config.json，合并默认参数"""
@@ -433,14 +439,16 @@ class TrueMinuteEngine:
             self._close_group(pos, ts, "emergency_close", spread_mode)
 
     def _check_stop_profit_all(self, date_str, ts, spread_mode):
-        """检查所有卖腿的止盈"""
+        """检查所有卖腿的止盈（因子6：动态止盈阈值）"""
         closed_ids = set()
         for pos in list(self.positions):
             if id(pos) in closed_ids:
                 continue
             if pos.role != "sell":
                 continue
-            if not self.monitor.check_stop_profit(pos):
+            # 传入品种的 IV 分位数（因子6）
+            iv_pct = self._current_iv_pcts.get(pos.product)
+            if not self.monitor.check_stop_profit(pos, iv_pct=iv_pct):
                 continue
 
             # 记录即将关闭的组
@@ -499,6 +507,45 @@ class TrueMinuteEngine:
         # 2. 构建 IV Smile
         smiles = build_iv_smiles(daily_df, sorted_products, date_str)
 
+        # 2b. 累积 ATM IV 历史 + 计算 IV 分位数
+        product_iv_pcts = {}  # {product: iv_percentile}
+        for product in sorted_products:
+            prod_df = daily_df[daily_df["product"] == product]
+            if prod_df.empty:
+                continue
+            # 提取当日 ATM IV（moneyness 0.95~1.05, dte 15~90）
+            atm = prod_df[
+                (prod_df["moneyness"].between(0.95, 1.05)) &
+                (prod_df["dte"].between(15, 90)) &
+                (prod_df["implied_vol"] > 0)
+            ]
+            if not atm.empty:
+                daily_atm_iv = atm["implied_vol"].mean()
+                hist = self._iv_history[product]
+                hist["dates"].append(date_str)
+                hist["ivs"].append(daily_atm_iv)
+                # 计算分位数（因果窗口，只用历史数据）
+                iv_series = pd.Series(hist["ivs"], index=hist["dates"])
+                iv_pct = calc_iv_percentile(
+                    iv_series, date_str,
+                    window=cfg.get("iv_window", 252),
+                    min_periods=cfg.get("iv_min_periods", 60)
+                )
+                product_iv_pcts[product] = iv_pct
+                # 记录到每日快照
+                self._iv_daily_records.append({
+                    "date": date_str,
+                    "product": product,
+                    "atm_iv": daily_atm_iv,
+                    "iv_percentile": iv_pct,
+                    "iv_history_len": len(hist["ivs"]),
+                })
+
+        # 组合级平均 IV 分位数（用于 NAV 快照）
+        valid_pcts = [v for v in product_iv_pcts.values() if not np.isnan(v)]
+        self._current_avg_iv_pct = np.mean(valid_pcts) if valid_pcts else np.nan
+        self._current_iv_pcts = product_iv_pcts
+
         # 3. 到期平仓
         for pos in list(self.positions):
             if pos not in self.positions:
@@ -545,9 +592,13 @@ class TrueMinuteEngine:
                 if ef.empty:
                     continue
 
-                # IV 分位数检查
-                # （简化：暂不实现 IV 分位数，后续可从历史数据累积）
-                iv_scale = 1.0
+                # IV 分位数检查 + 因子1（波动率自适应仓位）
+                iv_pct = product_iv_pcts.get(product, np.nan)
+                # IV>80% 暂停 S1/S3 开仓（S4 不受影响）
+                if should_pause_open(iv_pct, iv_open_thr):
+                    continue
+                # 因子1：高IV时缩小仓位 margin_per = base * (1 - iv_pct/200)
+                iv_scale = get_iv_scale(iv_pct, cfg.get("iv_threshold", 75))
 
                 # 保证金检查（含 pending 预估）
                 eff_total_m = total_m + pending_total_m
@@ -974,6 +1025,7 @@ class TrueMinuteEngine:
             "gamma_pnl": attr["gamma_pnl"],
             "theta_pnl": attr["theta_pnl"],
             "vega_pnl": attr["vega_pnl"],
+            "avg_iv_pct": self._current_avg_iv_pct,
             "iv_smile_avg_r2": 0.0,
             "n_positions": len(self.positions),
         })
@@ -1029,6 +1081,13 @@ class TrueMinuteEngine:
                 f.write(f"| Vega(残差) | {v_total:,.0f} | {v_total/safe_all*100:.1f}% |\n")
                 f.write(f"| **合计** | **{all_total:,.0f}** | |\n")
         logger.info("报告输出: %s", report_path)
+
+        # IV 每日数据输出
+        if self._iv_daily_records:
+            iv_path = os.path.join(OUTPUT_DIR, f"iv_daily_{tag}.csv")
+            iv_df = pd.DataFrame(self._iv_daily_records)
+            iv_df.to_csv(iv_path, index=False)
+            logger.info("IV 数据输出: %s (%d 行)", iv_path, len(iv_df))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
