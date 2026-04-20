@@ -410,19 +410,72 @@ class DaySlice:
         获取某标的某分钟的价格（期货close或ETF close）。
 
         Args:
-            underlying_code: 期货合约代码（如 "DCE.m2409"）或 ETF 代码
+            underlying_code: 期货合约代码（如 "m2409" 或 "DCE.m2409"）或 ETF 代码
         Returns:
             float | None
         """
         ts = str(timestamp)
-        # 先查期货
-        v = self._fut_idx.get((ts, underlying_code))
-        if v is not None and v > 0:
-            return v
-        # 查 ETF
-        v = self._etf_idx.get((ts, underlying_code))
-        if v is not None and v > 0:
-            return v
+        uc = str(underlying_code)
+
+        # 用缓存的规范化代码（避免每分钟重复遍历前缀）
+        resolved = self._resolve_spot_code(uc)
+        if resolved:
+            v = self._fut_idx.get((ts, resolved))
+            if v is not None and v > 0:
+                return v
+            v = self._etf_idx.get((ts, resolved))
+            if v is not None and v > 0:
+                return v
+        return None
+
+    def _resolve_spot_code(self, underlying_code):
+        """
+        将 underlying_code 解析为 _fut_idx/_etf_idx 中实际存在的 key。
+        结果缓存，每个 DaySlice 只解析一次。
+        """
+        if not hasattr(self, "_spot_code_cache"):
+            self._spot_code_cache = {}
+
+        if underlying_code in self._spot_code_cache:
+            return self._spot_code_cache[underlying_code]
+
+        # 直接匹配
+        # 取任意一个时间戳来测试 key 是否存在
+        sample_ts = None
+        if self._fut_idx:
+            sample_ts = next(iter(self._fut_idx))[0]
+        elif self._etf_idx:
+            sample_ts = next(iter(self._etf_idx))[0]
+
+        if sample_ts is None:
+            self._spot_code_cache[underlying_code] = None
+            return None
+
+        # 直接匹配
+        if (sample_ts, underlying_code) in self._fut_idx or \
+           (sample_ts, underlying_code) in self._etf_idx:
+            self._spot_code_cache[underlying_code] = underlying_code
+            return underlying_code
+
+        # 不带前缀 → 尝试加前缀
+        if "." not in underlying_code:
+            for prefix in ("DCE", "CZCE", "SHFE", "INE", "CFFEX", "GFEX",
+                           "SSE", "SZSE", "SH", "SZ"):
+                candidate = f"{prefix}.{underlying_code}"
+                if (sample_ts, candidate) in self._fut_idx or \
+                   (sample_ts, candidate) in self._etf_idx:
+                    self._spot_code_cache[underlying_code] = candidate
+                    return candidate
+            # 大写变体
+            uc_upper = underlying_code.upper()
+            if uc_upper != underlying_code:
+                for prefix in ("DCE", "CZCE", "SHFE", "INE", "CFFEX", "GFEX"):
+                    candidate = f"{prefix}.{uc_upper}"
+                    if (sample_ts, candidate) in self._fut_idx:
+                        self._spot_code_cache[underlying_code] = candidate
+                        return candidate
+
+        self._spot_code_cache[underlying_code] = None
         return None
 
     def build_spot_series(self, underlying_code):

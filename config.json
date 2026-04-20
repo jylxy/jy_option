@@ -45,8 +45,8 @@
 
   "greeks_vega_warn": 0.008,
   "greeks_vega_hard": 0.01,
-  "greeks_delta_hard": 0.05,
-  "greeks_delta_target": 0.03,
+  "greeks_delta_hard": 0.10,
+  "greeks_delta_target": 0.07,
   "greeks_vega_target": 0.007,
 
   "intraday_greeks_interval": 15,

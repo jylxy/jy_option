@@ -161,38 +161,53 @@ class IntradayMonitor:
 
     def select_positions_to_reduce(self, positions, breach_type, nav):
         """
-        选择需要减仓的持仓（按 delta/vega 贡献排序）。
+        选择需要减仓的持仓（按 delta/vega 贡献排序，平整组）。
 
-        超过硬限时触发，逐个平仓直到降至 target 以下（缓冲区设计，
-        避免在硬限附近反复触发）。
+        超过硬限时触发，按卖腿的 |delta|/|vega| 降序选组，
+        把同 group_id 的所有腿（卖腿+买腿+保护腿）一起平掉，
+        直到降至 target 以下。
 
         Returns:
-            list: 需要平仓的 position 列表
+            list: 需要平仓的 position 列表（包含整组）
         """
         if breach_type == "delta":
             key_fn = lambda p: abs(p.cash_delta())
             target = self.delta_target
-            current_fn = lambda positions: abs(sum(p.cash_delta() for p in positions))
+            current_fn = lambda pos_list: abs(sum(p.cash_delta() for p in pos_list))
         elif breach_type == "vega":
             key_fn = lambda p: abs(p.cash_vega())
             target = self.vega_target
-            current_fn = lambda positions: abs(sum(p.cash_vega() for p in positions))
+            current_fn = lambda pos_list: abs(sum(p.cash_vega() for p in pos_list))
         else:
             return []
 
         safe_nav = max(nav, 1.0)
-        # 只考虑卖腿（贡献最大的风险来源）
+
+        # 按卖腿的贡献排序，但平仓时带上整组
         sell_positions = [p for p in positions if p.role == "sell"]
         sell_positions.sort(key=key_fn, reverse=True)
 
         to_close = []
+        closed_groups = set()
         remaining = list(positions)
 
         for pos in sell_positions:
             if current_fn(remaining) / safe_nav <= target:
                 break
-            to_close.append(pos)
-            remaining = [p for p in remaining if p is not pos]
+
+            gid = pos.group_id
+            if gid and gid in closed_groups:
+                continue  # 这个组已经被选中了
+            closed_groups.add(gid)
+
+            # 找出同组所有腿
+            if gid:
+                group_members = [p for p in remaining if p.group_id == gid]
+            else:
+                group_members = [pos]
+
+            to_close.extend(group_members)
+            remaining = [p for p in remaining if p not in group_members]
 
         return to_close
 

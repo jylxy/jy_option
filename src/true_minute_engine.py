@@ -1008,10 +1008,9 @@ class TrueMinuteEngine:
                 f.write(f"| {k} | {v:.4f} |\n")
             f.write(f"\n## 策略PnL\n\n")
             if len(nav_df) > 0:
-                last = nav_df.iloc[-1]
-                f.write(f"| S1 | {last.get('s1_pnl', 0):.0f} |\n")
-                f.write(f"| S3 | {last.get('s3_pnl', 0):.0f} |\n")
-                f.write(f"| S4 | {last.get('s4_pnl', 0):.0f} |\n")
+                f.write(f"| S1 | {nav_df['s1_pnl'].sum():.0f} |\n")
+                f.write(f"| S3 | {nav_df['s3_pnl'].sum():.0f} |\n")
+                f.write(f"| S4 | {nav_df['s4_pnl'].sum():.0f} |\n")
                 f.write(f"| 手续费 | {nav_df['fee'].sum():.0f} |\n")
 
             # PnL 归因
