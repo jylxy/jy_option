@@ -177,8 +177,15 @@ class ContractMaster:
                 elif "-P-" in code:
                     ot = "P"
                 else:
-                    n_skip += 1
-                    continue
+                    # 尝试从合约名称提取（ETF 期权等）
+                    name = str(row.get("contract_name", "")).strip()
+                    if "购" in name or "Call" in name or "call" in name:
+                        ot = "C"
+                    elif "沽" in name or "Put" in name or "put" in name:
+                        ot = "P"
+                    else:
+                        n_skip += 1
+                        continue
 
             mult = _safe_int(row.get("contract_multiplier"), 1)
             if mult <= 0:
@@ -466,10 +473,15 @@ class DaySlice:
         info = self._cm.lookup(option_code)
 
         # ── ETF 期权：从 etf_bars 中查找标的 ──
-        if info and _ETF_OPT_CODE_RE.match(option_code):
-            uc = info.get("underlying_code", "")
+        if _ETF_OPT_CODE_RE.match(option_code):
+            if info is None:
+                # ETF 期权 lookup 失败，无法匹配标的
+                return None
+            uc = info.get("underlying_code") or ""
             # underlying_code 可能是合约编号（如 "10000969"），需要映射到 ETF 代码
             etf_code = ETF_UNDERLYING_MAP.get(uc, uc)
+            if not etf_code:
+                return None
             if self.etf_bars is not None and len(self.etf_bars) > 0:
                 etf_codes = set(self.etf_bars["code"].values)
                 # 尝试多种格式
@@ -479,29 +491,29 @@ class DaySlice:
                         return candidate
             return None
 
-        # ── 方法1：从 contract_master 获取 underlying_code ──
+        # ── 方法1：股指期权特殊处理（不依赖 underlying_code）──
+        m_idx = _OPT_CODE_RE.match(option_code) or (
+            _OPT_CODE_RE.match(option_code.split(".", 1)[1])
+            if "." in option_code else None)
+        if m_idx:
+            root = m_idx.group(1).upper()
+            if root in INDEX_OPTION_TO_FUTURE:
+                month = m_idx.group(2)
+                fut_root = INDEX_OPTION_TO_FUTURE[root]
+                exchange = (info or {}).get("exchange_code", "CFFEX")
+                candidates = [
+                    f"{exchange}.{fut_root}{month}",
+                    f"{fut_root}{month}",
+                ]
+                if self.futures_bars is not None and len(self.futures_bars) > 0:
+                    fut_codes = set(self.futures_bars["code"].values)
+                    for c in candidates:
+                        if c in fut_codes:
+                            return c
+
+        # ── 方法2：从 contract_master 获取 underlying_code ──
         if info and info.get("underlying_code"):
             uc = info["underlying_code"]
-
-            # 股指期权特殊处理：IO→IF, HO→IH, MO→IM
-            m_idx = _OPT_CODE_RE.match(option_code) or (
-                _OPT_CODE_RE.match(option_code.split(".", 1)[1])
-                if "." in option_code else None)
-            if m_idx:
-                root = m_idx.group(1).upper()
-                if root in INDEX_OPTION_TO_FUTURE:
-                    month = m_idx.group(2)
-                    fut_root = INDEX_OPTION_TO_FUTURE[root]
-                    exchange = info.get("exchange_code", "CFFEX")
-                    candidates = [
-                        f"{exchange}.{fut_root}{month}",
-                        f"{fut_root}{month}",
-                    ]
-                    if self.futures_bars is not None and len(self.futures_bars) > 0:
-                        fut_codes = set(self.futures_bars["code"].values)
-                        for c in candidates:
-                            if c in fut_codes:
-                                return c
 
             # 通用：直接用 underlying_code 查找
             if self.futures_bars is not None and len(self.futures_bars) > 0:
