@@ -34,7 +34,7 @@ for k in etf_keys:
     print(f"  {k}")
 
 # 看 aggregate_daily 输出的 underlying_code
-cm = loader.cm
+cm = loader.contract_master
 daily_df = day.aggregate_daily(cm)
 if not daily_df.empty and "underlying_code" in daily_df.columns:
     uc_samples = daily_df["underlying_code"].dropna().unique()[:20]

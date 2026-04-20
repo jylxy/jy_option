@@ -432,6 +432,9 @@ class DaySlice:
         """
         将 underlying_code 解析为 _fut_idx/_etf_idx 中实际存在的 key。
         结果缓存，每个 DaySlice 只解析一次。
+
+        Parquet 数据中期货代码格式：大写无前缀（如 AG2602, M2409）
+        ETF 代码格式：纯数字（如 159916, 510300）
         """
         if not hasattr(self, "_spot_code_cache"):
             self._spot_code_cache = {}
@@ -439,7 +442,6 @@ class DaySlice:
         if underlying_code in self._spot_code_cache:
             return self._spot_code_cache[underlying_code]
 
-        # 直接匹配
         # 取任意一个时间戳来测试 key 是否存在
         sample_ts = None
         if self._fut_idx:
@@ -451,29 +453,23 @@ class DaySlice:
             self._spot_code_cache[underlying_code] = None
             return None
 
-        # 直接匹配
-        if (sample_ts, underlying_code) in self._fut_idx or \
-           (sample_ts, underlying_code) in self._etf_idx:
-            self._spot_code_cache[underlying_code] = underlying_code
-            return underlying_code
+        # 构建候选列表（按优先级排序）
+        uc = underlying_code
+        candidates = [
+            uc,                          # 原样
+            uc.upper(),                  # 大写（AG2602）
+            uc.lower(),                  # 小写
+        ]
+        # 去掉交易所前缀（DCE.m2409 → m2409 → M2409）
+        if "." in uc:
+            bare = uc.split(".", 1)[1]
+            candidates.extend([bare, bare.upper(), bare.lower()])
 
-        # 不带前缀 → 尝试加前缀
-        if "." not in underlying_code:
-            for prefix in ("DCE", "CZCE", "SHFE", "INE", "CFFEX", "GFEX",
-                           "SSE", "SZSE", "SH", "SZ"):
-                candidate = f"{prefix}.{underlying_code}"
-                if (sample_ts, candidate) in self._fut_idx or \
-                   (sample_ts, candidate) in self._etf_idx:
-                    self._spot_code_cache[underlying_code] = candidate
-                    return candidate
-            # 大写变体
-            uc_upper = underlying_code.upper()
-            if uc_upper != underlying_code:
-                for prefix in ("DCE", "CZCE", "SHFE", "INE", "CFFEX", "GFEX"):
-                    candidate = f"{prefix}.{uc_upper}"
-                    if (sample_ts, candidate) in self._fut_idx:
-                        self._spot_code_cache[underlying_code] = candidate
-                        return candidate
+        for candidate in candidates:
+            if (sample_ts, candidate) in self._fut_idx or \
+               (sample_ts, candidate) in self._etf_idx:
+                self._spot_code_cache[underlying_code] = candidate
+                return candidate
 
         self._spot_code_cache[underlying_code] = None
         return None
