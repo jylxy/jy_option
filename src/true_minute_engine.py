@@ -218,11 +218,16 @@ class TrueMinuteEngine:
         product_pool = set()
 
         for di, date_str in enumerate(dates):
-            if di % 100 == 0:
+            if di % 10 == 0:
                 nav = self.capital + (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0)
                 elapsed = time.time() - t0
                 logger.info("  [%d/%d] %s NAV=%.0f 持仓=%d 耗时=%.0fs",
                             di, len(dates), date_str, nav, len(self.positions), elapsed)
+                # 每10天增量保存 NAV CSV，方便中途查看
+                if self.nav_records:
+                    _nav_path = os.path.join(OUTPUT_DIR, f"nav_{tag}.csv")
+                    os.makedirs(OUTPUT_DIR, exist_ok=True)
+                    pd.DataFrame(self.nav_records).to_csv(_nav_path, index=False)
 
             t_day = time.time()
 
