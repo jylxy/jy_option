@@ -43,9 +43,11 @@
   "hedge_rounding": "min_abs_residual",
   "hedge_cost_mode": "none",
 
-  "greeks_vega_warn": 0.015,
-  "greeks_vega_hard": 0.02,
-  "greeks_delta_hard": 0.20,
+  "greeks_vega_warn": 0.008,
+  "greeks_vega_hard": 0.01,
+  "greeks_delta_hard": 0.05,
+  "greeks_delta_target": 0.03,
+  "greeks_vega_target": 0.007,
 
   "intraday_greeks_interval": 15,
   "spread_mode": "tick",

@@ -65,7 +65,7 @@ class Position:
     __slots__ = [
         "strat", "product", "code", "opt_type", "strike",
         "open_price", "n", "open_date", "mult", "expiry", "mr", "role",
-        "prev_price", "cur_price", "cur_spot", "exchange",
+        "prev_price", "cur_price", "cur_spot", "prev_spot", "exchange",
         "cur_delta", "cur_gamma", "cur_vega", "cur_theta", "cur_iv",
         "iv_residual", "group_id", "dte",
         "underlying_code", "min_price_tick",
@@ -90,6 +90,7 @@ class Position:
         self.prev_price = open_price
         self.cur_price = open_price
         self.cur_spot = spot
+        self.prev_spot = spot
         self.exchange = exchange
         self.cur_delta = 0.0
         self.cur_gamma = 0.0
@@ -147,6 +148,36 @@ class Position:
         """Cash Theta = sign × theta × 乘数 × 手数"""
         sign = 1 if self.role in ("buy", "protect") else -1
         return sign * self.cur_theta * self.mult * self.n
+
+    def pnl_attribution(self):
+        """
+        PnL 归因分解（Taylor 展开近似）。
+
+        delta_pnl = sign × delta × dS × mult × n
+        gamma_pnl = sign × 0.5 × gamma × dS² × mult × n
+        theta_pnl = sign × theta × (1/365) × mult × n
+        vega_pnl  = total_pnl - delta_pnl - gamma_pnl - theta_pnl（残差）
+
+        Returns:
+            dict: {delta_pnl, gamma_pnl, theta_pnl, vega_pnl, total_pnl}
+        """
+        sign = 1 if self.role in ("buy", "protect") else -1
+        total = self.daily_pnl()
+        ds = (self.cur_spot or 0) - (self.prev_spot or 0)
+
+        d_pnl = sign * self.cur_delta * ds * self.mult * self.n
+        g_pnl = sign * 0.5 * self.cur_gamma * ds * ds * self.mult * self.n
+        t_pnl = sign * self.cur_theta * (1.0 / 365.0) * self.mult * self.n
+        # Vega PnL 作为残差（包含 IV 变化 + 高阶项 + 离散化误差）
+        v_pnl = total - d_pnl - g_pnl - t_pnl
+
+        return {
+            "delta_pnl": d_pnl,
+            "gamma_pnl": g_pnl,
+            "theta_pnl": t_pnl,
+            "vega_pnl": v_pnl,
+            "total_pnl": total,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -537,10 +568,16 @@ class TrueMinuteEngine:
                 # ── S3 开仓（优先）──
                 eff_s3_m = s3_m + pending_s3_m
                 if s3_cap and eff_s3_m / max(nav, 1) < s3_cap:
-                    for ot in ["P", "C"]:
+                    # S3 也使用 Delta 平衡的方向优先级
+                    s3_ot_order = self.monitor.get_delta_preferred_order(
+                        self.positions, nav)
+                    for ot in s3_ot_order:
                         if any(p.strat == "S3" and p.product == product and
                                p.opt_type == ot and p.role == "sell"
                                for p in self.positions):
+                            continue
+                        if self.monitor.should_skip_direction(
+                                self.positions, nav, ot):
                             continue
                         old_pending_len = len(self._pending_opens)
                         self._try_open_s3(ef, product, ot, spot, mult, mr,
@@ -562,10 +599,17 @@ class TrueMinuteEngine:
                 # ── S1 开仓 ──
                 eff_s1_m = s1_m + pending_s1_m
                 if s1_cap and eff_s1_m / max(nav, 1) < s1_cap:
-                    for ot in ["P", "C"]:
+                    # Delta 平衡：根据净 Delta 方向决定 Put/Call 优先级
+                    s1_ot_order = self.monitor.get_delta_preferred_order(
+                        self.positions, nav)
+                    for ot in s1_ot_order:
                         eff_total_m = total_m + pending_total_m
                         if margin_cap and eff_total_m / max(nav, 1) >= margin_cap:
                             break
+                        # 跳过会加剧 Delta 偏离的方向
+                        if self.monitor.should_skip_direction(
+                                self.positions, nav, ot):
+                            continue
                         old_pending_len = len(self._pending_opens)
                         self._try_open_s1(ef, product, ot, mult, mr,
                                           exchange, exp, nav, margin_per,
@@ -893,6 +937,16 @@ class TrueMinuteEngine:
         s4_pnl = (sum(p.daily_pnl() for p in self.positions if p.strat == "S4")
                   + self._day_realized["s4"])
 
+        # PnL 归因（仅持仓部分，已平仓无法归因）
+        attr = {"delta_pnl": 0.0, "gamma_pnl": 0.0,
+                "theta_pnl": 0.0, "vega_pnl": 0.0}
+        for p in self.positions:
+            pa = p.pnl_attribution()
+            attr["delta_pnl"] += pa["delta_pnl"]
+            attr["gamma_pnl"] += pa["gamma_pnl"]
+            attr["theta_pnl"] += pa["theta_pnl"]
+            attr["vega_pnl"] += pa["vega_pnl"]
+
         cum_pnl = (self.nav_records[-1]["cum_pnl"] if self.nav_records else 0) + day_pnl
         nav = self.capital + cum_pnl
         margin = sum(p.cur_margin() for p in self.positions if p.role == "sell")
@@ -916,13 +970,18 @@ class TrueMinuteEngine:
             "cash_vega": cv / max(nav, 1),
             "cash_gamma": cg / max(nav, 1),
             "cash_theta": ct,
+            "delta_pnl": attr["delta_pnl"],
+            "gamma_pnl": attr["gamma_pnl"],
+            "theta_pnl": attr["theta_pnl"],
+            "vega_pnl": attr["vega_pnl"],
             "iv_smile_avg_r2": 0.0,
             "n_positions": len(self.positions),
         })
 
-        # 重置 prev_price 为 cur_price（为下一天准备）
+        # 重置 prev_price 和 prev_spot 为当前值（为下一天准备）
         for p in self.positions:
             p.prev_price = p.cur_price
+            p.prev_spot = p.cur_spot
 
     def _output_results(self, nav_df, orders_df, stats, tag, elapsed):
         """输出 nav/orders/report CSV 和 Markdown"""
@@ -954,6 +1013,22 @@ class TrueMinuteEngine:
                 f.write(f"| S3 | {last.get('s3_pnl', 0):.0f} |\n")
                 f.write(f"| S4 | {last.get('s4_pnl', 0):.0f} |\n")
                 f.write(f"| 手续费 | {nav_df['fee'].sum():.0f} |\n")
+
+            # PnL 归因
+            if "delta_pnl" in nav_df.columns:
+                f.write(f"\n## PnL 归因\n\n")
+                f.write("| 来源 | 累计PnL | 占比 |\n|------|---------|------|\n")
+                d_total = nav_df["delta_pnl"].sum()
+                g_total = nav_df["gamma_pnl"].sum()
+                t_total = nav_df["theta_pnl"].sum()
+                v_total = nav_df["vega_pnl"].sum()
+                all_total = d_total + g_total + t_total + v_total
+                safe_all = max(abs(all_total), 1)
+                f.write(f"| Delta | {d_total:,.0f} | {d_total/safe_all*100:.1f}% |\n")
+                f.write(f"| Gamma | {g_total:,.0f} | {g_total/safe_all*100:.1f}% |\n")
+                f.write(f"| Theta | {t_total:,.0f} | {t_total/safe_all*100:.1f}% |\n")
+                f.write(f"| Vega(残差) | {v_total:,.0f} | {v_total/safe_all*100:.1f}% |\n")
+                f.write(f"| **合计** | **{all_total:,.0f}** | |\n")
         logger.info("报告输出: %s", report_path)
 
 

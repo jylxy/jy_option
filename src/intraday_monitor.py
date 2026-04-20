@@ -29,9 +29,11 @@ class IntradayMonitor:
               intraday_greeks_interval: int — Greeks/止盈 更新间隔（分钟，默认15）
               fee: float — 每手手续费（元）
         """
-        self.delta_hard = config.get("greeks_delta_hard", 0.20)
-        self.vega_hard = config.get("greeks_vega_hard", 0.02)
-        self.vega_warn = config.get("greeks_vega_warn", 0.015)
+        self.delta_hard = config.get("greeks_delta_hard", 0.05)
+        self.delta_target = config.get("greeks_delta_target", 0.03)
+        self.vega_hard = config.get("greeks_vega_hard", 0.01)
+        self.vega_target = config.get("greeks_vega_target", 0.007)
+        self.vega_warn = config.get("greeks_vega_warn", 0.008)
         self.protect_trigger_otm = config.get("s3_protect_trigger_otm_pct", 5.0)
         self.interval = config.get("intraday_greeks_interval", 15)
         self.fee_per_hand = config.get("fee", 3)
@@ -161,18 +163,19 @@ class IntradayMonitor:
         """
         选择需要减仓的持仓（按 delta/vega 贡献排序）。
 
-        逐个选择直到预计 Greeks 降至阈值以下。
+        超过硬限时触发，逐个平仓直到降至 target 以下（缓冲区设计，
+        避免在硬限附近反复触发）。
 
         Returns:
             list: 需要平仓的 position 列表
         """
         if breach_type == "delta":
             key_fn = lambda p: abs(p.cash_delta())
-            threshold = self.delta_hard
+            target = self.delta_target
             current_fn = lambda positions: abs(sum(p.cash_delta() for p in positions))
         elif breach_type == "vega":
             key_fn = lambda p: abs(p.cash_vega())
-            threshold = self.vega_hard
+            target = self.vega_target
             current_fn = lambda positions: abs(sum(p.cash_vega() for p in positions))
         else:
             return []
@@ -186,12 +189,55 @@ class IntradayMonitor:
         remaining = list(positions)
 
         for pos in sell_positions:
-            if current_fn(remaining) / safe_nav <= threshold:
+            if current_fn(remaining) / safe_nav <= target:
                 break
             to_close.append(pos)
             remaining = [p for p in remaining if p is not pos]
 
         return to_close
+
+
+    def get_delta_preferred_order(self, positions, nav):
+        """
+        根据当前净 Cash Delta 方向，返回 S1 开仓的 Put/Call 优先顺序。
+
+        净 Delta > 0（偏多）→ 优先卖 Call（增加负 delta）→ ["C", "P"]
+        净 Delta < 0（偏空）→ 优先卖 Put（增加正 delta）→ ["P", "C"]
+        净 Delta ≈ 0         → 默认 ["P", "C"]
+
+        这是预防性 Delta 平衡：通过调整开仓方向把 Delta 控制在 ±5% 以内，
+        而不是等超限后被动平仓。
+        """
+        cd = sum(p.cash_delta() for p in positions)
+        safe_nav = max(nav, 1.0)
+        delta_pct = cd / safe_nav
+
+        if delta_pct > 0.01:   # 偏多 1% 以上 → 优先卖 Call
+            return ["C", "P"]
+        elif delta_pct < -0.01:  # 偏空 1% 以上 → 优先卖 Put
+            return ["P", "C"]
+        else:
+            return ["P", "C"]  # 中性时默认卖 Put
+
+    def should_skip_direction(self, positions, nav, opt_type):
+        """
+        检查是否应该跳过某个方向的开仓。
+
+        如果当前 Delta 已经接近硬限（>= target），且新开仓会加剧偏离，则跳过。
+        卖 Put → 增加正 delta（偏多方向）
+        卖 Call → 增加负 delta（偏空方向）
+        """
+        cd = sum(p.cash_delta() for p in positions)
+        safe_nav = max(nav, 1.0)
+        delta_pct = cd / safe_nav
+
+        if opt_type == "P" and delta_pct >= self.delta_target:
+            # 已经偏多到 target，不再卖 Put（会继续增加正 delta）
+            return True
+        if opt_type == "C" and delta_pct <= -self.delta_target:
+            # 已经偏空到 target，不再卖 Call（会继续增加负 delta）
+            return True
+        return False
 
 
     # ── 买卖价差计算 ──────────────────────────────────────────────────────────
