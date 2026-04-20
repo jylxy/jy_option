@@ -762,22 +762,18 @@ class ParquetDayLoader:
                 except Exception as exc:
                     logger.warning("  分区文件读取失败 %s: %s", legacy_path, exc)
 
-        # 方法2：DuckDB 全量扫描
-        if HAS_DUCKDB and parquet_filename:
-            path = os.path.join(self.data_dir, parquet_filename)
-            if os.path.exists(path):
-                try:
-                    conn = duckdb.connect()
-                    df = conn.execute(f"""
-                        SELECT * FROM read_parquet('{path}')
-                        WHERE datetime >= '{date_str} 00:00'
-                          AND datetime < '{next_date_str} 00:00'
-                    """).fetchdf()
-                    conn.close()
-                    if len(df) > 0:
-                        return df
-                except Exception as exc:
-                    logger.warning("  DuckDB 加载失败，fallback: %s", exc)
+        # 方法2：DuckDB 全量扫描（仅在无分区文件且明确需要时使用）
+        # 注意：对 32GB 文件全量扫描会非常慢，仅作为最后手段
+        # 如果分区目录存在但目标日期不在其中，说明该日期无数据，直接返回空
+        if parquet_filename:
+            data_type = parquet_filename.replace("1MINRESULT.parquet", "").lower()
+            type_map = {"option": "option", "future": "futures", "etf": "etf"}
+            part_type = type_map.get(data_type, data_type)
+            part_base = os.path.join(self.data_dir, "partitioned", part_type)
+            if os.path.isdir(part_base):
+                # 分区目录存在但目标日期不在 → 该日期无数据
+                logger.debug("  分区目录存在但无 %s 数据，跳过", date_str)
+                return pd.DataFrame()
 
         # 方法3：PyArrow Scanner fallback
         if dataset is not None:
@@ -880,7 +876,21 @@ class ParquetDayLoader:
         logger.info("扫描交易日列表...")
         dates_set = set()
 
-        # 方法1：从 row_group 索引提取所有日期范围，用 bdate_range 生成完整列表
+        # 从分区目录名提取实际交易日（最准确，不会包含非交易日）
+        part_base = os.path.join(self.data_dir, "partitioned", "option")
+        if os.path.isdir(part_base):
+            for d in os.listdir(part_base):
+                if d.startswith("trade_date=") and len(d) == 21:
+                    date_str = d[11:]  # "trade_date=2024-01-02" → "2024-01-02"
+                    dates_set.add(date_str)
+            if dates_set:
+                self._trading_dates = sorted(dates_set)
+                logger.info("  从分区目录提取: %d 个交易日: %s ~ %s",
+                            len(self._trading_dates),
+                            self._trading_dates[0], self._trading_dates[-1])
+                return self._trading_dates
+
+        # Fallback：从 row_group 索引 + bdate_range 推断
         all_rg = self._fut_rg_index or self._opt_rg_index
         if all_rg:
             for _, min_d, max_d in all_rg:
@@ -890,7 +900,6 @@ class ParquetDayLoader:
                     dates_set.add(max_d)
 
         if len(dates_set) >= 2:
-            # 用 bdate_range 生成工作日序列
             min_d = min(dates_set)
             max_d = max(dates_set)
             all_bdays = pd.bdate_range(min_d, max_d).strftime("%Y-%m-%d").tolist()

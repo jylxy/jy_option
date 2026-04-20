@@ -246,7 +246,7 @@ def test_engine_single_day(date_str=None):
     # 获取一个交易日（选 2024 年以后，确保有期权数据）
     dates = engine.loader.get_trading_dates()
     if date_str is None:
-        recent = [d for d in dates if d >= "2024-01-01"]
+        recent = [d for d in dates if d >= "2024-01-02"]
         if not recent:
             recent = dates[-5:]
         date_str = recent[0]
