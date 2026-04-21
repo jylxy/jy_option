@@ -259,7 +259,33 @@ class TrueMinuteEngine:
         else:
             warmup_dates = []
 
-        if warmup_dates:
+        # 尝试从缓存加载（秒级完成）
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        iv_cache_path = os.path.join(OUTPUT_DIR, "iv_history_cache.json")
+        cache_loaded = False
+        if warmup_dates and os.path.exists(iv_cache_path):
+            try:
+                with open(iv_cache_path, "r") as f:
+                    cache = json.load(f)
+                # 检查缓存覆盖范围
+                cache_end = cache.get("_meta", {}).get("end_date", "")
+                if cache_end >= warmup_dates[-1]:
+                    for product, data in cache.items():
+                        if product == "_meta":
+                            continue
+                        # 只取 warmup 范围内的数据
+                        hist = self._iv_history[product]
+                        for d, iv in zip(data["dates"], data["ivs"]):
+                            if d >= warmup_dates[0] and d <= warmup_dates[-1]:
+                                hist["dates"].append(d)
+                                hist["ivs"].append(iv)
+                    n_products = sum(1 for h in self._iv_history.values() if h["ivs"])
+                    logger.info("IV 预热: 从缓存加载, %d 个品种有历史", n_products)
+                    cache_loaded = True
+            except (json.JSONDecodeError, KeyError, OSError) as exc:
+                logger.warning("IV 缓存加载失败: %s, 重新计算", exc)
+
+        if warmup_dates and not cache_loaded:
             logger.info("IV 预热: %d 天 (%s ~ %s)", len(warmup_dates),
                         warmup_dates[0], warmup_dates[-1])
             t_warmup = time.time()
@@ -288,6 +314,19 @@ class TrueMinuteEngine:
             logger.info("IV 预热完成: %.0f 秒, %d 个品种有历史",
                         time.time() - t_warmup,
                         sum(1 for h in self._iv_history.values() if h["ivs"]))
+            # 保存缓存（下次秒级加载）
+            try:
+                cache_data = {"_meta": {"end_date": warmup_dates[-1],
+                                         "n_days": len(warmup_dates)}}
+                for product, hist in self._iv_history.items():
+                    if hist["ivs"]:
+                        cache_data[product] = {"dates": hist["dates"],
+                                                "ivs": hist["ivs"]}
+                with open(iv_cache_path, "w") as f:
+                    json.dump(cache_data, f)
+                logger.info("IV 缓存已保存: %s", iv_cache_path)
+            except OSError as exc:
+                logger.warning("IV 缓存保存失败: %s", exc)
 
         # 品种池（简化：使用全部有数据的品种）
         product_pool = set()
