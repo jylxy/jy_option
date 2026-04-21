@@ -251,6 +251,44 @@ class TrueMinuteEngine:
 
         logger.info("回测 %d 天: %s ~ %s", len(dates), dates[0], dates[-1])
 
+        # ── IV 预热：加载 start_date 前 252 天的 ATM IV 历史 ──
+        all_dates = self.loader.get_trading_dates()
+        warmup_days = self.config.get("iv_window", 252)
+        if start_date:
+            warmup_dates = [d for d in all_dates if d < start_date][-warmup_days:]
+        else:
+            warmup_dates = []
+
+        if warmup_dates:
+            logger.info("IV 预热: %d 天 (%s ~ %s)", len(warmup_dates),
+                        warmup_dates[0], warmup_dates[-1])
+            t_warmup = time.time()
+            for wi, wd in enumerate(warmup_dates):
+                if wi % 50 == 0:
+                    logger.info("  预热 [%d/%d] %s", wi, len(warmup_dates), wd)
+                try:
+                    day_slice = self.loader.load_day(wd)
+                    daily_df = day_slice.aggregate_daily(self.cm)
+                    if not daily_df.empty:
+                        for product in daily_df["product"].unique():
+                            prod_df = daily_df[daily_df["product"] == product]
+                            atm = prod_df[
+                                (prod_df["moneyness"].between(0.95, 1.05)) &
+                                (prod_df["dte"].between(15, 90)) &
+                                (prod_df["implied_vol"] > 0)
+                            ]
+                            if not atm.empty:
+                                daily_atm_iv = atm["implied_vol"].mean()
+                                hist = self._iv_history[product]
+                                hist["dates"].append(wd)
+                                hist["ivs"].append(daily_atm_iv)
+                    day_slice.release()
+                except Exception as exc:
+                    logger.debug("  预热 %s 跳过: %s", wd, exc)
+            logger.info("IV 预热完成: %.0f 秒, %d 个品种有历史",
+                        time.time() - t_warmup,
+                        sum(1 for h in self._iv_history.values() if h["ivs"]))
+
         # 品种池（简化：使用全部有数据的品种）
         product_pool = set()
 
