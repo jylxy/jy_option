@@ -17,6 +17,7 @@ from margin_model import estimate_margin, resolve_margin_ratio
 DEFAULT_PARAMS = {
     "capital": 10_000_000,
     "daily_agg_batch_size": 10,
+    "iv_warmup_retry_skipped_products": False,
     "margin_per": 0.02,
     "margin_cap": 0.50,
     "s1_margin_cap": 0.25,

@@ -544,19 +544,23 @@ class ToolkitMinuteEngine:
         warmup_dates = [d for d in all_dates if d < dates[0]][-warmup_days:]
         if warmup_dates:
             cache_path = warmup_cache_path(OUTPUT_DIR)
-            cached_products = load_iv_warmup_cache(
+            cached_products, skipped_warmup_products = load_iv_warmup_cache(
                 cache_path,
                 product_pool,
                 self._iv_history,
                 self._spot_history,
                 required_end_date=warmup_dates[-1],
                 logger=logger,
+                return_skipped=True,
             )
+            if self.config.get('iv_warmup_retry_skipped_products', False):
+                skipped_warmup_products = set()
 
-            missing = set(product_pool - cached_products)
+            missing = set(product_pool - cached_products - skipped_warmup_products)
             if self.config.get('portfolio_dynamic_corr_control_enabled', True):
                 missing_spot = {
                     product for product in product_pool
+                    if product not in skipped_warmup_products
                     if not self._spot_history[product]['spots']
                 }
                 missing |= missing_spot
@@ -567,6 +571,11 @@ class ToolkitMinuteEngine:
                 logger.info("IV预热: 缓存命中 %d个品种, 补跑 %d个: %s",
                             len(cached_products), len(missing), sorted(missing))
                 self._warmup_iv_consistent(warmup_dates, missing)
+                warmup_failed = {
+                    product for product in missing
+                    if not self._iv_history[product]['ivs']
+                }
+                skipped_warmup_products |= warmup_failed
                 save_iv_warmup_cache(
                     cache_path,
                     warmup_dates[-1],
@@ -574,6 +583,7 @@ class ToolkitMinuteEngine:
                     self._spot_history,
                     n_days=len(warmup_dates),
                     logger=logger,
+                    skipped_products=skipped_warmup_products,
                 )
             else:
                 logger.info("IV预热: 从缓存加载, %d个品种全部命中", len(cached_products))

@@ -201,6 +201,37 @@ class IVWarmupTest(unittest.TestCase):
         self.assertEqual(loaded_iv["CU"]["ivs"], [0.2])
         self.assertEqual(loaded_spot["CU"]["spots"], [80000.0])
 
+    def test_warmup_cache_roundtrip_with_skipped_products(self):
+        iv_history = defaultdict(lambda: {"dates": [], "ivs": []})
+        spot_history = defaultdict(lambda: {"dates": [], "spots": []})
+        iv_history["CU"] = {"dates": ["2025-05-06"], "ivs": [0.2]}
+        spot_history["CU"] = {"dates": ["2025-05-06"], "spots": [80000.0]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "iv_warmup_cache.json")
+            self.assertTrue(save_iv_warmup_cache(
+                path,
+                "2025-05-30",
+                iv_history,
+                spot_history,
+                n_days=10,
+                skipped_products={"BU", "ZC"},
+            ))
+
+            loaded_iv = defaultdict(lambda: {"dates": [], "ivs": []})
+            loaded_spot = defaultdict(lambda: {"dates": [], "spots": []})
+            cached, skipped = load_iv_warmup_cache(
+                path,
+                {"CU", "AU", "BU", "ZC"},
+                loaded_iv,
+                loaded_spot,
+                "2025-05-20",
+                return_skipped=True,
+            )
+
+        self.assertEqual(cached, {"CU"})
+        self.assertEqual(skipped, {"BU", "ZC"})
+
 
 if __name__ == "__main__":
     unittest.main()

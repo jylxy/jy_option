@@ -49,11 +49,11 @@ def warmup_cache_path(output_dir):
 
 
 def load_iv_warmup_cache(cache_path, product_pool, iv_history, spot_history,
-                         required_end_date, logger=None):
+                         required_end_date, logger=None, return_skipped=False):
     """Load cached IV/spot histories that cover the requested warmup window."""
     cached_products = set()
     if not os.path.exists(cache_path):
-        return cached_products
+        return (cached_products, set()) if return_skipped else cached_products
 
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
@@ -61,13 +61,14 @@ def load_iv_warmup_cache(cache_path, product_pool, iv_history, spot_history,
     except (json.JSONDecodeError, OSError) as exc:
         if logger is not None:
             logger.warning("IV warmup cache load failed: %s", exc)
-        return cached_products
+        return (cached_products, set()) if return_skipped else cached_products
 
     cache_end = cache.get("_meta", {}).get("end_date", "")
     if cache_end < required_end_date:
-        return cached_products
+        return (cached_products, set()) if return_skipped else cached_products
 
     requested = set(product_pool)
+    skipped_products = set(cache.get("_meta", {}).get("skipped_products", [])) & requested
     for product, data in cache.items():
         if product == "_meta" or product not in requested:
             continue
@@ -78,15 +79,17 @@ def load_iv_warmup_cache(cache_path, product_pool, iv_history, spot_history,
         spot_hist["dates"] = list(data.get("spot_dates", []))
         spot_hist["spots"] = list(data.get("spots", []))
         cached_products.add(product)
-    return cached_products
+    return (cached_products, skipped_products) if return_skipped else cached_products
 
 
 def save_iv_warmup_cache(cache_path, end_date, iv_history, spot_history,
-                         n_days=None, logger=None):
+                         n_days=None, logger=None, skipped_products=None):
     """Persist IV/spot warmup histories. Returns True on success."""
     cache = {"_meta": {"end_date": end_date}}
     if n_days is not None:
         cache["_meta"]["n_days"] = int(n_days)
+    if skipped_products:
+        cache["_meta"]["skipped_products"] = sorted(set(skipped_products))
     for product, hist in iv_history.items():
         if not hist.get("ivs"):
             continue
@@ -110,7 +113,9 @@ def save_iv_warmup_cache(cache_path, end_date, iv_history, spot_history,
         return False
 
     if logger is not None:
-        logger.info("  IV warmup cache saved: %s (%d products)", cache_path, len(cache) - 1)
+        n_skipped = len(cache.get("_meta", {}).get("skipped_products", []))
+        logger.info("  IV warmup cache saved: %s (%d products, %d skipped)",
+                    cache_path, len(cache) - 1, n_skipped)
     return True
 
 
