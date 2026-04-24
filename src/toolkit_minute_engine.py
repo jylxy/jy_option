@@ -17,7 +17,6 @@ import json
 import time
 import logging
 import argparse
-import re
 from datetime import datetime, date, timedelta
 from collections import Counter, defaultdict
 
@@ -44,6 +43,7 @@ from strategy_rules import (
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
+from contract_provider import ContractInfo
 from budget_model import (
     normalize_open_budget,
     get_effective_open_budget,
@@ -61,25 +61,6 @@ OPTION_INFO_TABLE = "option_basic_info"
 OPTION_MINUTE_TABLE = "option_hf_1min_non_ror"
 FUTURE_MINUTE_TABLE = "future_hf_1min"
 ETF_MINUTE_TABLE = "etf_hf_1min_non_ror"
-
-# ths_code后缀 → 交易所映射
-SUFFIX_TO_EXCHANGE = {
-    'DCE': 'DCE', 'SHF': 'SHFE', 'CZC': 'CZCE', 'INE': 'INE',
-    'GFE': 'GFEX', 'CFE': 'CFFEX', 'SH': 'SSE', 'SZ': 'SZSE',
-}
-
-# 股指期权→期货映射（用于标的价格推算）
-INDEX_OPT_ROOT = {'IO', 'HO', 'MO'}
-INDEX_OPTION_TO_FUTURE = {'IO': 'IF', 'HO': 'IH', 'MO': 'IM'}
-OPTION_MONTH_RE = re.compile(r'^([A-Za-z]+)(\d{3,4})')
-ETF_NAME_PATTERNS = [
-    ("科创50", {"SSE": "588000.SH"}),
-    ("科创板50", {"SSE": "588000.SH"}),
-    ("50ETF", {"SSE": "510050.SH"}),
-    ("300ETF", {"SSE": "510300.SH", "SZSE": "159919.SZ"}),
-    ("500ETF", {"SSE": "510500.SH"}),
-    ("创业板ETF", {"SZSE": "159915.SZ"}),
-]
 
 PRODUCT_BUCKET_MAP = {
     "510050": "equity_core",
@@ -219,241 +200,7 @@ def _build_underlying_alias_map(underlying_codes):
 # 合约属性管理
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ContractInfo:
-    """从 option_basic_info 加载的合约属性缓存"""
 
-    def __init__(self):
-        self._cache = {}  # ths_code → dict
-        self._products = {}  # product_root → set of ths_codes
-        self._future_margin_ratios = {}
-        self._loaded = False
-
-    def load(self):
-        """从 toolkit 加载全部合约属性"""
-        if self._loaded:
-            return
-        cache_path = os.path.join(CACHE_DIR, 'contract_info_cache.json')
-        if os.path.exists(cache_path):
-            try:
-                t0 = time.time()
-                with open(cache_path, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                self._cache = cache.get('by_code', {})
-                self._products = {
-                    product: set(codes) for product, codes in cache.get('by_product', {}).items()
-                }
-                self._future_margin_ratios = cache.get('future_margin_ratios', {}) or {}
-                cache_has_underlying = any(
-                    isinstance(v, dict) and v.get('underlying_code')
-                    for v in self._cache.values()
-                )
-                if self._cache and cache_has_underlying:
-                    if not self._future_margin_ratios:
-                        self._load_future_margin_ratios()
-                    self._loaded = True
-                    logger.info("加载合约属性缓存: %d 个合约, %d 个品种, %.1f秒",
-                                len(self._cache), len(self._products), time.time() - t0)
-                    return
-                logger.warning("合约属性缓存缺少 underlying_code，回退数据库重建缓存")
-            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                logger.warning("合约属性缓存加载失败，回退数据库查询: %s", exc)
-
-        logger.info("加载合约属性 option_basic_info ...")
-        t0 = time.time()
-        df = select_bars_sql("""
-            SELECT ths_code, option_short_name, contract_type,
-                   strike_price, maturity_date, last_strike_date,
-                   contract_multiplier, strike_method
-            FROM option_basic_info
-        """)
-        if df is None or df.empty:
-            raise RuntimeError("option_basic_info 加载失败")
-
-        for _, row in df.iterrows():
-            code = row['ths_code']
-            # 解析交易所
-            suffix = code.rsplit('.', 1)[-1] if '.' in code else ''
-            exchange = SUFFIX_TO_EXCHANGE.get(suffix, '')
-
-            # 解析期权类型
-            ct = str(row.get('contract_type', ''))
-            if '看涨' in ct or 'call' in ct.lower():
-                opt_type = 'C'
-            elif '看跌' in ct or 'put' in ct.lower():
-                opt_type = 'P'
-            else:
-                opt_type = 'C' if 'C' in code.upper().split('.')[0] else 'P'
-
-            # 解析品种根码
-            short_name = str(row.get('option_short_name', ''))
-            underlying_code = self._extract_underlying_code(code, exchange, short_name)
-            product_root = self._extract_product_root(code, exchange, short_name)
-
-            strike = float(row['strike_price']) if pd.notna(row['strike_price']) else 0
-            mult = float(row['contract_multiplier']) if pd.notna(row['contract_multiplier']) else 10
-            expiry = str(row['maturity_date'])[:10] if pd.notna(row['maturity_date']) else ''
-
-            info = {
-                'ths_code': code,
-                'option_type': opt_type,
-                'strike': strike,
-                'expiry_date': expiry,
-                'multiplier': mult,
-                'exchange': exchange,
-                'product_root': product_root,
-                'underlying_code': underlying_code,
-                'exercise_type': str(row.get('strike_method', '')),
-                'short_name': short_name,
-            }
-            self._cache[code] = info
-            if product_root:
-                self._products.setdefault(product_root, set()).add(code)
-
-        self._loaded = True
-        self._load_future_margin_ratios()
-        logger.info("  加载完成: %d 个合约, %d 个品种, %.1f秒",
-                    len(self._cache), len(self._products), time.time() - t0)
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'by_code': self._cache,
-                    'by_product': {k: sorted(v) for k, v in self._products.items()},
-                    'future_margin_ratios': self._future_margin_ratios,
-                }, f)
-        except OSError as exc:
-            logger.warning("合约属性缓存保存失败: %s", exc)
-
-    @staticmethod
-    def _parse_margin_ratio(value):
-        if value is None:
-            return None
-        if isinstance(value, str):
-            value = value.strip().replace('%', '')
-            if not value:
-                return None
-        try:
-            ratio = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(ratio) or ratio <= 0:
-            return None
-        if ratio > 1:
-            ratio /= 100.0
-        return ratio if 0 < ratio < 1 else None
-
-    def _load_future_margin_ratios(self):
-        if self._future_margin_ratios:
-            return
-        try:
-            df = select_bars_sql("""
-                SELECT ths_code, initial_td_deposit
-                FROM future_basic_info
-                WHERE initial_td_deposit IS NOT NULL
-            """)
-        except Exception as exc:
-            logger.warning("future_basic_info margin ratio load failed: %s", exc)
-            return
-        if df is None or df.empty:
-            return
-        ratios = {}
-        for _, row in df.iterrows():
-            ratio = self._parse_margin_ratio(row.get('initial_td_deposit'))
-            if ratio is None:
-                continue
-            code = str(row.get('ths_code', '')).upper().strip()
-            if not code:
-                continue
-            ratios[code] = ratio
-            ratios[code.split('.', 1)[0]] = ratio
-        self._future_margin_ratios = ratios
-        logger.info("  loaded future margin ratios: %d keys", len(ratios))
-
-    def get_margin_ratio(self, exchange=None, product=None, underlying_code=None, config=None):
-        self._load_future_margin_ratios()
-        data_ratio = None
-        if str(exchange or '').upper() in ('SHFE', 'INE', 'DCE', 'CZCE', 'GFEX') and underlying_code:
-            key = str(underlying_code).upper().strip()
-            data_ratio = self._future_margin_ratios.get(key)
-            if data_ratio is None:
-                data_ratio = self._future_margin_ratios.get(key.split('.', 1)[0])
-        return resolve_margin_ratio(
-            exchange=exchange,
-            product=product,
-            config=config,
-            data_ratio=data_ratio,
-        )
-
-    def _infer_etf_underlying_code(self, short_name, exchange):
-        text = str(short_name or "")
-        for pattern, exchange_map in ETF_NAME_PATTERNS:
-            if pattern in text:
-                if exchange in exchange_map:
-                    return exchange_map[exchange]
-                if exchange_map:
-                    return next(iter(exchange_map.values()))
-        return None
-
-    def _extract_underlying_code(self, ths_code, exchange, short_name=""):
-        base, _, suffix = str(ths_code).partition(".")
-        if base.isdigit():
-            return self._infer_etf_underlying_code(short_name, exchange)
-
-        option_head = base.split("-", 1)[0]
-        matched = OPTION_MONTH_RE.match(option_head)
-        if not matched:
-            return None
-
-        root = matched.group(1).upper()
-        month = matched.group(2)
-        fut_root = INDEX_OPTION_TO_FUTURE.get(root, root)
-        return f"{fut_root}{month}.{suffix}" if suffix else f"{fut_root}{month}"
-
-    def _extract_product_root(self, ths_code, exchange, short_name=""):
-        """从ths_code提取品种根码"""
-        base = ths_code.split('.')[0]
-        # ETF期权: 纯数字代码
-        if base.isdigit():
-            underlying = self._infer_etf_underlying_code(short_name, exchange)
-            return underlying.split(".", 1)[0] if underlying else base
-        # 商品/股指: 提取字母部分
-        root = ''
-        for ch in base:
-            if ch.isalpha():
-                root += ch
-            else:
-                break
-        return root.upper() if root else base
-
-    def lookup(self, ths_code):
-        """查询合约属性"""
-        return self._cache.get(ths_code)
-
-    def get_product_codes(self, product_root):
-        """获取某品种的所有合约代码"""
-        return self._products.get(product_root, set())
-
-    def get_all_products(self):
-        """获取所有品种根码"""
-        return list(self._products.keys())
-
-    def calc_dte(self, ths_code, current_date):
-        """计算剩余天数"""
-        info = self._cache.get(ths_code)
-        if not info or not info['expiry_date']:
-            return -1
-        try:
-            exp = datetime.strptime(info['expiry_date'], '%Y-%m-%d').date()
-            if isinstance(current_date, str):
-                current_date = datetime.strptime(current_date, '%Y-%m-%d').date()
-            return (exp - current_date).days
-        except (ValueError, TypeError):
-            return -1
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 每日数据加载（从 toolkit 拉取分钟数据，聚合成日频）
-# ══════════════════════════════════════════════════════════════════════════════
 
 class ToolkitDayLoader:
     """从 toolkit 批量拉取分钟数据并聚合"""

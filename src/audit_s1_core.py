@@ -19,7 +19,8 @@ import numpy as np
 import pandas as pd
 
 from option_calc import calc_greeks_single, calc_iv_single
-from toolkit_minute_engine import ContractInfo, ToolkitDayLoader
+from contract_provider import ContractInfo
+from toolkit_minute_engine import ToolkitDayLoader
 
 
 CLOSE_ACTION_PREFIXES = ("sl_", "tp_", "pre_expiry_roll", "expiry", "greeks_", "s4_")
