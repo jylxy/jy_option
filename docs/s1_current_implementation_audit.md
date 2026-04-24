@@ -6,7 +6,7 @@
 
 - `config_s1_risk_reward_v1.json` 仍作为当前收益风险评分基准。
 - E1 不是主线升级实验，而是反向消融实验：它只保留 `IV/RV carry >= 0`，故意拆掉了完整 falling framework。
-- 当前 repo 中已经存在完整 falling/carry 入场框架，但它主要体现在 `config_s1_only_stop18_noprotect_volregime.json`，没有和 V1 的 `risk_reward` 候选评分合并。
+- 当前 repo 中已经存在完整 falling/carry 入场框架，但它主要体现在 `config_s1_only_stop25_noprotect_volregime.json`，没有和 V1 的 `risk_reward` 候选评分合并。
 - 下一轮先不混入 falling framework，先做 V1 的单变量实验：止损倍数从 `1.8x` 调整到 `2.5x`。
 
 ## 当前主要配置分工
@@ -27,7 +27,7 @@
 
 ### 完整 falling/carry 框架旧配置
 
-文件：[config_s1_only_stop18_noprotect_volregime.json](../config_s1_only_stop18_noprotect_volregime.json)
+文件：[config_s1_only_stop25_noprotect_volregime.json](../config_s1_only_stop25_noprotect_volregime.json)
 
 - 已启用 `s1_falling_framework_enabled`。
 - 已启用 `s1_require_risk_release_entry`。
