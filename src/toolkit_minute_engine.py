@@ -63,6 +63,12 @@ from product_taxonomy import (
     get_product_bucket,
     get_product_corr_group,
 )
+from query_filters import (
+    normalize_product_pool,
+    build_product_like_sql,
+    build_code_filter_sql,
+    iter_code_filter_sql,
+)
 
 logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1955,73 +1961,23 @@ class ToolkitMinuteEngine:
 
     def _build_product_like_sql(self, product_pool):
         """构建品种的ths_code LIKE过滤SQL"""
-        normalized_pool = tuple(sorted({
-            self._normalize_product_key(product)
-            for product in product_pool
-            if str(product).strip()
-        }))
+        normalized_pool = normalize_product_pool(product_pool)
         if not normalized_pool:
             return None
         cached_sql = self._product_like_sql_cache.get(normalized_pool)
         if cached_sql is not None:
             return cached_sql
 
-        pool_set = set(normalized_pool)
-        product_suffixes = {}
-        explicit_chunks = []
-        for code, info in self.ci._cache.items():
-            root = info['product_root']
-            if root in pool_set:
-                if str(root).isdigit() and len(str(root)) == 6:
-                    continue
-                suffix = code.rsplit('.', 1)[-1] if '.' in code else ''
-                if suffix and root not in product_suffixes:
-                    product_suffixes[root] = suffix
-        for product in sorted({
-            product for product in pool_set
-            if product.isdigit() and len(product) == 6
-        }):
-            codes = sorted(self.ci.get_product_codes(product))
-            if not codes:
-                continue
-            for start in range(0, len(codes), 1000):
-                chunk = codes[start:start + 1000]
-                code_list = ", ".join(f"'{code}'" for code in chunk)
-                explicit_chunks.append(f"ths_code IN ({code_list})")
-        parts = [f"ths_code LIKE '{root}%.{suffix}'" for root, suffix in product_suffixes.items()]
-        parts.extend(explicit_chunks)
-        if not parts:
-            return None
-        like_sql = ' OR '.join(parts)
+        like_sql = build_product_like_sql(
+            normalized_pool,
+            self.ci._cache,
+            self.ci.get_product_codes,
+        )
         self._product_like_sql_cache[normalized_pool] = like_sql
         return like_sql
 
-    @staticmethod
-    def _build_code_filter_sql(codes, column_name='ths_code', chunk_size=1000):
-        normalized_codes = sorted({str(code) for code in codes if str(code).strip()})
-        if not normalized_codes:
-            return None
-        parts = []
-        for start in range(0, len(normalized_codes), chunk_size):
-            chunk = normalized_codes[start:start + chunk_size]
-            code_list = ", ".join(f"'{code}'" for code in chunk)
-            parts.append(f"{column_name} IN ({code_list})")
-        return ' OR '.join(parts)
-
-    @staticmethod
-    def _iter_code_filter_sql(codes, column_name='ths_code', chunk_size=500):
-        normalized_codes = sorted({str(code) for code in codes if str(code).strip()})
-        for start in range(0, len(normalized_codes), chunk_size):
-            chunk = normalized_codes[start:start + chunk_size]
-            code_list = ", ".join(f"'{code}'" for code in chunk)
-            yield f"{column_name} IN ({code_list})"
-
     def _get_warmup_contract_codes(self, product_pool, warmup_dates):
-        normalized_pool = tuple(sorted({
-            self._normalize_product_key(product)
-            for product in product_pool
-            if str(product).strip()
-        }))
+        normalized_pool = normalize_product_pool(product_pool)
         if not normalized_pool or not warmup_dates:
             return []
 
@@ -2066,7 +2022,7 @@ class ToolkitMinuteEngine:
         warmup_chunk_size = int(self.config.get('warmup_prefilter_chunk_size', 2000) or 2000)
         max_prefilter_chunks = int(self.config.get('warmup_prefilter_max_chunks', 4) or 4)
         prefilter_sqls = list(
-            self._iter_code_filter_sql(contract_codes, chunk_size=warmup_chunk_size)
+            iter_code_filter_sql(contract_codes, chunk_size=warmup_chunk_size)
         ) if contract_codes else []
         filter_sqls = prefilter_sqls if prefilter_sqls and len(prefilter_sqls) <= max_prefilter_chunks else [like_sql]
         logger.info("  LIKE条件: %s", like_sql)
@@ -2126,7 +2082,7 @@ class ToolkitMinuteEngine:
         if underlying_codes:
             alias_map = build_underlying_alias_map(underlying_codes)
             lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
-            spot_filter_sql = self._build_code_filter_sql(lookup_codes)
+            spot_filter_sql = build_code_filter_sql(lookup_codes)
             spot_frames = []
             for table_name in self._spot_tables_for_codes(lookup_codes):
                 spot_query = f"""
