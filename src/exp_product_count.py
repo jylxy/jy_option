@@ -27,7 +27,7 @@ except ImportError:
     run_unified_v3 = None
     stats = None
     S4_PRODUCTS = ["中证1000", "沪金", "原油", "沪铜"]
-from backtest_fast import estimate_margin
+from margin_model import estimate_margin
 
 # ── 品种映射表：root -> (where_clause, name, mult, mr, liq_category) ──────────
 # 复用 exp_expanded_products.py 中验证过的 WHERE 子句模式

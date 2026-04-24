@@ -1,81 +1,133 @@
 """
-期权定价与Greeks计算模块
+Unified IV and Greeks helpers for the backtest engines.
 
-统一的IV反推 + Greeks计算接口，实盘和回测共用同一套逻辑。
+Model routing:
+- Index / ETF options default to Black-Scholes.
+- Commodity options on futures default to Black-76.
 
-支持：
-  - 欧式期权（股指/ETF）：BSM模型
-  - 美式期权（商品）：Black76模型（期货标的近似）
-  - 向量化批量计算（py_vollib_vectorized）
-
-无风险利率默认2%（编码规范要求）。
+The public function names are kept stable so existing callers continue to work.
 """
-import numpy as np
-import pandas as pd
+
 import warnings
 
-# ── 尝试加载向量化版本（快100倍），fallback到标量版 ──
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
 try:
-    from py_vollib_vectorized import vectorized_implied_volatility as vec_iv
-    from py_vollib_vectorized import vectorized_black_scholes as vec_bs
-    from py_vollib_vectorized.api import price_dataframe
+    from py_vollib_vectorized import vectorized_implied_volatility as vec_iv_bs
+    from py_vollib_vectorized import vectorized_implied_volatility_black as vec_iv_black
     HAS_VECTORIZED = True
 except ImportError:
     HAS_VECTORIZED = False
+    vec_iv_bs = None
+    vec_iv_black = None
 
-from py_vollib.black_scholes import black_scholes as bs_price
+from py_vollib.black.implied_volatility import implied_volatility as black_iv
+from py_vollib.black.greeks.analytical import delta as black_delta
+from py_vollib.black.greeks.analytical import gamma as black_gamma
+from py_vollib.black.greeks.analytical import vega as black_vega
+from py_vollib.black.greeks.analytical import theta as black_theta
 from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_iv
 from py_vollib.black_scholes.greeks.analytical import delta as bs_delta
-from py_vollib.black_scholes.greeks.analytical import vega as bs_vega
 from py_vollib.black_scholes.greeks.analytical import gamma as bs_gamma
+from py_vollib.black_scholes.greeks.analytical import vega as bs_vega
 from py_vollib.black_scholes.greeks.analytical import theta as bs_theta
 
-# 无风险利率（编码规范：默认2%）
+
 RISK_FREE_RATE = 0.02
 
-# IV反推的边界
-IV_MIN = 0.01    # 1%
-IV_MAX = 5.0     # 500%（极端情况）
-IV_DEFAULT = 0.25  # 反推失败时的默认值
+IV_MIN = 0.01
+IV_MAX = 5.0
+IV_DEFAULT = 0.25
+
+BLACK_MODEL_EXCHANGES = frozenset({"SHFE", "INE", "DCE", "CZCE", "GFEX"})
 
 
-def calc_iv_single(price, spot, strike, dte_days, option_type, r=RISK_FREE_RATE):
-    """
-    单合约IV反推（BSM模型）。
-    
-    Args:
-        price: 期权市场价格
-        spot: 标的价格（期货价格或ETF价格）
-        strike: 行权价
-        dte_days: 剩余天数（日历天）
-        option_type: 'C' 或 'P'
-        r: 无风险利率
-    
-    Returns:
-        float: 隐含波动率（小数形式，如0.25表示25%），失败返回NaN
-    """
+def _normalize_model_name(model):
+    if model is None:
+        return ""
+    text = str(model).strip().lower()
+    if text in ("black", "black76", "black_76"):
+        return "black"
+    if text in ("black_scholes", "bs", "bsm"):
+        return "black_scholes"
+    return text
+
+
+def _model_from_exchange(exchange):
+    ex = str(exchange or "").strip().upper()
+    return "black" if ex in BLACK_MODEL_EXCHANGES else "black_scholes"
+
+
+def _resolve_single_model(exchange="", model=None):
+    normalized = _normalize_model_name(model)
+    if normalized:
+        return normalized
+    return _model_from_exchange(exchange)
+
+
+def _resolve_models(df, exchange_col="exchange", model=None):
+    normalized = _normalize_model_name(model)
+    if normalized:
+        return np.full(len(df), normalized, dtype=object)
+
+    if exchange_col and exchange_col in df.columns:
+        ex = df[exchange_col].fillna("").astype(str).str.upper().values
+        return np.where(np.isin(ex, list(BLACK_MODEL_EXCHANGES)), "black", "black_scholes")
+
+    return np.full(len(df), "black_scholes", dtype=object)
+
+
+def _norm_cdf(x):
+    return norm.cdf(x)
+
+
+def _norm_pdf(x):
+    return np.exp(-0.5 * x * x) / np.sqrt(2.0 * np.pi)
+
+
+def _bsm_d1_d2(spots, strikes, t, r, sigma):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sqrt_t = np.sqrt(t)
+        d1 = (np.log(spots / strikes) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+    return d1, d2
+
+
+def _black_d1_d2(forwards, strikes, t, sigma):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sqrt_t = np.sqrt(t)
+        d1 = (np.log(forwards / strikes) + 0.5 * sigma * sigma * t) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+    return d1, d2
+
+
+def calc_iv_single(price, spot, strike, dte_days, option_type, r=RISK_FREE_RATE,
+                   exchange="", model=None):
     if price <= 0 or spot <= 0 or strike <= 0 or dte_days <= 0:
         return np.nan
-    
+
     t = dte_days / 365.0
-    flag = 'c' if option_type == 'C' else 'p'
-    
-    # 内在价值检查：期权价格不能低于内在价值
-    if option_type == 'C':
-        intrinsic = max(spot * np.exp(-r * t) - strike * np.exp(-r * t), 0)
+    flag = "c" if option_type == "C" else "p"
+    resolved_model = _resolve_single_model(exchange=exchange, model=model)
+
+    if resolved_model == "black":
+        intrinsic = np.exp(-r * t) * max(spot - strike, 0.0) if option_type == "C" else np.exp(-r * t) * max(strike - spot, 0.0)
+        if price <= intrinsic * 1.001:
+            return IV_MIN
+        iv_func = lambda: black_iv(price, spot, strike, r, t, flag)
     else:
-        intrinsic = max(strike * np.exp(-r * t) - spot * np.exp(-r * t), 0)
-    
-    # 如果价格接近或低于内在价值，IV接近0
-    if price <= intrinsic * 1.001:
-        return IV_MIN
-    
+        intrinsic = max(spot * np.exp(-r * t) - strike * np.exp(-r * t), 0.0) if option_type == "C" else max(strike * np.exp(-r * t) - spot * np.exp(-r * t), 0.0)
+        if price <= intrinsic * 1.001:
+            return IV_MIN
+        iv_func = lambda: bs_iv(price, spot, strike, t, r, flag)
+
     try:
-        iv = bs_iv(price, spot, strike, t, r, flag)
-        # py_vollib 某些版本返回 DataFrame，需要提取标量
-        if hasattr(iv, 'item'):
+        iv = iv_func()
+        if hasattr(iv, "item"):
             iv = iv.item()
-        elif hasattr(iv, 'values'):
+        elif hasattr(iv, "values"):
             iv = float(iv.values.flat[0])
         iv = float(iv)
         if IV_MIN <= iv <= IV_MAX:
@@ -85,137 +137,130 @@ def calc_iv_single(price, spot, strike, dte_days, option_type, r=RISK_FREE_RATE)
         return np.nan
 
 
-def calc_greeks_single(spot, strike, dte_days, iv, option_type, r=RISK_FREE_RATE):
-    """
-    单合约Greeks计算（BSM模型）。
-    
-    Returns:
-        dict: {delta, gamma, vega, theta}，失败返回全NaN
-    """
+def calc_greeks_single(spot, strike, dte_days, iv, option_type, r=RISK_FREE_RATE,
+                       exchange="", model=None):
     nan_result = {"delta": np.nan, "gamma": np.nan, "vega": np.nan, "theta": np.nan}
-    
+
     if spot <= 0 or strike <= 0 or dte_days <= 0 or iv <= 0:
         return nan_result
-    
+
     t = dte_days / 365.0
-    flag = 'c' if option_type == 'C' else 'p'
-    
+    flag = "c" if option_type == "C" else "p"
+    resolved_model = _resolve_single_model(exchange=exchange, model=model)
+
     try:
-        d = bs_delta(flag, spot, strike, t, r, iv)
-        g = bs_gamma(flag, spot, strike, t, r, iv)
-        v = bs_vega(flag, spot, strike, t, r, iv)
-        th = bs_theta(flag, spot, strike, t, r, iv)
-        return {"delta": d, "gamma": g, "vega": v, "theta": th}
+        if resolved_model == "black":
+            return {
+                "delta": black_delta(flag, spot, strike, t, r, iv),
+                "gamma": black_gamma(flag, spot, strike, t, r, iv),
+                "vega": black_vega(flag, spot, strike, t, r, iv),
+                "theta": black_theta(flag, spot, strike, t, r, iv),
+            }
+        return {
+            "delta": bs_delta(flag, spot, strike, t, r, iv),
+            "gamma": bs_gamma(flag, spot, strike, t, r, iv),
+            "vega": bs_vega(flag, spot, strike, t, r, iv),
+            "theta": bs_theta(flag, spot, strike, t, r, iv),
+        }
     except Exception:
         return nan_result
 
 
 def calc_iv_batch(df, price_col="option_close", spot_col="spot_close",
                   strike_col="strike", dte_col="dte", otype_col="option_type",
-                  r=RISK_FREE_RATE):
-    """
-    批量IV反推。优先用向量化版本，fallback到逐行计算。
-    
-    Args:
-        df: DataFrame，必须包含 price/spot/strike/dte/option_type 列
-        
-    Returns:
-        Series: 隐含波动率（与df同index）
-    """
+                  exchange_col="exchange", model=None, r=RISK_FREE_RATE):
     n = len(df)
     if n == 0:
         return pd.Series(dtype=float)
-    
+
     prices = df[price_col].values.astype(float)
     spots = df[spot_col].values.astype(float)
     strikes = df[strike_col].values.astype(float)
     dtes = df[dte_col].values.astype(float)
     otypes = df[otype_col].values
-    
+    flags = np.where(otypes == "C", "c", "p")
     t_arr = dtes / 365.0
-    flags = np.where(otypes == 'C', 'c', 'p')
-    
-    # 向量化版本
+    models = _resolve_models(df, exchange_col=exchange_col, model=model)
+    valid = (prices > 0) & (spots > 0) & (strikes > 0) & (dtes > 0)
+
+    result = np.full(n, np.nan)
+
     if HAS_VECTORIZED and n > 100:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                iv_arr = vec_iv(
-                    prices, spots, strikes, t_arr, r, flags,
-                    model='black_scholes', return_as='numpy'
-                )
-            # 清理异常值
-            iv_arr = np.where((iv_arr >= IV_MIN) & (iv_arr <= IV_MAX), iv_arr, np.nan)
-            return pd.Series(iv_arr, index=df.index)
+
+                bs_mask = valid & (models == "black_scholes")
+                if bs_mask.any():
+                    result[bs_mask] = vec_iv_bs(
+                        prices[bs_mask], spots[bs_mask], strikes[bs_mask], t_arr[bs_mask], r, flags[bs_mask],
+                        model="black_scholes", return_as="numpy"
+                    )
+
+                black_mask = valid & (models == "black")
+                if black_mask.any():
+                    result[black_mask] = vec_iv_black(
+                        prices[black_mask], spots[black_mask], strikes[black_mask], r, t_arr[black_mask], flags[black_mask],
+                        return_as="numpy"
+                    )
+
+            result = np.where((result >= IV_MIN) & (result <= IV_MAX), result, np.nan)
+            return pd.Series(result, index=df.index)
         except Exception:
-            pass  # fallback到逐行
-    
-    # 逐行计算
-    result = np.full(n, np.nan)
-    for i in range(n):
-        if prices[i] > 0 and spots[i] > 0 and strikes[i] > 0 and dtes[i] > 0:
-            result[i] = calc_iv_single(prices[i], spots[i], strikes[i], dtes[i], otypes[i], r)
-    
+            pass
+
+    idx = np.where(valid)[0]
+    for i in idx:
+        result[i] = calc_iv_single(
+            prices[i], spots[i], strikes[i], dtes[i], otypes[i], r=r, model=models[i]
+        )
+
     return pd.Series(result, index=df.index)
 
 
 def calc_greeks_batch(df, spot_col="spot_close", strike_col="strike",
                       dte_col="dte", iv_col="implied_vol", otype_col="option_type",
-                      r=RISK_FREE_RATE):
-    """
-    批量Greeks计算（逐行版，兼容旧代码）。
-    新代码应优先使用 calc_greeks_batch_vectorized。
-    """
+                      exchange_col="exchange", model=None, r=RISK_FREE_RATE):
+    if len(df) > 100:
+        return calc_greeks_batch_vectorized(
+            df,
+            spot_col=spot_col,
+            strike_col=strike_col,
+            dte_col=dte_col,
+            iv_col=iv_col,
+            otype_col=otype_col,
+            exchange_col=exchange_col,
+            model=model,
+            r=r,
+        )
+
     n = len(df)
     if n == 0:
         return pd.DataFrame(columns=["delta", "gamma", "vega", "theta"])
-    
+
     spots = df[spot_col].values.astype(float)
     strikes = df[strike_col].values.astype(float)
     dtes = df[dte_col].values.astype(float)
     ivs = df[iv_col].values.astype(float)
     otypes = df[otype_col].values
-    
-    t_arr = dtes / 365.0
-    flags = np.where(otypes == 'C', 'c', 'p')
-    
+    models = _resolve_models(df, exchange_col=exchange_col, model=model)
+
     deltas = np.full(n, np.nan)
     gammas = np.full(n, np.nan)
     vegas = np.full(n, np.nan)
     thetas = np.full(n, np.nan)
-    
-    # 有效行掩码
+
     valid = (spots > 0) & (strikes > 0) & (dtes > 0) & (ivs > 0) & np.isfinite(ivs)
-    
-    if HAS_VECTORIZED and valid.sum() > 100:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                # py_vollib_vectorized 的 delta
-                idx = np.where(valid)[0]
-                for i in idx:
-                    try:
-                        g = calc_greeks_single(spots[i], strikes[i], dtes[i], ivs[i], otypes[i], r)
-                        deltas[i] = g["delta"]
-                        gammas[i] = g["gamma"]
-                        vegas[i] = g["vega"]
-                        thetas[i] = g["theta"]
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    else:
-        for i in range(n):
-            if valid[i]:
-                try:
-                    g = calc_greeks_single(spots[i], strikes[i], dtes[i], ivs[i], otypes[i], r)
-                    deltas[i] = g["delta"]
-                    gammas[i] = g["gamma"]
-                    vegas[i] = g["vega"]
-                    thetas[i] = g["theta"]
-                except Exception:
-                    pass
-    
+
+    for i in np.where(valid)[0]:
+        g = calc_greeks_single(
+            spots[i], strikes[i], dtes[i], ivs[i], otypes[i], r=r, model=models[i]
+        )
+        deltas[i] = g["delta"]
+        gammas[i] = g["gamma"]
+        vegas[i] = g["vega"]
+        thetas[i] = g["theta"]
+
     return pd.DataFrame({
         "delta": deltas,
         "gamma": gammas,
@@ -224,46 +269,10 @@ def calc_greeks_batch(df, spot_col="spot_close", strike_col="strike",
     }, index=df.index)
 
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 向量化 BSM Greeks — numpy 直接实现，不依赖 py_vollib 逐行调用
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _bsm_d1_d2(spots, strikes, t, r, sigma):
-    """
-    向量化计算 BSM d1/d2。
-
-    所有参数均为 numpy array（同 shape）。
-    """
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sqrt_t = np.sqrt(t)
-        d1 = (np.log(spots / strikes) + (r + 0.5 * sigma**2) * t) / (sigma * sqrt_t)
-        d2 = d1 - sigma * sqrt_t
-    return d1, d2
-
-
-def _norm_cdf(x):
-    """标准正态分布 CDF（向量化）"""
-    from scipy.stats import norm
-    return norm.cdf(x)
-
-
-def _norm_pdf(x):
-    """标准正态分布 PDF（向量化）"""
-    return np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi)
-
-
 def calc_greeks_batch_vectorized(df, spot_col="spot_close", strike_col="strike",
-                                  dte_col="dte", iv_col="implied_vol",
-                                  otype_col="option_type", r=RISK_FREE_RATE):
-    """
-    向量化批量 Greeks 计算（numpy 直接实现 BSM 公式）。
-
-    比 calc_greeks_batch 快 50-100 倍，适合大批量计算。
-
-    Returns:
-        DataFrame: 包含 delta, gamma, vega, theta 四列
-    """
+                                 dte_col="dte", iv_col="implied_vol",
+                                 otype_col="option_type", exchange_col="exchange",
+                                 model=None, r=RISK_FREE_RATE):
     n = len(df)
     if n == 0:
         return pd.DataFrame(columns=["delta", "gamma", "vega", "theta"])
@@ -273,14 +282,12 @@ def calc_greeks_batch_vectorized(df, spot_col="spot_close", strike_col="strike",
     dtes = df[dte_col].values.astype(float)
     ivs = df[iv_col].values.astype(float)
     otypes = df[otype_col].values
-
-    t = dtes / 365.0
     is_call = (otypes == "C")
+    t = dtes / 365.0
+    models = _resolve_models(df, exchange_col=exchange_col, model=model)
 
-    # 有效行掩码
     valid = (spots > 0) & (strikes > 0) & (dtes > 0) & (ivs > 0) & np.isfinite(ivs)
 
-    # 初始化结果
     deltas = np.full(n, np.nan)
     gammas = np.full(n, np.nan)
     vegas = np.full(n, np.nan)
@@ -288,46 +295,69 @@ def calc_greeks_batch_vectorized(df, spot_col="spot_close", strike_col="strike",
 
     if not valid.any():
         return pd.DataFrame({
-            "delta": deltas, "gamma": gammas,
-            "vega": vegas, "theta": thetas,
+            "delta": deltas,
+            "gamma": gammas,
+            "vega": vegas,
+            "theta": thetas,
         }, index=df.index)
 
-    # 提取有效子集
+    valid_idx = np.where(valid)[0]
     v_spots = spots[valid]
     v_strikes = strikes[valid]
     v_t = t[valid]
     v_ivs = ivs[valid]
     v_call = is_call[valid]
+    v_models = models[valid]
 
-    d1, d2 = _bsm_d1_d2(v_spots, v_strikes, v_t, r, v_ivs)
-    nd1 = _norm_cdf(d1)
-    nd2 = _norm_cdf(d2)
-    npd1 = _norm_pdf(d1)
-    sqrt_t = np.sqrt(v_t)
-    exp_rt = np.exp(-r * v_t)
+    if (v_models == "black_scholes").any():
+        mask = (v_models == "black_scholes")
+        sub_idx = valid_idx[mask]
+        sub_spots = v_spots[mask]
+        sub_strikes = v_strikes[mask]
+        sub_t = v_t[mask]
+        sub_ivs = v_ivs[mask]
+        sub_call = v_call[mask]
 
-    # Delta
-    v_delta = np.where(v_call, nd1, nd1 - 1.0)
+        d1, d2 = _bsm_d1_d2(sub_spots, sub_strikes, sub_t, r, sub_ivs)
+        nd1 = _norm_cdf(d1)
+        nd2 = _norm_cdf(d2)
+        npd1 = _norm_pdf(d1)
+        sqrt_t = np.sqrt(sub_t)
+        exp_rt = np.exp(-r * sub_t)
 
-    # Gamma（Call 和 Put 相同）
-    v_gamma = npd1 / (v_spots * v_ivs * sqrt_t)
+        deltas[sub_idx] = np.where(sub_call, nd1, nd1 - 1.0)
+        gammas[sub_idx] = npd1 / (sub_spots * sub_ivs * sqrt_t)
+        vegas[sub_idx] = sub_spots * npd1 * sqrt_t * 0.01
 
-    # Vega（Call 和 Put 相同，单位：dPrice/dSigma）
-    v_vega = v_spots * npd1 * sqrt_t
+        term1 = -(sub_spots * npd1 * sub_ivs) / (2.0 * sqrt_t)
+        theta_call = term1 - r * sub_strikes * exp_rt * nd2
+        theta_put = term1 + r * sub_strikes * exp_rt * _norm_cdf(-d2)
+        thetas[sub_idx] = np.where(sub_call, theta_call, theta_put) / 365.0
 
-    # Theta
-    term1 = -(v_spots * npd1 * v_ivs) / (2 * sqrt_t)
-    theta_call = term1 - r * v_strikes * exp_rt * _norm_cdf(d2)
-    theta_put = term1 + r * v_strikes * exp_rt * _norm_cdf(-d2)
-    v_theta = np.where(v_call, theta_call, theta_put)
-    # 转为每日 theta（除以365）
-    v_theta = v_theta / 365.0
+    if (v_models == "black").any():
+        mask = (v_models == "black")
+        sub_idx = valid_idx[mask]
+        sub_forwards = v_spots[mask]
+        sub_strikes = v_strikes[mask]
+        sub_t = v_t[mask]
+        sub_ivs = v_ivs[mask]
+        sub_call = v_call[mask]
 
-    # 写回结果
-    deltas[valid] = v_delta
-    gammas[valid] = v_gamma
-    vegas[valid] = v_vega
-    thetas[valid] = v_theta
+        d1, d2 = _black_d1_d2(sub_forwards, sub_strikes, sub_t, sub_ivs)
+        nd1 = _norm_cdf(d1)
+        nd2 = _norm_cdf(d2)
+        npd1 = _norm_pdf(d1)
+        sqrt_t = np.sqrt(sub_t)
+        exp_rt = np.exp(-r * sub_t)
+
+        deltas[sub_idx] = np.where(sub_call, exp_rt * nd1, -exp_rt * _norm_cdf(-d1))
+        gammas[sub_idx] = exp_rt * npd1 / (sub_forwards * sub_ivs * sqrt_t)
+        vegas[sub_idx] = sub_forwards * exp_rt * npd1 * sqrt_t * 0.01
+
+        first_term = sub_forwards * exp_rt * npd1 * sub_ivs / (2.0 * sqrt_t)
+        theta_call = -(first_term - r * sub_forwards * exp_rt * nd1 + r * sub_strikes * exp_rt * nd2) / 365.0
+        theta_put = (-first_term - r * sub_forwards * exp_rt * _norm_cdf(-d1) + r * sub_strikes * exp_rt * _norm_cdf(-d2)) / 365.0
+        thetas[sub_idx] = np.where(sub_call, theta_call, theta_put)
 
     return pd.DataFrame({
         "delta": deltas,

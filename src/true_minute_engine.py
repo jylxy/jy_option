@@ -44,7 +44,7 @@ from strategy_rules import (
     check_margin_ok, calc_stats,
     DEFAULT_PARAMS,
 )
-from backtest_fast import estimate_margin
+from margin_model import estimate_margin, resolve_margin_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class Position:
         return estimate_margin(
             self.cur_spot or self.strike, self.strike, self.opt_type,
             self.cur_price, self.mult, self.mr, 0.5,
-            exchange=self.exchange
+            exchange=self.exchange, product=self.product
         ) * self.n
 
     def cash_delta(self):
@@ -450,13 +450,13 @@ class TrueMinuteEngine:
                     if pos.cur_price > 0 and pos.cur_spot > 0 and pos.dte > 0:
                         iv = calc_iv_single(
                             pos.cur_price, pos.cur_spot, pos.strike,
-                            pos.dte, pos.opt_type
+                            pos.dte, pos.opt_type, exchange=pos.exchange
                         )
                         if not np.isnan(iv) and iv > 0:
                             pos.cur_iv = iv
                             g = calc_greeks_single(
                                 pos.cur_spot, pos.strike, pos.dte,
-                                iv, pos.opt_type
+                                iv, pos.opt_type, exchange=pos.exchange
                             )
                             if not np.isnan(g["delta"]):
                                 pos.cur_delta = g["delta"]
@@ -685,13 +685,7 @@ class TrueMinuteEngine:
                 spot = ef["spot_close"].iloc[0] if "spot_close" in ef.columns else 0
                 mult = ef["multiplier"].iloc[0] if "multiplier" in ef.columns else 10
                 exchange = ef["exchange"].iloc[0] if "exchange" in ef.columns else ""
-                # 保证金比例按交易所区分
-                if exchange in ("CFFEX",):
-                    mr = 0.10  # 股指期权保证金较高
-                elif exchange in ("SSE", "SZSE"):
-                    mr = 0.12  # ETF 期权
-                else:
-                    mr = 0.05  # 商品期权
+                mr = resolve_margin_ratio(exchange=exchange, product=product, config=cfg)
 
                 # ── S3 开仓（优先）──
                 eff_s3_m = s3_m + pending_s3_m
@@ -718,7 +712,7 @@ class TrueMinuteEngine:
                                 est_m = estimate_margin(
                                     item["spot"], item["strike"], item["opt_type"],
                                     item["ref_price"], item["mult"], item["mr"], 0.5,
-                                    exchange=item["exchange"]
+                                    exchange=item["exchange"], product=item.get("product")
                                 ) * item["n"]
                                 pending_total_m += est_m
                                 if item["strat"] == "S3":
@@ -748,7 +742,7 @@ class TrueMinuteEngine:
                                 est_m = estimate_margin(
                                     item["spot"], item["strike"], item["opt_type"],
                                     item["ref_price"], item["mult"], item["mr"], 0.5,
-                                    exchange=item["exchange"]
+                                    exchange=item["exchange"], product=item.get("product")
                                 ) * item["n"]
                                 pending_total_m += est_m
                                 if item["strat"] == "S1":
@@ -785,12 +779,19 @@ class TrueMinuteEngine:
         else:
             ef_with_ivr["iv_residual"] = 0.0
 
-        c = select_s1_sell(ef_with_ivr, ot, mult, mr)
+        c = select_s1_sell(
+            ef_with_ivr, ot, mult, mr,
+            min_abs_delta=float(self.config.get("s1_sell_delta_floor", 0.0)),
+            max_abs_delta=float(self.config.get("s1_sell_delta_cap", 0.10)),
+            exchange=exchange,
+            product=product,
+        )
         if c is None:
             return
 
         m = estimate_margin(c["spot_close"], c["strike"], ot,
-                            c["option_close"], mult, mr, 0.5, exchange=exchange)
+                            c["option_close"], mult, mr, 0.5,
+                            exchange=exchange, product=product)
         nn = calc_s1_size(nav, margin_per, m, iv_scale)
 
         # 保证金二次验证
@@ -822,9 +823,21 @@ class TrueMinuteEngine:
         })
 
         # 保护腿
-        pr = select_s1_protect(ef, c)
+        protect_enabled = bool(self.config.get("s1_protect_enabled", True))
+        protect_ratio = max(0.0, float(self.config.get("s1_protect_ratio", 0.5)))
+        protect_mode = self.config.get("s1_protect_mode", "inner")
+        protect_max_abs_delta = float(self.config.get("s1_protect_max_abs_delta", 0.25))
+        protect_min_price = float(self.config.get("s1_protect_min_price", 0.5))
+        protect_premium_ratio_cap = self.config.get("s1_protect_premium_ratio_cap", None)
+        pr = select_s1_protect(
+            ef, c,
+            mode=protect_mode,
+            max_abs_delta=protect_max_abs_delta,
+            min_price=protect_min_price,
+            premium_ratio_cap=protect_premium_ratio_cap,
+        ) if protect_enabled and protect_ratio > 0 else None
         if pr is not None and pr["option_code"] != c["option_code"]:
-            pn = max(1, nn // 2)
+            pn = max(1, int(round(nn * protect_ratio)))
             self._pending_opens.append({
                 "strat": "S1", "product": product, "code": pr["option_code"],
                 "opt_type": ot, "strike": pr["strike"], "ref_price": pr["option_close"],
@@ -851,7 +864,8 @@ class TrueMinuteEngine:
             return
 
         sm = estimate_margin(sl["spot_close"], sl["strike"], ot,
-                             sl["option_close"], mult, mr, 0.5, exchange=exchange)
+                             sl["option_close"], mult, mr, 0.5,
+                             exchange=exchange, product=product)
         size_result = calc_s3_size_v2(
             nav, margin_per, sm, bl["option_close"], sl["option_close"],
             mult, iv_scale,
@@ -970,7 +984,7 @@ class TrueMinuteEngine:
                 new_m = estimate_margin(
                     item["spot"], item["strike"], item["opt_type"],
                     price, item["mult"], item["mr"], 0.5,
-                    exchange=item["exchange"]
+                    exchange=item["exchange"], product=item.get("product")
                 ) * item["n"]
                 cap_key = f"{strat.lower()}_margin_cap"
                 if not check_margin_ok(total_m, strat_m, new_m, nav,

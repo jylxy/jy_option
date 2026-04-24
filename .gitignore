@@ -1,16 +1,31 @@
-# 数据库
+# Databases and large local data
 *.db
 *.sqlite
+*.parquet
 
-# Python缓存
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 
-# 回测输出
-output/*.csv
-output/*.png
-output/*.md
+# Backtest outputs and runtime artifacts
+output/*
+!output/.gitkeep
+*.log
 
-# 系统文件
+# Local scratch files
+*_tmp.py
+tmp_*.py
+src/_analyze_*.py
+src/_check_*.py
+src/_debug_*.py
+src/_test_*.py
+src/explore_*.py
+*.bak
+*.bak_*
+
+# System and IDE files
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/

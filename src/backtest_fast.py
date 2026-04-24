@@ -10,6 +10,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
+from margin_model import estimate_margin
 
 DB_PATH = os.environ.get("OPTION_DB_PATH", "benchmark.db")
 
@@ -56,50 +57,6 @@ def load_product_data(conn, where_clause):
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df["expiry_date"] = pd.to_datetime(df["expiry_date"])
     return df
-
-
-def estimate_margin(spot, strike, option_type, option_price, multiplier,
-                    margin_ratio=0.10, min_guarantee=0.5, exchange=None):
-    """
-    估算单手卖权保证金（按交易所区分公式）
-
-    exchange:
-      'CFFEX' - 中金所股指期权（欧式，现金交割）
-      'SHFE'/'INE' - 上期所/能源所（美式，实物交割）
-      'DCE' - 大商所（美式，实物交割）
-      'CZCE' - 郑商所（美式，实物交割）
-      None - 默认用CFFEX公式（向后兼容）
-
-    各交易所公式差异：
-      CFFEX: 权利金 + max(S×mr - OTM额, min_guarantee×S(or K)×mr)
-      SHFE/INE/DCE: 权利金 + max(标的结算价×mr - OTM额, 0.5×标的结算价×mr)
-      CZCE: 权利金 + max(标的结算价×mr - OTM额×0.5, 0.5×标的结算价×mr×min_guarantee)
-    """
-    if spot <= 0 or strike <= 0:
-        return option_price * multiplier  # fallback
-
-    if option_type == "C":
-        otm_amount = max(strike - spot, 0)
-    else:
-        otm_amount = max(spot - strike, 0)
-
-    if exchange == "CZCE":
-        # 郑商所：OTM额打5折
-        margin = (option_price + max(spot * margin_ratio - otm_amount * 0.5,
-                                     min_guarantee * spot * margin_ratio)) * multiplier
-    elif exchange in ("SHFE", "INE", "DCE"):
-        # 上期所/能源所/大商所：标准公式，min_guarantee固定0.5
-        margin = (option_price + max(spot * margin_ratio - otm_amount,
-                                     0.5 * spot * margin_ratio)) * multiplier
-    else:
-        # CFFEX或默认：Put用K，Call用S
-        if option_type == "C":
-            margin = (option_price + max(spot * margin_ratio - otm_amount,
-                                         min_guarantee * spot * margin_ratio)) * multiplier
-        else:
-            margin = (option_price + max(spot * margin_ratio - otm_amount,
-                                         min_guarantee * strike * margin_ratio)) * multiplier
-    return margin
 
 
 def run_backtest(df, config, multiplier=100.0):
@@ -373,3 +330,4 @@ def print_stats(stats, name=""):
           f"夏普{stats['sharpe']:5.2f} | "
           f"胜率{stats['win_rate']:4.0%} | "
           f"偏度{stats['skew']:+5.2f}")
+
