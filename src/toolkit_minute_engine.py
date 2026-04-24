@@ -1142,6 +1142,8 @@ class ToolkitMinuteEngine:
                 'side_score_mult': item.get('side_score_mult', np.nan),
                 'side_budget_mult': item.get('side_budget_mult', np.nan),
                 'side_delta_cap': item.get('side_delta_cap', np.nan),
+                'ladder_candidate_count': item.get('ladder_candidate_count', np.nan),
+                'ladder_delta_gap': item.get('ladder_delta_gap', np.nan),
             })
             executed += 1
 
@@ -1880,6 +1882,25 @@ class ToolkitMinuteEngine:
             return max(1, int(self.config.get('s1_neighbor_contract_count', 3) or 1))
         return 1
 
+    def _s1_ladder_shape(self, side_meta=None):
+        base_count = self._s1_max_selection_candidates()
+        base_gap = float(self.config.get('s1_neighbor_max_delta_gap', 0.0) or 0.0)
+        if not self.config.get('s1_trend_ladder_enabled', False):
+            return base_count, base_gap
+        role = str((side_meta or {}).get('trend_role', 'neutral') or 'neutral').lower()
+        if role == 'strong':
+            count_key = 's1_trend_ladder_strong_contract_count'
+            gap_key = 's1_trend_ladder_strong_max_delta_gap'
+        elif role == 'weak':
+            count_key = 's1_trend_ladder_weak_contract_count'
+            gap_key = 's1_trend_ladder_weak_max_delta_gap'
+        else:
+            count_key = 's1_trend_ladder_neutral_contract_count'
+            gap_key = 's1_trend_ladder_neutral_max_delta_gap'
+        count = int(self.config.get(count_key, base_count) or base_count)
+        gap = float(self.config.get(gap_key, base_gap) or base_gap)
+        return max(1, count), max(0.0, gap)
+
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
                                    min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
@@ -2054,7 +2075,7 @@ class ToolkitMinuteEngine:
         """S1开仓"""
         min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
         split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
-        max_candidates = self._s1_max_selection_candidates()
+        max_candidates, max_delta_gap = self._s1_ladder_shape(side_meta)
         if preselected_candidates is None:
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
@@ -2066,7 +2087,6 @@ class ToolkitMinuteEngine:
             return
         candidates = candidates.copy()
         if split_enabled and max_candidates > 1:
-            max_delta_gap = float(self.config.get('s1_neighbor_max_delta_gap', 0.0) or 0.0)
             if max_delta_gap > 0 and 'abs_delta' in candidates.columns:
                 center_delta = float(candidates['abs_delta'].iloc[0])
                 candidates = candidates[
@@ -2198,6 +2218,8 @@ class ToolkitMinuteEngine:
                 'side_score_mult': side_meta.get('score_mult', c.get('side_score_mult', np.nan)),
                 'side_budget_mult': side_budget_mult,
                 'side_delta_cap': side_meta.get('delta_cap', np.nan),
+                'ladder_candidate_count': max_candidates,
+                'ladder_delta_gap': max_delta_gap,
             }
             pending_item.update(self._pending_budget_fields(effective_strategy_cap))
             self._pending_opens.append(pending_item)
