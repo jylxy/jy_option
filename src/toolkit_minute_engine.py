@@ -1490,13 +1490,6 @@ class ToolkitMinuteEngine:
             if pos.underlying_code:
                 pos_by_underlying[pos.underlying_code].append(pos)
 
-        spot_groups = {}
-        if self.config.get('intraday_refresh_spot_greeks_for_attribution', True):
-            spot_df = self.loader.load_spot_day_minute(date_str, list(pos_by_underlying))
-            if not spot_df.empty:
-                spot_df = spot_df.sort_values(['time', 'underlying_code'])
-                spot_groups = {tm: grp for tm, grp in spot_df.groupby('time')}
-
         price_df = price_df.sort_values(['time', 'ths_code'])
         price_groups = {tm: grp for tm, grp in price_df.groupby('time')}
         time_points = sorted(price_groups.keys())
@@ -1516,6 +1509,16 @@ class ToolkitMinuteEngine:
         )
         greek_refresh_times = set(self._sample_intraday_times(time_points, greek_refresh_interval))
         greek_refresh_times.add(time_points[-1])
+        spot_groups = {}
+        if self.config.get('intraday_refresh_spot_greeks_for_attribution', True):
+            spot_df = self.loader.load_spot_day_minute(
+                date_str,
+                list(pos_by_underlying),
+                time_list=greek_refresh_times,
+            )
+            if not spot_df.empty:
+                spot_df = spot_df.sort_values(['time', 'underlying_code'])
+                spot_groups = {tm: grp for tm, grp in spot_df.groupby('time')}
         stop_pending = {}
         if self.config.get('intraday_stop_confirmation_use_full_minutes', True):
             monitor_times = list(time_points)

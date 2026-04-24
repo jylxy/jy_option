@@ -125,7 +125,7 @@ class ToolkitDayLoader:
             self._day_cache[date_str] = df
         return df
 
-    def load_spot_day_minute(self, date_str, underlying_codes):
+    def load_spot_day_minute(self, date_str, underlying_codes, time_list=None):
         """Load one trading day's underlying minute spots."""
         if not underlying_codes:
             return pd.DataFrame()
@@ -136,6 +136,12 @@ class ToolkitDayLoader:
             return pd.DataFrame()
 
         code_sql = ", ".join(f"'{code}'" for code in lookup_codes)
+        time_filter = ""
+        if time_list:
+            time_values = sorted({str(tm) for tm in time_list if tm})
+            if time_values:
+                time_sql = ", ".join(f"'{tm}'" for tm in time_values)
+                time_filter = f" AND time IN ({time_sql})"
         frames = []
         for table_name in self._spot_tables_for_codes(lookup_codes):
             query = f"""
@@ -143,6 +149,7 @@ class ToolkitDayLoader:
                 FROM {table_name}
                 WHERE date = '{date_str}'
                   AND ths_code IN ({code_sql})
+                  {time_filter}
                   AND toFloat64OrZero(close) > 0
             """
             part = select_bars_sql(query)

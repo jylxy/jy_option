@@ -16,6 +16,7 @@ selector_module.select_bars_sql = lambda _sql: pd.DataFrame()
 sys.modules.setdefault("toolkit", toolkit_module)
 sys.modules.setdefault("toolkit.selector", selector_module)
 
+import day_loader as day_loader_module  # noqa: E402
 from day_loader import ToolkitDayLoader  # noqa: E402
 
 
@@ -45,6 +46,31 @@ class DayLoaderTest(unittest.TestCase):
         loader = ToolkitDayLoader(FakeContractInfo())
         self.assertTrue(loader.load_spot_day_minute("2025-01-02", []).empty)
         self.assertTrue(loader.load_day_minute("2025-01-02", code_list=[]).empty)
+
+    def test_load_spot_day_minute_can_filter_times(self):
+        loader = ToolkitDayLoader(FakeContractInfo())
+        loader._spot_tables_for_codes = lambda _codes: ["etf_table"]
+        seen_sql = []
+
+        def fake_select(sql):
+            seen_sql.append(sql)
+            return pd.DataFrame([
+                {"ths_code": "510300.SH", "time": "10:00:00", "close": 3.5},
+            ])
+
+        old_select = day_loader_module.select_bars_sql
+        day_loader_module.select_bars_sql = fake_select
+        try:
+            out = loader.load_spot_day_minute(
+                "2025-01-02",
+                ["510300.SH"],
+                time_list=["10:00:00", "10:15:00"],
+            )
+        finally:
+            day_loader_module.select_bars_sql = old_select
+
+        self.assertFalse(out.empty)
+        self.assertIn("time IN ('10:00:00', '10:15:00')", seen_sql[0])
 
     def test_preload_spot_daily_close_batch_populates_cache(self):
         loader = ToolkitDayLoader(FakeContractInfo())
