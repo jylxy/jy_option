@@ -1058,6 +1058,33 @@ class ToolkitMinuteEngine:
             self.positions.append(pos)
             open_fee = float(self.config.get('fee', 3) or 0.0) * actual_n
             self._day_realized['fee'] += open_fee
+            gross_premium_cash = float(price) * float(item['mult']) * float(actual_n)
+            net_premium_cash = (
+                gross_premium_cash - open_fee
+                if item['role'] == 'sell'
+                else -gross_premium_cash - open_fee
+            )
+            open_margin = pos.cur_margin() if item['role'] == 'sell' else 0.0
+            ref_price = self._safe_float(item.get('ref_price', np.nan), np.nan)
+            price_drift = price / ref_price - 1.0 if np.isfinite(ref_price) and ref_price > 0 else np.nan
+            theta = self._safe_float(item.get('theta', np.nan), np.nan)
+            theta_cash = abs(theta) * float(item['mult']) * float(actual_n) if np.isfinite(theta) else np.nan
+            stress_loss = float(pos.stress_loss or 0.0)
+            exec_premium_stress = (
+                net_premium_cash / stress_loss
+                if item['role'] == 'sell' and stress_loss > 0
+                else np.nan
+            )
+            exec_theta_stress = (
+                theta_cash / stress_loss
+                if item['role'] == 'sell' and stress_loss > 0 and np.isfinite(theta_cash)
+                else np.nan
+            )
+            exec_premium_margin = (
+                net_premium_cash / open_margin
+                if item['role'] == 'sell' and open_margin > 0
+                else np.nan
+            )
             self.orders.append({
                 'date': date_str, 'signal_date': item.get('signal_date', ''),
                 'action': f"open_{item['role']}",
@@ -1067,6 +1094,27 @@ class ToolkitMinuteEngine:
                 'price': round(price, 4), 'quantity': actual_n,
                 'fee': round(open_fee, 2), 'pnl': 0,
                 'stress_loss': round(pos.stress_loss, 2),
+                'open_margin': round(open_margin, 2),
+                'one_contract_margin': item.get('one_contract_margin', np.nan),
+                'gross_premium_cash': round(gross_premium_cash, 2),
+                'net_premium_cash': round(net_premium_cash, 2),
+                'signal_ref_price': ref_price,
+                'execution_price_drift': price_drift,
+                'premium_stress': exec_premium_stress,
+                'theta_stress': exec_theta_stress,
+                'premium_margin': exec_premium_margin,
+                'signal_premium_stress': item.get('premium_stress', np.nan),
+                'signal_theta_stress': item.get('theta_stress', np.nan),
+                'signal_premium_margin': item.get('premium_margin', np.nan),
+                'abs_delta': item.get('abs_delta', np.nan),
+                'delta': item.get('delta', np.nan),
+                'gamma': item.get('gamma', np.nan),
+                'vega': item.get('vega', np.nan),
+                'theta': item.get('theta', np.nan),
+                'volume': item.get('volume', np.nan),
+                'open_interest': item.get('open_interest', np.nan),
+                'moneyness': item.get('moneyness', np.nan),
+                'liquidity_score': item.get('liquidity_score', np.nan),
                 'vol_regime': item.get('vol_regime', ''),
                 'selection_score': item.get('selection_score', np.nan),
                 'selection_rank': item.get('selection_rank', np.nan),
@@ -2116,6 +2164,21 @@ class ToolkitMinuteEngine:
                 'cash_gamma': new_greeks['cash_gamma'],
                 'one_contract_stress_loss': one_stress_loss,
                 'stress_loss': total_stress_loss,
+                'one_contract_margin': m,
+                'gross_premium_cash': self._safe_float(c.get('option_close', np.nan), np.nan) * float(mult) * nn,
+                'net_premium_cash': self._safe_float(c.get('net_premium_cash', np.nan), np.nan) * nn,
+                'premium_stress': self._safe_float(c.get('premium_stress', np.nan), np.nan),
+                'theta_stress': self._safe_float(c.get('theta_stress', np.nan), np.nan),
+                'premium_margin': self._safe_float(c.get('premium_margin', np.nan), np.nan),
+                'liquidity_score': self._safe_float(c.get('liquidity_score', np.nan), np.nan),
+                'volume': self._safe_float(c.get('volume', np.nan), np.nan),
+                'open_interest': self._safe_float(c.get('open_interest', np.nan), np.nan),
+                'moneyness': self._safe_float(c.get('moneyness', np.nan), np.nan),
+                'abs_delta': self._safe_float(c.get('abs_delta', np.nan), np.nan),
+                'delta': self._safe_float(c.get('delta', np.nan), np.nan),
+                'gamma': self._safe_float(c.get('gamma', np.nan), np.nan),
+                'vega': self._safe_float(c.get('vega', np.nan), np.nan),
+                'theta': self._safe_float(c.get('theta', np.nan), np.nan),
                 'selection_score': float(c.get('quality_score', np.nan)) if pd.notna(c.get('quality_score', np.nan)) else np.nan,
                 'selection_rank': rank,
                 'vol_regime': self._current_vol_regimes.get(product, ''),
@@ -2306,6 +2369,18 @@ class ToolkitMinuteEngine:
             else:
                 order_pnl = (pos.open_price - pos.cur_price) * pos.mult * pos.n
 
+            open_premium_cash = float(pos.open_price) * float(pos.mult) * float(pos.n)
+            close_value_cash = float(pos.cur_price) * float(pos.mult) * float(pos.n)
+            premium_retained_cash = (
+                open_premium_cash - close_value_cash
+                if pos.role == 'sell'
+                else np.nan
+            )
+            premium_retained_pct = (
+                premium_retained_cash / open_premium_cash
+                if pos.role == 'sell' and open_premium_cash > 0
+                else np.nan
+            )
             self.orders.append({
                 'date': date_str, 'action': reason,
                 'time': exec_time or '',
@@ -2314,6 +2389,13 @@ class ToolkitMinuteEngine:
                 'strike': pos.strike, 'expiry': str(pos.expiry)[:10],
                 'price': round(pos.cur_price, 4), 'quantity': pos.n,
                 'fee': round(fee, 2), 'pnl': round(order_pnl, 2),
+                'stress_loss': round(float(pos.stress_loss or 0.0), 2),
+                'margin_at_close': round(pos.cur_margin() if pos.role == 'sell' else 0.0, 2),
+                'open_premium_cash': round(open_premium_cash, 2),
+                'close_value_cash': round(close_value_cash, 2),
+                'premium_retained_cash': round(premium_retained_cash, 2)
+                if np.isfinite(premium_retained_cash) else np.nan,
+                'premium_retained_pct': premium_retained_pct,
             })
 
         self.positions = [p for p in self.positions if p not in to_close]
@@ -2321,10 +2403,84 @@ class ToolkitMinuteEngine:
 
     # ── NAV快照 ──────────────────────────────────────────────────────────────
 
+    def _s1_sell_shape_snapshot(self, nav):
+        nav = max(float(nav), 1.0)
+        side_state = defaultdict(lambda: {
+            'lots': 0.0,
+            'contracts': set(),
+            'products': set(),
+            'open_premium': 0.0,
+            'liability': 0.0,
+        })
+        total_lots = 0.0
+        total_contracts = set()
+        total_products = set()
+        total_open_premium = 0.0
+        total_liability = 0.0
+
+        for pos in self.positions:
+            if pos.strat != 'S1' or pos.role != 'sell':
+                continue
+            side = str(pos.opt_type or '').upper()[:1]
+            product = self._normalize_product_key(pos.product)
+            lots = float(pos.n or 0.0)
+            open_premium = float(pos.open_price) * float(pos.mult) * lots
+            liability = float(pos.cur_price) * float(pos.mult) * lots
+
+            total_lots += lots
+            total_contracts.add(pos.code)
+            total_products.add(product)
+            total_open_premium += open_premium
+            total_liability += liability
+
+            state = side_state[side]
+            state['lots'] += lots
+            state['contracts'].add(pos.code)
+            state['products'].add(product)
+            state['open_premium'] += open_premium
+            state['liability'] += liability
+
+        snapshot = {
+            's1_active_sell_lots': total_lots,
+            's1_active_sell_contracts': len(total_contracts),
+            's1_active_sell_products': len(total_products),
+            's1_lots_per_contract': total_lots / len(total_contracts) if total_contracts else 0.0,
+            's1_contracts_per_product': (
+                len(total_contracts) / len(total_products) if total_products else 0.0
+            ),
+            's1_short_open_premium': total_open_premium,
+            's1_short_liability': total_liability,
+            's1_short_unrealized_premium': total_open_premium - total_liability,
+            's1_short_open_premium_pct': total_open_premium / nav,
+            's1_short_liability_pct': total_liability / nav,
+            's1_short_unrealized_premium_pct': (total_open_premium - total_liability) / nav,
+        }
+        call_lots = side_state['C']['lots']
+        put_lots = side_state['P']['lots']
+        snapshot['s1_call_lot_share'] = call_lots / total_lots if total_lots > 0 else 0.0
+        snapshot['s1_put_call_lot_ratio'] = put_lots / call_lots if call_lots > 0 else np.nan
+
+        for side, label in (('C', 'call'), ('P', 'put')):
+            state = side_state[side]
+            lots = state['lots']
+            open_premium = state['open_premium']
+            liability = state['liability']
+            snapshot[f's1_active_{label}_lots'] = lots
+            snapshot[f's1_active_{label}_contracts'] = len(state['contracts'])
+            snapshot[f's1_active_{label}_products'] = len(state['products'])
+            snapshot[f's1_{label}_open_premium'] = open_premium
+            snapshot[f's1_{label}_liability'] = liability
+            snapshot[f's1_{label}_unrealized_premium'] = open_premium - liability
+            snapshot[f's1_{label}_open_premium_pct'] = open_premium / nav
+            snapshot[f's1_{label}_liability_pct'] = liability / nav
+        return snapshot
+
     def _record_daily_diagnostics(self, date_str, nav):
         if not self.config.get('portfolio_diagnostics_enabled', True):
             return
         nav = max(float(nav), 1.0)
+        bucket_max_active = int(self.config.get('portfolio_bucket_max_active_products', 3) or 0)
+        corr_max_active = int(self.config.get('portfolio_corr_group_max_active_products', 2) or 0)
         bucket_state = defaultdict(lambda: {
             'margin': 0.0,
             'cash_vega': 0.0,
@@ -2341,6 +2497,17 @@ class ToolkitMinuteEngine:
             'products': set(),
             'positions': 0,
         })
+        s1_product_side_state = defaultdict(lambda: {
+            'margin': 0.0,
+            'cash_vega': 0.0,
+            'cash_gamma': 0.0,
+            'cash_theta': 0.0,
+            'stress_loss': 0.0,
+            'contracts': set(),
+            'lots': 0.0,
+            'open_premium': 0.0,
+            'liability': 0.0,
+        })
         for pos in self.positions:
             bucket = self._get_product_bucket(pos.product)
             corr_group = self._get_product_corr_group(pos.product)
@@ -2355,6 +2522,19 @@ class ToolkitMinuteEngine:
                 state[key]['stress_loss'] += stress_loss
                 state[key]['products'].add(self._normalize_product_key(pos.product))
                 state[key]['positions'] += 1
+            if pos.strat == 'S1' and pos.role == 'sell':
+                side = str(pos.opt_type or '').upper()[:1]
+                product = self._normalize_product_key(pos.product)
+                data = s1_product_side_state[(product, side)]
+                data['margin'] += margin
+                data['cash_vega'] += cv
+                data['cash_gamma'] += cg
+                data['cash_theta'] += pos.cash_theta()
+                data['stress_loss'] += stress_loss
+                data['contracts'].add(pos.code)
+                data['lots'] += float(pos.n or 0.0)
+                data['open_premium'] += float(pos.open_price) * float(pos.mult) * float(pos.n or 0.0)
+                data['liability'] += float(pos.cur_price) * float(pos.mult) * float(pos.n or 0.0)
         for bucket, data in bucket_state.items():
             self.diagnostics_records.append({
                 'date': date_str,
@@ -2366,6 +2546,38 @@ class ToolkitMinuteEngine:
                 'stress_loss_pct': data['stress_loss'] / nav,
                 'n_products': len(data['products']),
                 'n_positions': data['positions'],
+                'max_active_products': bucket_max_active,
+                'active_product_cap_used': (
+                    len(data['products']) / bucket_max_active if bucket_max_active > 0 else np.nan
+                ),
+                'portfolio_vol_regime': self._current_portfolio_regime,
+            })
+        for (product, side), data in s1_product_side_state.items():
+            bucket = self._get_product_bucket(product)
+            corr_group = self._get_product_corr_group(product)
+            unrealized_premium = data['open_premium'] - data['liability']
+            self.diagnostics_records.append({
+                'date': date_str,
+                'scope': 's1_product_side',
+                'name': f'{product}:{side}',
+                'product': product,
+                'option_type': side,
+                'bucket': bucket,
+                'corr_group': corr_group,
+                'product_vol_regime': self._current_vol_regimes.get(product, ''),
+                'lots': data['lots'],
+                'n_contracts': len(data['contracts']),
+                'margin_pct': data['margin'] / nav,
+                'cash_vega_pct': data['cash_vega'] / nav,
+                'cash_gamma_pct': data['cash_gamma'] / nav,
+                'cash_theta_pct': data['cash_theta'] / nav,
+                'stress_loss_pct': data['stress_loss'] / nav,
+                'open_premium': data['open_premium'],
+                'current_liability': data['liability'],
+                'unrealized_premium': unrealized_premium,
+                'open_premium_pct': data['open_premium'] / nav,
+                'current_liability_pct': data['liability'] / nav,
+                'unrealized_premium_pct': unrealized_premium / nav,
                 'portfolio_vol_regime': self._current_portfolio_regime,
             })
         for group, data in corr_state.items():
@@ -2379,6 +2591,10 @@ class ToolkitMinuteEngine:
                 'stress_loss_pct': data['stress_loss'] / nav,
                 'n_products': len(data['products']),
                 'n_positions': data['positions'],
+                'max_active_products': corr_max_active,
+                'active_product_cap_used': (
+                    len(data['products']) / corr_max_active if corr_max_active > 0 else np.nan
+                ),
                 'portfolio_vol_regime': self._current_portfolio_regime,
             })
 
@@ -2415,8 +2631,9 @@ class ToolkitMinuteEngine:
             if state.get('is_structural_low_iv')
         )
         self._record_daily_diagnostics(date_str, nav)
+        s1_shape = self._s1_sell_shape_snapshot(nav)
 
-        self.nav_records.append({
+        nav_record = {
             'date': date_str, 'nav': nav, 'cum_pnl': cum_pnl,
             's1_pnl': s1_pnl, 's3_pnl': s3_pnl, 's4_pnl': s4_pnl,
             'fee': realized_fee, 'margin_used': margin,
@@ -2431,6 +2648,12 @@ class ToolkitMinuteEngine:
             'effective_s3_margin_cap': budget.get('s3_margin_cap', np.nan),
             'effective_product_margin_cap': budget.get('product_margin_cap', np.nan),
             'effective_bucket_margin_cap': budget.get('bucket_margin_cap', np.nan),
+            'effective_bucket_max_active_products': int(
+                self.config.get('portfolio_bucket_max_active_products', 3) or 0
+            ),
+            'effective_corr_group_max_active_products': int(
+                self.config.get('portfolio_corr_group_max_active_products', 2) or 0
+            ),
             'effective_stress_loss_cap': budget.get('portfolio_stress_loss_cap', np.nan),
             'effective_bucket_stress_loss_cap': budget.get('portfolio_bucket_stress_loss_cap', np.nan),
             'effective_s1_stress_budget_pct': budget.get('s1_stress_loss_budget_pct', np.nan),
@@ -2446,7 +2669,9 @@ class ToolkitMinuteEngine:
             'vol_post_stop_products': regime_counts.get('post_stop_cooldown', 0),
             'structural_low_iv_products': structural_low_count,
             'n_positions': len(self.positions),
-        })
+        }
+        nav_record.update(s1_shape)
+        self.nav_records.append(nav_record)
 
         for p in self.positions:
             p.prev_price = p.cur_price
