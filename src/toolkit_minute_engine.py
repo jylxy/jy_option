@@ -38,7 +38,7 @@ from strategy_rules import (
     calc_s1_size, calc_s1_stress_size, calc_s3_size_v2, calc_s4_size,
     extract_atm_iv_series, calc_iv_percentile, calc_iv_rv_features, get_iv_scale,
     should_pause_open, should_close_expiry, should_open_new, can_reopen,
-    should_allow_open_low_iv_product, check_margin_ok, calc_stats,
+    should_allow_open_low_iv_product, calc_stats,
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
@@ -82,6 +82,7 @@ from iv_warmup import (
     warmup_cache_path,
     warmup_iv_consistent,
 )
+import portfolio_risk as port_risk
 import vol_regime as vol_rules
 
 logger = logging.getLogger(__name__)
@@ -434,86 +435,35 @@ class ToolkitMinuteEngine:
         )
 
     def _candidate_cash_greeks(self, row, opt_type, mult, qty, role='sell'):
-        sign = 1.0 if role in ('buy', 'protect') else -1.0
-        spot = float(row.get('spot_close', 0.0) or 0.0)
-        vega = float(row.get('vega', 0.0) or 0.0)
-        gamma = float(row.get('gamma', 0.0) or 0.0)
-        return {
-            'cash_vega': sign * vega * float(mult) * float(qty),
-            'cash_gamma': sign * gamma * float(mult) * float(qty) * spot * spot,
-        }
+        return port_risk.candidate_cash_greeks(row, opt_type, mult, qty, role=role)
 
     def _get_open_greek_state(self, include_pending=True):
-        state = {
-            'cash_delta': 0.0,
-            'cash_vega': 0.0,
-            'cash_gamma': 0.0,
-            'bucket_vega': defaultdict(float),
-            'bucket_gamma': defaultdict(float),
-        }
-        for pos in self.positions:
-            bucket = self._get_product_bucket(pos.product)
-            cd = pos.cash_delta()
-            cv = pos.cash_vega()
-            cg = pos.cash_gamma()
-            state['cash_delta'] += cd
-            state['cash_vega'] += cv
-            state['cash_gamma'] += cg
-            state['bucket_vega'][bucket] += cv
-            state['bucket_gamma'][bucket] += cg
-        if include_pending:
-            for item in self._pending_opens:
-                bucket = self._get_product_bucket(item.get('product', ''))
-                cv = float(item.get('cash_vega', 0.0) or 0.0)
-                cg = float(item.get('cash_gamma', 0.0) or 0.0)
-                state['cash_vega'] += cv
-                state['cash_gamma'] += cg
-                state['bucket_vega'][bucket] += cv
-                state['bucket_gamma'][bucket] += cg
-        return state
+        return port_risk.get_open_greek_state(
+            self.positions,
+            self._pending_opens,
+            self._get_product_bucket,
+            include_pending=include_pending,
+        )
 
     def _get_open_stress_loss_state(self, include_pending=True):
-        state = {
-            'stress_loss': 0.0,
-            'bucket_stress_loss': defaultdict(float),
-        }
-        for pos in self.positions:
-            loss = float(getattr(pos, 'stress_loss', 0.0) or 0.0)
-            bucket = self._get_product_bucket(pos.product)
-            state['stress_loss'] += loss
-            state['bucket_stress_loss'][bucket] += loss
-        if include_pending:
-            for item in self._pending_opens:
-                if item.get('role') != 'sell':
-                    continue
-                one_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0)
-                loss = float(item.get('stress_loss', one_loss * float(item.get('n', 0) or 0)) or 0.0)
-                bucket = self._get_product_bucket(item.get('product', ''))
-                state['stress_loss'] += loss
-                state['bucket_stress_loss'][bucket] += loss
-        return state
+        return port_risk.get_open_stress_loss_state(
+            self.positions,
+            self._pending_opens,
+            self._get_product_bucket,
+            include_pending=include_pending,
+        )
 
     def _passes_greek_budget(self, product, nav, new_cash_vega=0.0,
                              new_cash_gamma=0.0, include_pending=True):
-        cfg = self.config
-        if not np.isfinite(nav) or nav <= 0:
-            return False
-        state = self._get_open_greek_state(include_pending=include_pending)
-        vega_cap = float(cfg.get('portfolio_cash_vega_cap', 0.0) or 0.0)
-        gamma_cap = float(cfg.get('portfolio_cash_gamma_cap', 0.0) or 0.0)
-        if vega_cap > 0 and abs(state['cash_vega'] + new_cash_vega) / nav > vega_cap:
-            return False
-        if gamma_cap > 0 and abs(state['cash_gamma'] + new_cash_gamma) / nav > gamma_cap:
-            return False
-
-        bucket = self._get_product_bucket(product)
-        bucket_vega_cap = float(cfg.get('portfolio_bucket_cash_vega_cap', 0.0) or 0.0)
-        bucket_gamma_cap = float(cfg.get('portfolio_bucket_cash_gamma_cap', 0.0) or 0.0)
-        if bucket_vega_cap > 0 and abs(state['bucket_vega'].get(bucket, 0.0) + new_cash_vega) / nav > bucket_vega_cap:
-            return False
-        if bucket_gamma_cap > 0 and abs(state['bucket_gamma'].get(bucket, 0.0) + new_cash_gamma) / nav > bucket_gamma_cap:
-            return False
-        return True
+        return port_risk.passes_greek_budget(
+            self.config,
+            product=product,
+            nav=nav,
+            greek_state=self._get_open_greek_state(include_pending=include_pending),
+            get_product_bucket=self._get_product_bucket,
+            new_cash_vega=new_cash_vega,
+            new_cash_gamma=new_cash_gamma,
+        )
 
     def _current_drawdown(self, nav=None):
         if nav is None:
@@ -550,33 +500,19 @@ class ToolkitMinuteEngine:
     def _passes_stress_budget(self, nav, new_cash_vega=0.0, new_cash_gamma=0.0,
                               product=None, new_stress_loss=0.0, budget=None,
                               include_pending=True):
-        cfg = self.config
-        if not cfg.get('portfolio_stress_gate_enabled', False):
-            return True
-        if not np.isfinite(nav) or nav <= 0:
-            return False
         budget = budget or self._current_open_budget or self._get_effective_open_budget()
-        explicit_state = self._get_open_stress_loss_state(include_pending=include_pending)
-        loss_cap = float(budget.get('portfolio_stress_loss_cap',
-                                    cfg.get('portfolio_stress_loss_cap', 0.03)) or 0.0)
-        if loss_cap > 0 and new_stress_loss > 0:
-            if (explicit_state['stress_loss'] + float(new_stress_loss)) / nav > loss_cap:
-                return False
-        bucket_cap = float(budget.get('portfolio_bucket_stress_loss_cap',
-                                      cfg.get('portfolio_bucket_stress_loss_cap', 0.0)) or 0.0)
-        if bucket_cap > 0 and product is not None and new_stress_loss > 0:
-            bucket = self._get_product_bucket(product)
-            if (explicit_state['bucket_stress_loss'].get(bucket, 0.0) + float(new_stress_loss)) / nav > bucket_cap:
-                return False
-        state = self._get_open_greek_state(include_pending=include_pending)
-        move = float(cfg.get('portfolio_stress_spot_move_pct', 0.03) or 0.0)
-        iv_up_points = float(cfg.get('portfolio_stress_iv_up_points', 5.0) or 0.0)
-        cash_delta = state['cash_delta']
-        cash_gamma = state['cash_gamma'] + new_cash_gamma
-        cash_vega = state['cash_vega'] + new_cash_vega
-        stress_pnl = -abs(cash_delta) * move + 0.5 * cash_gamma * move * move + cash_vega * iv_up_points
-        stress_loss = max(0.0, -float(stress_pnl))
-        return loss_cap <= 0 or stress_loss / nav <= loss_cap
+        return port_risk.passes_stress_budget(
+            self.config,
+            nav=nav,
+            greek_state=self._get_open_greek_state(include_pending=include_pending),
+            stress_state=self._get_open_stress_loss_state(include_pending=include_pending),
+            get_product_bucket=self._get_product_bucket,
+            product=product,
+            budget=budget,
+            new_cash_vega=new_cash_vega,
+            new_cash_gamma=new_cash_gamma,
+            new_stress_loss=new_stress_loss,
+        )
 
     def run(self, start_date=None, end_date=None, products=None, tag='toolkit'):
         """主入口"""
@@ -810,171 +746,79 @@ class ToolkitMinuteEngine:
         return get_product_corr_group(product)
 
     def _iter_open_sell_exposures(self, include_pending=True):
-        for pos in self.positions:
-            if pos.role == 'sell':
-                yield self._normalize_product_key(pos.product), float(pos.cur_margin())
-        if not include_pending:
-            return
-        for item in self._pending_opens:
-            if item.get('role') == 'sell':
-                yield self._normalize_product_key(item.get('product', '')), float(item.get('margin', 0.0) or 0.0)
+        yield from port_risk.iter_open_sell_exposures(
+            self.positions,
+            self._pending_opens,
+            self._normalize_product_key,
+            include_pending=include_pending,
+        )
 
     def _get_open_sell_margin_total(self, strat=None, include_pending=True):
-        total = 0.0
-        for pos in self.positions:
-            if pos.role == 'sell' and (strat is None or pos.strat == strat):
-                total += float(pos.cur_margin())
-        if not include_pending:
-            return total
-        for item in self._pending_opens:
-            if item.get('role') == 'sell' and (strat is None or item.get('strat') == strat):
-                total += float(item.get('margin', 0.0) or 0.0)
-        return total
+        return port_risk.get_open_sell_margin_total(
+            self.positions,
+            self._pending_opens,
+            strat=strat,
+            include_pending=include_pending,
+        )
 
     def _get_product_return_series(self, product, current_date=None):
-        product = self._normalize_product_key(product)
-        hist = self._spot_history.get(product, {})
-        dates = hist.get('dates', [])
-        spots = hist.get('spots', [])
-        if not dates or not spots:
-            return pd.Series(dtype=float)
-        series = pd.Series(spots, index=pd.Index(dates, dtype=object), dtype=float)
-        series = series[~series.index.duplicated(keep='last')]
-        series = series.replace([np.inf, -np.inf], np.nan).dropna()
-        series = series[series > 0]
-        if current_date is not None:
-            series = series[series.index <= current_date]
-        if len(series) < 2:
-            return pd.Series(dtype=float)
-        returns = np.log(series).diff().dropna()
-        return returns
+        return port_risk.product_return_series(
+            self._spot_history,
+            self._normalize_product_key,
+            product,
+            current_date=current_date,
+        )
 
     def _get_recent_product_corr(self, product, peer_product, current_date):
-        cfg = self.config
-        window = int(cfg.get('portfolio_corr_window', 60) or 0)
-        min_periods = int(cfg.get('portfolio_corr_min_periods', 20) or 0)
-        if window <= 1:
-            return np.nan
-        left = self._get_product_return_series(product, current_date=current_date).tail(window)
-        right = self._get_product_return_series(peer_product, current_date=current_date).tail(window)
-        if left.empty or right.empty:
-            return np.nan
-        aligned = pd.concat([left.rename('x'), right.rename('y')], axis=1, join='inner').dropna()
-        if len(aligned) < max(min_periods, 2):
-            return np.nan
-        return float(aligned['x'].corr(aligned['y']))
+        return port_risk.recent_product_corr(
+            self.config,
+            self._spot_history,
+            self._normalize_product_key,
+            product,
+            peer_product,
+            current_date,
+        )
 
     def _get_open_concentration_state(self, include_pending=True):
-        state = {
-            'product_margin': defaultdict(float),
-            'bucket_margin': defaultdict(float),
-            'bucket_products': defaultdict(set),
-            'corr_products': defaultdict(set),
-        }
-        for product, margin in self._iter_open_sell_exposures(include_pending=include_pending):
-            if not product:
-                continue
-            bucket = self._get_product_bucket(product)
-            corr_group = self._get_product_corr_group(product)
-            state['product_margin'][product] += margin
-            state['bucket_margin'][bucket] += margin
-            state['bucket_products'][bucket].add(product)
-            state['corr_products'][corr_group].add(product)
-        return state
+        return port_risk.get_open_concentration_state(
+            self.positions,
+            self._pending_opens,
+            self._normalize_product_key,
+            self._get_product_bucket,
+            self._get_product_corr_group,
+            include_pending=include_pending,
+        )
 
     def _passes_portfolio_construction(self, product, nav, new_margin, date_str=None,
                                        new_cash_vega=0.0, new_cash_gamma=0.0,
                                        new_stress_loss=0.0, budget=None,
                                        include_pending=True):
-        cfg = self.config
         budget = budget or self._current_open_budget or self._get_effective_open_budget()
-        if not cfg.get('portfolio_construction_enabled', True):
-            return (
-                self._passes_greek_budget(
-                    product, nav, new_cash_vega, new_cash_gamma,
-                    include_pending=include_pending,
-                ) and
-                self._passes_stress_budget(
-                    nav, new_cash_vega, new_cash_gamma, product, new_stress_loss,
-                    budget=budget, include_pending=include_pending,
-                )
-            )
-        if not np.isfinite(nav) or nav <= 0:
-            return False
-
-        product = self._normalize_product_key(product)
-        state = self._get_open_concentration_state(include_pending=include_pending)
-        product_cap = float(
-            budget.get('product_margin_cap', cfg.get('portfolio_product_margin_cap', 0.08)) or 0.0
-        )
-        bucket = self._get_product_bucket(product)
-        corr_group = self._get_product_corr_group(product)
-
-        if product_cap > 0:
-            if (state['product_margin'].get(product, 0.0) + new_margin) / nav > product_cap:
-                return False
-
-        if cfg.get('portfolio_bucket_control_enabled', True):
-            bucket_cap = float(
-                budget.get('bucket_margin_cap', cfg.get('portfolio_bucket_margin_cap', 0.18)) or 0.0
-            )
-            bucket_max_active = int(cfg.get('portfolio_bucket_max_active_products', 3) or 0)
-            bucket_products = state['bucket_products'].get(bucket, set())
-            if bucket_max_active > 0 and product not in bucket_products and len(bucket_products) >= bucket_max_active:
-                return False
-            if bucket_cap > 0:
-                if (state['bucket_margin'].get(bucket, 0.0) + new_margin) / nav > bucket_cap:
-                    return False
-
-        if cfg.get('portfolio_corr_control_enabled', True):
-            corr_max_active = int(cfg.get('portfolio_corr_group_max_active_products', 2) or 0)
-            corr_products = state['corr_products'].get(corr_group, set())
-            if corr_max_active > 0 and product not in corr_products and len(corr_products) >= corr_max_active:
-                return False
-            if cfg.get('portfolio_dynamic_corr_control_enabled', True) and date_str is not None:
-                corr_threshold = float(cfg.get('portfolio_corr_threshold', 0.70) or 0.0)
-                max_high_corr_peers = int(cfg.get('portfolio_corr_max_high_corr_peers', 1) or 0)
-                if corr_threshold > 0 and max_high_corr_peers >= 0:
-                    high_corr_peers = 0
-                    for peer in corr_products:
-                        if peer == product:
-                            continue
-                        corr = self._get_recent_product_corr(product, peer, current_date=date_str)
-                        if pd.notna(corr) and corr >= corr_threshold:
-                            high_corr_peers += 1
-                    if high_corr_peers > max_high_corr_peers:
-                        return False
-
-        return (
-            self._passes_greek_budget(
-                product, nav, new_cash_vega, new_cash_gamma,
-                include_pending=include_pending,
-            ) and
-            self._passes_stress_budget(
-                nav, new_cash_vega, new_cash_gamma, product, new_stress_loss,
-                budget=budget, include_pending=include_pending,
-            )
+        return port_risk.passes_portfolio_construction(
+            self.config,
+            product=product,
+            nav=nav,
+            new_margin=new_margin,
+            positions=self.positions,
+            pending_opens=self._pending_opens,
+            spot_history=self._spot_history,
+            normalize_product_key=self._normalize_product_key,
+            get_product_bucket=self._get_product_bucket,
+            get_product_corr_group=self._get_product_corr_group,
+            date_str=date_str,
+            new_cash_vega=new_cash_vega,
+            new_cash_gamma=new_cash_gamma,
+            new_stress_loss=new_stress_loss,
+            budget=budget,
+            include_pending=include_pending,
         )
 
     def _diversify_product_order(self, products):
-        if not self.config.get('portfolio_bucket_round_robin', True):
-            return list(products)
-        bucket_products = defaultdict(list)
-        bucket_order = []
-        for product in products:
-            bucket = self._get_product_bucket(product)
-            if bucket not in bucket_products:
-                bucket_order.append(bucket)
-            bucket_products[bucket].append(product)
-        diversified = []
-        has_remaining = True
-        while has_remaining:
-            has_remaining = False
-            for bucket in bucket_order:
-                if bucket_products[bucket]:
-                    diversified.append(bucket_products[bucket].pop(0))
-                    has_remaining = True
-        return diversified
+        return port_risk.diversify_product_order(
+            self.config,
+            products,
+            self._get_product_bucket,
+        )
 
     def _prioritize_products_by_regime(self, products):
         return vol_rules.prioritize_products_by_regime(
@@ -1118,9 +962,11 @@ class ToolkitMinuteEngine:
                 ) * actual_n
                 cap_key = f"{strat.lower()}_margin_cap"
                 effective_strategy_cap = exec_budget.get(cap_key, self.config.get(cap_key, 0.25))
-                if not check_margin_ok(total_m, strat_m, new_m, nav,
-                                       exec_budget.get('margin_cap', self.config.get('margin_cap', 0.50)),
-                                       effective_strategy_cap):
+                if not port_risk.check_margin_ok(
+                    total_m, strat_m, new_m, nav,
+                    exec_budget.get('margin_cap', self.config.get('margin_cap', 0.50)),
+                    effective_strategy_cap,
+                ):
                     continue
                 item_n = float(item.get('n', 0) or 0)
                 exposure_scale = actual_n / item_n if item_n > 0 else 0.0
@@ -1929,7 +1775,7 @@ class ToolkitMinuteEngine:
                 s1_m = self._get_open_sell_margin_total('S1')
                 new_greeks = self._candidate_cash_greeks(row, ot, mult, qty, role='sell')
                 total_stress_loss = one_loss * qty if one_loss > 0 else 0.0
-                if not check_margin_ok(
+                if not port_risk.check_margin_ok(
                     total_m, s1_m, single_margin * qty, nav,
                     effective_margin_cap, effective_strategy_cap,
                 ):
@@ -2076,9 +1922,11 @@ class ToolkitMinuteEngine:
         new_greeks = self._candidate_cash_greeks(sl, ot, mult, sq, role='sell')
         effective_margin_cap = self.config.get('margin_cap', 0.50) if margin_cap is None else margin_cap
         effective_strategy_cap = self.config.get('s3_margin_cap', 0.25) if strategy_cap is None else strategy_cap
-        if not check_margin_ok(total_m, s3_m, sm * sq, nav,
-                               effective_margin_cap,
-                               effective_strategy_cap):
+        if not port_risk.check_margin_ok(
+            total_m, s3_m, sm * sq, nav,
+            effective_margin_cap,
+            effective_strategy_cap,
+        ):
             return
         if not self._passes_portfolio_construction(
             product, nav, sm * sq, date_str=date_str,
