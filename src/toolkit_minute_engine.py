@@ -81,6 +81,7 @@ from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
 from day_loader import ToolkitDayLoader
+from config_loader import load_engine_config
 
 logger = logging.getLogger(__name__)
 
@@ -123,16 +124,7 @@ class ToolkitMinuteEngine:
         # 30品种时 margin_per 调低，避免保证金上限卡住太多品种
 
     def _load_config(self, path):
-        merged = dict(DEFAULT_PARAMS)
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-                if isinstance(cfg, dict):
-                    merged.update(cfg)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("config.json 读取失败: %s", exc)
-        return merged
+        return load_engine_config(path, DEFAULT_PARAMS, logger=logger)
 
     @staticmethod
     def _zero_attr_bucket():
