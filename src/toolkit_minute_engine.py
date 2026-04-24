@@ -44,6 +44,12 @@ from strategy_rules import (
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
+from budget_model import (
+    normalize_open_budget,
+    get_effective_open_budget,
+    pending_budget_fields,
+    execution_budget_for_item,
+)
 
 logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1612,102 +1618,17 @@ class ToolkitMinuteEngine:
             return min(value, float(upper))
         return value
 
-    @staticmethod
-    def _regime_budget_prefix(regime):
-        if regime == 'falling_vol_carry':
-            return 'falling'
-        if regime == 'low_stable_vol':
-            return 'low'
-        if regime == 'high_rising_vol':
-            return 'high'
-        return 'normal'
-
     def _normalize_open_budget(self, budget):
-        budget = dict(budget)
-        budget['margin_cap'] = self._safe_pct(budget.get('margin_cap'), 0.50)
-        budget['s1_margin_cap'] = min(
-            self._safe_pct(budget.get('s1_margin_cap'), 0.25),
-            budget['margin_cap'],
-        )
-        budget['s3_margin_cap'] = min(
-            self._safe_pct(budget.get('s3_margin_cap'), 0.25),
-            budget['margin_cap'],
-        )
-        budget['margin_per'] = self._safe_pct(budget.get('margin_per'), 0.02)
-        product_cap = self._safe_pct(budget.get('product_margin_cap'), 0.0)
-        bucket_cap = self._safe_pct(budget.get('bucket_margin_cap'), 0.0)
-        if bucket_cap > 0:
-            bucket_cap = min(bucket_cap, budget['margin_cap'])
-        if product_cap > 0:
-            product_cap = min(product_cap, budget['margin_cap'])
-            if bucket_cap > 0:
-                product_cap = min(product_cap, bucket_cap)
-        budget['product_margin_cap'] = product_cap
-        budget['bucket_margin_cap'] = bucket_cap
-
-        stress_cap = self._safe_pct(budget.get('portfolio_stress_loss_cap'), 0.0)
-        bucket_stress_cap = self._safe_pct(budget.get('portfolio_bucket_stress_loss_cap'), 0.0)
-        s1_stress_budget = self._safe_pct(budget.get('s1_stress_loss_budget_pct'), 0.0)
-        if stress_cap > 0:
-            if bucket_stress_cap > 0:
-                bucket_stress_cap = min(bucket_stress_cap, stress_cap)
-            if s1_stress_budget > 0:
-                s1_stress_budget = min(s1_stress_budget, stress_cap)
-        budget['portfolio_stress_loss_cap'] = stress_cap
-        budget['portfolio_bucket_stress_loss_cap'] = bucket_stress_cap
-        budget['s1_stress_loss_budget_pct'] = s1_stress_budget
-        return budget
+        return normalize_open_budget(budget)
 
     def _get_effective_open_budget(self):
-        cfg = self.config
-        base = self._normalize_open_budget({
-            'portfolio_regime': 'normal_vol',
-            'margin_cap': float(cfg.get('margin_cap', 0.50) or 0.50),
-            's1_margin_cap': float(cfg.get('s1_margin_cap', 0.25) or 0.25),
-            's3_margin_cap': float(cfg.get('s3_margin_cap', 0.25) or 0.25),
-            'margin_per': float(cfg.get('margin_per', 0.02) or 0.02),
-            'product_margin_cap': float(cfg.get('portfolio_product_margin_cap', 0.08) or 0.0),
-            'bucket_margin_cap': float(cfg.get('portfolio_bucket_margin_cap', 0.18) or 0.0),
-            'portfolio_stress_loss_cap': float(cfg.get('portfolio_stress_loss_cap', 0.03) or 0.0),
-            'portfolio_bucket_stress_loss_cap': float(cfg.get('portfolio_bucket_stress_loss_cap', 0.0) or 0.0),
-            's1_stress_loss_budget_pct': float(cfg.get('s1_stress_loss_budget_pct', 0.0010) or 0.0),
-        })
-        if not cfg.get('vol_regime_sizing_enabled', False):
-            budget = self._apply_open_budget_brakes(base)
-            self._current_open_budget = budget
-            return budget
-
-        regime = self._current_portfolio_regime or 'normal_vol'
-        prefix = self._regime_budget_prefix(regime)
-        budget = dict(base)
-        budget['portfolio_regime'] = regime
-        budget['margin_cap'] = float(cfg.get(f'vol_regime_{prefix}_margin_cap', base['margin_cap']) or base['margin_cap'])
-        budget['s1_margin_cap'] = float(cfg.get(f'vol_regime_{prefix}_s1_margin_cap', base['s1_margin_cap']) or base['s1_margin_cap'])
-        budget['s3_margin_cap'] = float(cfg.get(f'vol_regime_{prefix}_s3_margin_cap', base['s3_margin_cap']) or base['s3_margin_cap'])
-        budget['product_margin_cap'] = float(
-            cfg.get(f'vol_regime_{prefix}_product_margin_cap', base['product_margin_cap']) or
-            base['product_margin_cap']
+        nav = self._current_nav()
+        budget = get_effective_open_budget(
+            self.config,
+            portfolio_regime=self._current_portfolio_regime or 'normal_vol',
+            drawdown=self._current_drawdown(nav),
+            recent_stop_count=self._recent_stop_count(),
         )
-        budget['bucket_margin_cap'] = float(
-            cfg.get(f'vol_regime_{prefix}_bucket_margin_cap', base['bucket_margin_cap']) or
-            base['bucket_margin_cap']
-        )
-        budget['portfolio_stress_loss_cap'] = float(
-            cfg.get(f'vol_regime_{prefix}_stress_loss_cap', base['portfolio_stress_loss_cap']) or
-            base['portfolio_stress_loss_cap']
-        )
-        budget['portfolio_bucket_stress_loss_cap'] = float(
-            cfg.get(f'vol_regime_{prefix}_bucket_stress_loss_cap',
-                    base['portfolio_bucket_stress_loss_cap']) or
-            base['portfolio_bucket_stress_loss_cap']
-        )
-        budget['s1_stress_loss_budget_pct'] = float(
-            cfg.get(f'vol_regime_{prefix}_s1_stress_loss_budget_pct',
-                    base['s1_stress_loss_budget_pct']) or
-            base['s1_stress_loss_budget_pct']
-        )
-        budget = self._normalize_open_budget(budget)
-        budget = self._apply_open_budget_brakes(budget)
         self._current_open_budget = budget
         return budget
 
@@ -1939,154 +1860,13 @@ class ToolkitMinuteEngine:
                     continue
         return count
 
-    def _apply_open_budget_brakes(self, budget):
-        cfg = self.config
-        if not cfg.get('portfolio_budget_brake_enabled', True):
-            return self._normalize_open_budget(budget)
-
-        budget = dict(budget)
-        nav = self._current_nav()
-        drawdown = self._current_drawdown(nav)
-        recent_stops = self._recent_stop_count()
-        scale = 1.0
-        reasons = []
-
-        if (
-            budget.get('portfolio_regime') == 'falling_vol_carry' and
-            drawdown >= float(cfg.get('portfolio_dd_pause_falling', 0.008) or 0.0)
-        ):
-            for key in (
-                'margin_cap',
-                's1_margin_cap',
-                's3_margin_cap',
-                'product_margin_cap',
-                'bucket_margin_cap',
-                'portfolio_stress_loss_cap',
-                'portfolio_bucket_stress_loss_cap',
-                's1_stress_loss_budget_pct',
-            ):
-                normal_key = f'vol_regime_normal_{key}'
-                if key == 'portfolio_stress_loss_cap':
-                    normal_key = 'vol_regime_normal_stress_loss_cap'
-                elif key == 'portfolio_bucket_stress_loss_cap':
-                    normal_key = 'vol_regime_normal_bucket_stress_loss_cap'
-                elif key == 's1_stress_loss_budget_pct':
-                    normal_key = 'vol_regime_normal_s1_stress_loss_budget_pct'
-                if normal_key in cfg:
-                    budget[key] = min(float(budget.get(key, cfg[normal_key]) or 0.0),
-                                      float(cfg.get(normal_key) or 0.0))
-            budget['portfolio_regime'] = 'falling_vol_carry_paused'
-            reasons.append('dd_pause_falling')
-
-        hard_dd = float(cfg.get('portfolio_dd_reduce_limit', 0.012) or 0.0)
-        defensive_dd = float(cfg.get('portfolio_dd_defensive_limit', 0.016) or 0.0)
-        if defensive_dd > 0 and drawdown >= defensive_dd:
-            scale = min(scale, float(cfg.get('portfolio_dd_defensive_scale', 0.25) or 0.25))
-            reasons.append('dd_defensive')
-        elif hard_dd > 0 and drawdown >= hard_dd:
-            scale = min(scale, float(cfg.get('portfolio_dd_reduce_scale', 0.50) or 0.50))
-            reasons.append('dd_reduce')
-
-        stop_threshold = int(cfg.get('portfolio_stop_cluster_threshold', 3) or 0)
-        if stop_threshold > 0 and recent_stops >= stop_threshold:
-            scale = min(scale, float(cfg.get('portfolio_stop_cluster_scale', 0.50) or 0.50))
-            reasons.append('stop_cluster')
-
-        if scale < 1.0:
-            for key in (
-                'margin_cap',
-                's1_margin_cap',
-                's3_margin_cap',
-                'product_margin_cap',
-                'bucket_margin_cap',
-                'margin_per',
-                'portfolio_stress_loss_cap',
-                'portfolio_bucket_stress_loss_cap',
-                's1_stress_loss_budget_pct',
-            ):
-                if key in budget:
-                    budget[key] = float(budget[key]) * scale
-
-        budget['current_drawdown'] = drawdown
-        budget['recent_stop_count'] = recent_stops
-        budget['risk_scale'] = scale
-        budget['brake_reason'] = ','.join(reasons)
-        return self._normalize_open_budget(budget)
-
     def _pending_budget_fields(self, strategy_cap):
         budget = self._current_open_budget or self._get_effective_open_budget()
-        return {
-            'effective_margin_cap': budget.get('margin_cap', np.nan),
-            'effective_strategy_margin_cap': strategy_cap,
-            'effective_product_margin_cap': budget.get('product_margin_cap', np.nan),
-            'effective_bucket_margin_cap': budget.get('bucket_margin_cap', np.nan),
-            'effective_stress_loss_cap': budget.get('portfolio_stress_loss_cap', np.nan),
-            'effective_bucket_stress_loss_cap': budget.get('portfolio_bucket_stress_loss_cap', np.nan),
-            'effective_s1_stress_budget_pct': budget.get('s1_stress_loss_budget_pct', np.nan),
-            'open_budget_risk_scale': budget.get('risk_scale', np.nan),
-            'open_budget_brake_reason': budget.get('brake_reason', ''),
-        }
+        return pending_budget_fields(budget, strategy_cap)
 
     def _execution_budget_for_item(self, item):
         current = self._current_open_budget or self._get_effective_open_budget()
-        current = self._normalize_open_budget(current)
-        strat = str(item.get('strat', '')).lower()
-        strategy_key = f'{strat}_margin_cap' if strat else 's1_margin_cap'
-        if strategy_key not in current:
-            strategy_key = 's1_margin_cap'
-
-        signal = dict(current)
-        signal['margin_cap'] = self._safe_pct(
-            item.get('effective_margin_cap', current['margin_cap']),
-            current['margin_cap'],
-        )
-        signal[strategy_key] = self._safe_pct(
-            item.get('effective_strategy_margin_cap', current[strategy_key]),
-            current[strategy_key],
-        )
-        signal['product_margin_cap'] = self._safe_pct(
-            item.get('effective_product_margin_cap', current.get('product_margin_cap', 0.0)),
-            current.get('product_margin_cap', 0.0),
-        )
-        signal['bucket_margin_cap'] = self._safe_pct(
-            item.get('effective_bucket_margin_cap', current.get('bucket_margin_cap', 0.0)),
-            current.get('bucket_margin_cap', 0.0),
-        )
-        signal['portfolio_stress_loss_cap'] = self._safe_pct(
-            item.get('effective_stress_loss_cap', current.get('portfolio_stress_loss_cap', 0.0)),
-            current.get('portfolio_stress_loss_cap', 0.0),
-        )
-        signal['portfolio_bucket_stress_loss_cap'] = self._safe_pct(
-            item.get('effective_bucket_stress_loss_cap', current.get('portfolio_bucket_stress_loss_cap', 0.0)),
-            current.get('portfolio_bucket_stress_loss_cap', 0.0),
-        )
-        signal['s1_stress_loss_budget_pct'] = self._safe_pct(
-            item.get('effective_s1_stress_budget_pct', current.get('s1_stress_loss_budget_pct', 0.0)),
-            current.get('s1_stress_loss_budget_pct', 0.0),
-        )
-        signal = self._normalize_open_budget(signal)
-
-        policy = str(self.config.get('portfolio_execution_budget_policy', 'min_signal_current') or '').lower()
-        if policy == 'signal':
-            return signal
-        if policy == 'current':
-            return current
-
-        budget = dict(current)
-        for key in (
-            'margin_cap',
-            strategy_key,
-            'product_margin_cap',
-            'bucket_margin_cap',
-            'portfolio_stress_loss_cap',
-            'portfolio_bucket_stress_loss_cap',
-            's1_stress_loss_budget_pct',
-        ):
-            budget[key] = min(
-                self._safe_pct(current.get(key, 0.0), 0.0),
-                self._safe_pct(signal.get(key, current.get(key, 0.0)), current.get(key, 0.0)),
-            )
-        return self._normalize_open_budget(budget)
+        return execution_budget_for_item(item, current, self.config)
 
     def _passes_stress_budget(self, nav, new_cash_vega=0.0, new_cash_gamma=0.0,
                               product=None, new_stress_loss=0.0, budget=None,
