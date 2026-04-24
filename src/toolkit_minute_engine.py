@@ -44,6 +44,14 @@ from strategy_rules import (
 )
 from margin_model import estimate_margin, resolve_margin_ratio
 from contract_provider import ContractInfo
+from spot_provider import (
+    build_underlying_alias_map,
+    spot_tables_for_codes,
+    map_alias_spot_frame,
+    resolve_alias_value_map,
+    estimate_spot_pcp,
+    build_pcp_spot_frame,
+)
 from budget_model import (
     normalize_open_budget,
     get_effective_open_budget,
@@ -155,45 +163,6 @@ PRODUCT_CORR_GROUP_MAP = {
     "CF": "softs",
     "SR": "softs",
 }
-
-
-def _extract_future_root(code):
-    """Return the alphabetic root of a futures-like underlying code."""
-    base = str(code).split('.', 1)[0]
-    root = []
-    for ch in base:
-        if ch.isalpha():
-            root.append(ch)
-        else:
-            break
-    return ''.join(root).upper()
-
-
-def _build_underlying_alias_map(underlying_codes):
-    """
-    Build fallback aliases for real-spot lookup.
-
-    Exact monthly contracts are preferred. For commodity futures, fall back to
-    the exchange continuous contract code such as BUZL.SHF when the exact month
-    is absent from future_hf_1min.
-    """
-    alias_map = {}
-    for code in sorted({str(code) for code in underlying_codes if code}):
-        aliases = [code]
-        if '.' not in code:
-            alias_map[code] = aliases
-            continue
-        base, suffix = code.split('.', 1)
-        if base.isdigit():
-            alias_map[code] = aliases
-            continue
-        root = _extract_future_root(base)
-        if root:
-            continuous = f"{root}ZL.{suffix}"
-            if continuous not in aliases:
-                aliases.append(continuous)
-        alias_map[code] = aliases
-    return alias_map
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -343,7 +312,7 @@ class ToolkitDayLoader:
         if not underlying_codes:
             return pd.DataFrame()
 
-        alias_map = _build_underlying_alias_map(underlying_codes)
+        alias_map = build_underlying_alias_map(underlying_codes)
         lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
         if not lookup_codes:
             return pd.DataFrame()
@@ -364,30 +333,13 @@ class ToolkitDayLoader:
         if not frames:
             return pd.DataFrame()
 
-        df = pd.concat(frames, ignore_index=True)
-        df['spot'] = pd.to_numeric(df['close'], errors='coerce')
-        df = df[df['spot'].notna() & (df['spot'] > 0)].copy()
-        if df.empty:
-            return pd.DataFrame()
-
-        reverse_rows = []
-        for requested_code, aliases in alias_map.items():
-            for alias_rank, alias_code in enumerate(aliases):
-                reverse_rows.append({
-                    'lookup_code': alias_code,
-                    'underlying_code': requested_code,
-                    'alias_rank': alias_rank,
-                })
-        reverse_df = pd.DataFrame(reverse_rows)
-        df = df.rename(columns={'ths_code': 'lookup_code'})
-        df = df.merge(reverse_df, on='lookup_code', how='inner')
-        df = df.sort_values(
-            ['time', 'underlying_code', 'alias_rank'],
-            ascending=[True, True, True],
-            kind='mergesort',
+        return map_alias_spot_frame(
+            pd.concat(frames, ignore_index=True),
+            alias_map,
+            lookup_col='ths_code',
+            value_col='close',
+            sort_cols=['time'],
         )
-        df = df.drop_duplicates(['time', 'underlying_code'], keep='first')
-        return df[['time', 'underlying_code', 'spot']]
 
     def clear_cache(self, keep_dates=None):
         """清理缓存，释放内存。可选保留指定日期。"""
@@ -415,16 +367,7 @@ class ToolkitDayLoader:
         return select_bars_sql(query)
 
     def _spot_tables_for_codes(self, underlying_codes):
-        codes = [str(code) for code in underlying_codes if code]
-        if not codes:
-            return []
-        etf_like = {'.SH', '.SZ'}
-        code_suffixes = {code.rsplit('.', 1)[-1] if '.' in code else '' for code in codes}
-        if code_suffixes and code_suffixes.issubset({'SH', 'SZ'}):
-            return [ETF_MINUTE_TABLE]
-        if code_suffixes.isdisjoint(etf_like):
-            return [FUTURE_MINUTE_TABLE]
-        return [FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE]
+        return spot_tables_for_codes(underlying_codes, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE)
 
     def _get_spot_daily_close_map(self, date_str, underlying_codes):
         if not underlying_codes:
@@ -433,7 +376,7 @@ class ToolkitDayLoader:
         cache = self._spot_daily_cache.setdefault(date_str, {})
         missing = [code for code in sorted(set(underlying_codes)) if code and code not in cache]
         if missing:
-            alias_map = _build_underlying_alias_map(missing)
+            alias_map = build_underlying_alias_map(missing)
             lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
             code_list_sql = ", ".join(f"'{code}'" for code in lookup_codes)
             frames = []
@@ -447,13 +390,9 @@ class ToolkitDayLoader:
                 merged = merged[merged['last_close'].notna() & (merged['last_close'] > 0)]
                 for _, row in merged.iterrows():
                     cache[str(row['ths_code'])] = float(row['last_close'])
+            cache.update(resolve_alias_value_map(cache, alias_map))
             for code in missing:
-                for alias in alias_map.get(code, [code]):
-                    if cache.get(alias) is not None and cache.get(alias) > 0:
-                        cache[code] = float(cache[alias])
-                        break
-                else:
-                    cache.setdefault(code, None)
+                cache.setdefault(code, None)
 
         return {
             code: cache.get(code)
@@ -718,43 +657,8 @@ class ToolkitDayLoader:
         return df
 
     def _estimate_spot_pcp(self, group):
-        """用 put-call parity 推算标的价格"""
-        calls = group[group['option_type'] == 'C']
-        puts = group[group['option_type'] == 'P']
-
-        if calls.empty or puts.empty:
-            return None
-
-        common_strikes = set(calls['strike'].values) & set(puts['strike'].values)
-        if not common_strikes:
-            return None
-
-        dte = group['dte'].iloc[0] if 'dte' in group.columns else 30
-        t = max(dte, 1) / 365.0
-        discount = np.exp(RISK_FREE_RATE * t)
-
-        estimates = []
-        for k in common_strikes:
-            c_row = calls[calls['strike'] == k]
-            p_row = puts[puts['strike'] == k]
-            if c_row.empty or p_row.empty:
-                continue
-            c_price = float(c_row.iloc[0]['option_close'])
-            p_price = float(p_row.iloc[0]['option_close'])
-            if c_price <= 0 or p_price <= 0:
-                continue
-            f = k + discount * (c_price - p_price)
-            if f > 0:
-                c_vol = int(c_row.iloc[0].get('volume', 0))
-                p_vol = int(p_row.iloc[0].get('volume', 0))
-                weight = min(c_vol, p_vol) + 1
-                estimates.append((f, weight))
-
-        if not estimates:
-            return None
-
-        total_w = sum(w for _, w in estimates)
-        return sum(f * w for f, w in estimates) / total_w
+        """Estimate spot with put-call parity fallback."""
+        return estimate_spot_pcp(group, risk_free_rate=RISK_FREE_RATE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -945,15 +849,7 @@ class ToolkitMinuteEngine:
 
     @staticmethod
     def _spot_tables_for_codes(underlying_codes):
-        codes = [str(code) for code in underlying_codes if code]
-        if not codes:
-            return []
-        code_suffixes = {code.rsplit('.', 1)[-1] if '.' in code else '' for code in codes}
-        if code_suffixes and code_suffixes.issubset({'SH', 'SZ'}):
-            return [ETF_MINUTE_TABLE]
-        if code_suffixes.isdisjoint({'SH', 'SZ'}):
-            return [FUTURE_MINUTE_TABLE]
-        return [FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE]
+        return spot_tables_for_codes(underlying_codes, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE)
 
     def _reentry_key(self, strat, product, opt_type=None):
         return (str(strat), str(product))
@@ -2320,7 +2216,7 @@ class ToolkitMinuteEngine:
         underlying_codes = sorted({code for code in df['underlying_code'].dropna().tolist() if code})
         real_spot_df = pd.DataFrame(columns=['trade_date', 'underlying_code', 'spot'])
         if underlying_codes:
-            alias_map = _build_underlying_alias_map(underlying_codes)
+            alias_map = build_underlying_alias_map(underlying_codes)
             lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
             spot_filter_sql = self._build_code_filter_sql(lookup_codes)
             spot_frames = []
@@ -2340,27 +2236,13 @@ class ToolkitMinuteEngine:
                 if spot_part is not None and not spot_part.empty:
                     spot_frames.append(spot_part)
             if spot_frames:
-                real_spot_df = pd.concat(spot_frames, ignore_index=True)
-                real_spot_df['spot'] = pd.to_numeric(real_spot_df['spot'], errors='coerce')
-                real_spot_df = real_spot_df[real_spot_df['spot'].notna() & (real_spot_df['spot'] > 0)].copy()
-                reverse_rows = []
-                for requested_code, aliases in alias_map.items():
-                    for alias_rank, alias_code in enumerate(aliases):
-                        reverse_rows.append({
-                            'lookup_code': alias_code,
-                            'underlying_code': requested_code,
-                            'alias_rank': alias_rank,
-                        })
-                reverse_df = pd.DataFrame(reverse_rows)
-                real_spot_df = real_spot_df.rename(columns={'underlying_code': 'lookup_code'})
-                real_spot_df = real_spot_df.merge(reverse_df, on='lookup_code', how='inner')
-                real_spot_df = real_spot_df.sort_values(
-                    ['trade_date', 'underlying_code', 'alias_rank'],
-                    ascending=[True, True, True],
-                    kind='mergesort',
+                real_spot_df = map_alias_spot_frame(
+                    pd.concat(spot_frames, ignore_index=True),
+                    alias_map,
+                    lookup_col='underlying_code',
+                    value_col='spot',
+                    sort_cols=['trade_date'],
                 )
-                real_spot_df = real_spot_df.drop_duplicates(['trade_date', 'underlying_code'], keep='first')
-                real_spot_df = real_spot_df[['trade_date', 'underlying_code', 'spot']]
                 df = df.merge(real_spot_df, on=['trade_date', 'underlying_code'], how='left')
             else:
                 df['spot'] = np.nan
@@ -2377,38 +2259,16 @@ class ToolkitMinuteEngine:
         if unresolved.any():
             fallback_src = df.loc[unresolved, ['trade_date', 'product', 'expiry_date', 'strike',
                                                'option_type', 'last_close', 'total_volume']].copy()
-            calls = fallback_src[fallback_src['option_type'] == 'C']
-            puts = fallback_src[fallback_src['option_type'] == 'P']
-            pairs = calls.merge(
-                puts,
-                on=['trade_date', 'product', 'expiry_date', 'strike'],
-                suffixes=('_c', '_p'),
-                how='inner',
-            )
-            if not pairs.empty:
-                pairs['trade_dt'] = pd.to_datetime(pairs['trade_date'], errors='coerce')
-                pairs['expiry_dt'] = pd.to_datetime(pairs['expiry_date'], errors='coerce')
-                pairs['dte'] = (pairs['expiry_dt'] - pairs['trade_dt']).dt.days.clip(lower=1)
-                pairs['discount'] = np.exp(RISK_FREE_RATE * pairs['dte'].astype(float) / 365.0)
-                pairs['spot_est'] = pairs['strike'] + pairs['discount'] * (pairs['last_close_c'] - pairs['last_close_p'])
-                pairs = pairs[pairs['spot_est'] > 0].copy()
-                if not pairs.empty:
-                    pairs['weight'] = np.minimum(pairs['total_volume_c'], pairs['total_volume_p']) + 1.0
-                    pairs['weighted_spot'] = pairs['spot_est'] * pairs['weight']
-                    spot_agg = pairs.groupby(['trade_date', 'product', 'expiry_date']).agg(
-                        spot_sum=('weighted_spot', 'sum'),
-                        weight_sum=('weight', 'sum')
-                    ).reset_index()
-                    spot_agg = spot_agg[spot_agg['weight_sum'] > 0].copy()
-                    spot_agg['spot_pcp'] = spot_agg['spot_sum'] / spot_agg['weight_sum']
-                    df = df.merge(
-                        spot_agg[['trade_date', 'product', 'expiry_date', 'spot_pcp']],
-                        on=['trade_date', 'product', 'expiry_date'],
-                        how='left'
-                    )
-                    fill_mask = (df['spot'].isna() | (df['spot'] <= 0)) & df['spot_pcp'].notna() & (df['spot_pcp'] > 0)
-                    df.loc[fill_mask, 'spot'] = df.loc[fill_mask, 'spot_pcp']
-                    df = df.drop(columns=['spot_pcp'], errors='ignore')
+            spot_agg = build_pcp_spot_frame(fallback_src, risk_free_rate=RISK_FREE_RATE)
+            if not spot_agg.empty:
+                df = df.merge(
+                    spot_agg,
+                    on=['trade_date', 'product', 'expiry_date'],
+                    how='left'
+                )
+                fill_mask = (df['spot'].isna() | (df['spot'] <= 0)) & df['spot_pcp'].notna() & (df['spot_pcp'] > 0)
+                df.loc[fill_mask, 'spot'] = df.loc[fill_mask, 'spot_pcp']
+                df = df.drop(columns=['spot_pcp'], errors='ignore')
 
         valid_spot_products = set(df.loc[df['spot'].notna() & (df['spot'] > 0), 'product'].dropna().unique())
         skipped_products = sorted(requested_products - valid_spot_products)
