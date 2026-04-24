@@ -130,6 +130,9 @@ class DailyAggregationTest(unittest.TestCase):
         self.assertTrue(np.allclose(enriched["moneyness"], 0.5))
         self.assertTrue(enriched["implied_vol"].isna().all())
         self.assertTrue(enriched["delta"].isna().all())
+        self.assertTrue(enriched["gamma"].isna().all())
+        self.assertTrue(enriched["vega"].isna().all())
+        self.assertTrue(enriched["theta"].isna().all())
 
 
 if __name__ == "__main__":

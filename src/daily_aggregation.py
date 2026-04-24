@@ -137,6 +137,9 @@ def enrich_daily_with_spot_iv_delta(df, spot_map=None, risk_free_rate=RISK_FREE_
 
     result["implied_vol"] = np.nan
     result["delta"] = np.nan
+    result["gamma"] = np.nan
+    result["vega"] = np.nan
+    result["theta"] = np.nan
 
     if candidate.any():
         iv = calc_iv_batch(
@@ -160,5 +163,8 @@ def enrich_daily_with_spot_iv_delta(df, spot_map=None, risk_free_rate=RISK_FREE_
                 otype_col="option_type",
             )
             result.loc[has_iv, "delta"] = greeks["delta"].values
+            result.loc[has_iv, "gamma"] = greeks["gamma"].values
+            result.loc[has_iv, "vega"] = greeks["vega"].values
+            result.loc[has_iv, "theta"] = greeks["theta"].values
 
     return result

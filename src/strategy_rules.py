@@ -97,6 +97,12 @@ DEFAULT_PARAMS = {
     "s1_min_volume": 50,
     "s1_min_oi": 200,
     "s1_carry_metric": "premium_margin",
+    "s1_ranking_mode": "target_delta",
+    "s1_score_premium_stress_weight": 0.55,
+    "s1_score_theta_stress_weight": 0.25,
+    "s1_score_premium_margin_weight": 0.15,
+    "s1_score_liquidity_weight": 0.05,
+    "s1_score_delta_weight": 0.00,
     "s1_falling_framework_enabled": False,
     "s1_entry_max_iv_trend": 0.005,
     "s1_entry_max_rv_trend": 0.02,
@@ -275,6 +281,22 @@ def _stable_rank(df, sort_cols, ascending):
         cols.append("option_code")
         orders.append(True)
     return work.sort_values(cols, ascending=orders, kind="mergesort")
+
+
+def _pct_rank_high(series, fill_value=0.0):
+    """Return percentile ranks where larger raw values are better."""
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if values.notna().sum() <= 1:
+        return pd.Series(fill_value, index=series.index, dtype=float)
+    return values.rank(method="average", pct=True).fillna(fill_value)
+
+
+def _pct_rank_low(series, fill_value=0.0):
+    """Return percentile ranks where smaller raw values are better."""
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if values.notna().sum() <= 1:
+        return pd.Series(fill_value, index=series.index, dtype=float)
+    return (1.0 - values.rank(method="average", pct=True)).fillna(fill_value)
 
 
 def select_s1_protect(day_df, sell_row, mode="inner",
@@ -1053,6 +1075,12 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                    min_premium_fee_multiple=0.0, use_stress_score=False,
                    stress_spot_move_pct=0.03, stress_iv_up_points=5.0,
                    gamma_penalty=0.0, vega_penalty=0.0,
+                   ranking_mode="target_delta",
+                   premium_stress_weight=0.55,
+                   theta_stress_weight=0.25,
+                   premium_margin_weight=0.15,
+                   liquidity_weight=0.05,
+                   delta_weight=0.0,
                    return_candidates=False, max_candidates=1,
                    exchange=None, product=None):
     """Deterministic S1 sell-leg selector with optional carry/stress ranking."""
@@ -1104,15 +1132,21 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
     if c.empty:
         return None
 
-    c["eff"] = c["option_close"] * mult / c["margin"]
-    premium_cash = c["option_close"] * float(mult)
-    theta_cash = c["theta"].abs() * float(mult) if "theta" in c.columns else premium_cash
+    gross_premium_cash = c["option_close"] * float(mult)
+    roundtrip_fee = float(fee_per_contract or 0.0) * 2.0
+    net_premium_cash = (gross_premium_cash - roundtrip_fee).clip(lower=0.0)
+    c["net_premium_cash"] = net_premium_cash
+    c["eff"] = gross_premium_cash / c["margin"]
+    c["net_eff"] = net_premium_cash / c["margin"]
+    theta_cash = c["theta"].abs() * float(mult) if "theta" in c.columns else pd.Series(0.0, index=c.index)
     if carry_metric == "theta_margin" and "theta" in c.columns:
         c["carry_score"] = theta_cash / c["margin"]
     elif carry_metric == "theta" and "theta" in c.columns:
         c["carry_score"] = theta_cash
     elif carry_metric == "premium":
-        c["carry_score"] = premium_cash
+        c["carry_score"] = net_premium_cash
+    elif carry_metric == "net_premium_margin":
+        c["carry_score"] = c["net_eff"]
     else:
         c["carry_score"] = c["eff"]
     c["stress_loss"] = c.apply(
@@ -1132,12 +1166,47 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
         target_abs_delta = (float(min_abs_delta) + float(max_abs_delta)) / 2.0
     c["abs_delta"] = c["delta"].abs()
     c["delta_dist"] = (c["abs_delta"] - float(target_abs_delta)).abs()
+    c["premium_stress"] = c["net_premium_cash"] / c["stress_loss"]
+    c["theta_stress"] = theta_cash / c["stress_loss"]
+    c["premium_margin"] = c["net_eff"]
+    volume_rank = _pct_rank_high(c["volume"]) if "volume" in c.columns else pd.Series(0.0, index=c.index)
+    oi_rank = _pct_rank_high(c["open_interest"]) if "open_interest" in c.columns else pd.Series(0.0, index=c.index)
+    c["liquidity_score"] = 0.5 * volume_rank + 0.5 * oi_rank
 
     if "iv_residual" in c.columns and iv_residual_weight > 0:
         iv_res = c["iv_residual"].fillna(0).clip(-1, 1)
         c["quality_score"] = c["carry_score"] * (1 + iv_residual_weight * iv_res)
     else:
         c["quality_score"] = c["carry_score"]
+    if str(ranking_mode or "").lower() in {"risk_reward", "stress_reward", "premium_stress"}:
+        gamma_abs = c["gamma"].abs().fillna(0) if "gamma" in c.columns else pd.Series(0.0, index=c.index)
+        vega_abs = c["vega"].abs().fillna(0) if "vega" in c.columns else pd.Series(0.0, index=c.index)
+        gamma_penalty_rank = _pct_rank_high(gamma_abs)
+        vega_penalty_rank = _pct_rank_high(vega_abs)
+        penalty = (
+            1.0
+            + float(gamma_penalty or 0.0) * gamma_penalty_rank
+            + float(vega_penalty or 0.0) * vega_penalty_rank
+        )
+        c["quality_score"] = (
+            float(premium_stress_weight or 0.0) * _pct_rank_high(c["premium_stress"])
+            + float(theta_stress_weight or 0.0) * _pct_rank_high(c["theta_stress"])
+            + float(premium_margin_weight or 0.0) * _pct_rank_high(c["premium_margin"])
+            + float(liquidity_weight or 0.0) * c["liquidity_score"]
+            + float(delta_weight or 0.0) * _pct_rank_low(c["delta_dist"])
+        ) / penalty
+        if "iv_residual" in c.columns and iv_residual_weight > 0:
+            iv_res = c["iv_residual"].fillna(0).clip(-1, 1)
+            c["quality_score"] = c["quality_score"] * (1 + iv_residual_weight * iv_res)
+        ranked = _stable_rank(
+            c,
+            ["quality_score", "premium_stress", "theta_stress", "premium_margin", "volume", "open_interest"],
+            [False, False, False, False, False, False],
+        )
+        if return_candidates:
+            return ranked.head(max(1, int(max_candidates or 1))) if ranked is not None else ranked
+        return None if ranked is None or ranked.empty else ranked.iloc[0]
+
     if use_stress_score:
         gamma_abs = c["gamma"].abs().fillna(0) if "gamma" in c.columns else 0.0
         vega_abs = c["vega"].abs().fillna(0) if "vega" in c.columns else 0.0
