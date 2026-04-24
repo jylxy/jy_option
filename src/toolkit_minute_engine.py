@@ -1144,6 +1144,7 @@ class ToolkitMinuteEngine:
                 'side_delta_cap': item.get('side_delta_cap', np.nan),
                 'ladder_candidate_count': item.get('ladder_candidate_count', np.nan),
                 'ladder_delta_gap': item.get('ladder_delta_gap', np.nan),
+                'effective_s1_stress_max_qty': item.get('effective_s1_stress_max_qty', np.nan),
             })
             executed += 1
 
@@ -1901,6 +1902,20 @@ class ToolkitMinuteEngine:
         gap = float(self.config.get(gap_key, base_gap) or base_gap)
         return max(1, count), max(0.0, gap)
 
+    def _s1_stress_max_qty(self, product=None):
+        base_qty = int(self.config.get('s1_stress_max_qty', 50) or 50)
+        if not self.config.get('s1_regime_stress_max_qty_enabled', False):
+            return base_qty
+        regime = self._current_vol_regimes.get(product, 'normal_vol') if product else 'normal_vol'
+        prefix = {
+            'falling_vol_carry': 'falling',
+            'low_stable_vol': 'low',
+            'high_rising_vol': 'high',
+            'post_stop_cooldown': 'high',
+        }.get(regime, 'normal')
+        key = f'vol_regime_{prefix}_s1_stress_max_qty'
+        return max(1, int(self.config.get(key, base_qty) or base_qty))
+
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
                                    min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
@@ -2112,7 +2127,7 @@ class ToolkitMinuteEngine:
         remaining_stress_budget = nav * stress_budget_pct * float(iv_scale or 1.0) * side_budget_mult
         remaining_margin_budget = nav * float(margin_per or 0.0) / 2.0 * float(iv_scale or 1.0) * side_budget_mult
         min_qty = int(self.config.get('s1_stress_min_qty', 1) or 1)
-        max_qty = int(self.config.get('s1_stress_max_qty', 50) or 50)
+        max_qty = self._s1_stress_max_qty(product)
         group_id = f"S1_{product}_{ot}_{exp}_{date_str}"
 
         def max_allowed_qty(row, single_margin, target_qty, one_loss):
@@ -2220,6 +2235,7 @@ class ToolkitMinuteEngine:
                 'side_delta_cap': side_meta.get('delta_cap', np.nan),
                 'ladder_candidate_count': max_candidates,
                 'ladder_delta_gap': max_delta_gap,
+                'effective_s1_stress_max_qty': max_qty,
             }
             pending_item.update(self._pending_budget_fields(effective_strategy_cap))
             self._pending_opens.append(pending_item)
