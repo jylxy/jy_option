@@ -13,11 +13,10 @@
 """
 import os
 import sys
-import json
 import time
 import logging
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -44,12 +43,7 @@ from strategy_rules import (
 )
 from margin_model import estimate_margin, resolve_margin_ratio
 from contract_provider import ContractInfo
-from spot_provider import (
-    build_underlying_alias_map,
-    spot_tables_for_codes,
-    map_alias_spot_frame,
-    build_pcp_spot_frame,
-)
+from spot_provider import spot_tables_for_codes
 from budget_model import (
     normalize_open_budget,
     get_effective_open_budget,
@@ -64,8 +58,6 @@ from product_taxonomy import (
 from query_filters import (
     normalize_product_pool,
     build_product_like_sql,
-    build_code_filter_sql,
-    iter_code_filter_sql,
 )
 from product_lifecycle import (
     product_first_trade_cache_path,
@@ -82,6 +74,14 @@ from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TAB
 from result_output import write_backtest_outputs
 from day_loader import ToolkitDayLoader
 from config_loader import load_engine_config
+from iv_warmup import (
+    IVWarmupContext,
+    get_warmup_contract_codes,
+    load_iv_warmup_cache,
+    save_iv_warmup_cache,
+    warmup_cache_path,
+    warmup_iv_consistent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -860,27 +860,15 @@ class ToolkitMinuteEngine:
         all_dates = self.loader.get_trading_dates()
         warmup_dates = [d for d in all_dates if d < dates[0]][-warmup_days:]
         if warmup_dates:
-            cache_path = os.path.join(OUTPUT_DIR, 'iv_warmup_cache.json')
-            cached_products = set()
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, 'r') as f:
-                        cache = json.load(f)
-                    cache_end = cache.get('_meta', {}).get('end_date', '')
-                    if cache_end >= warmup_dates[-1]:
-                        for product, data in cache.items():
-                            if product == '_meta':
-                                continue
-                            if product in product_pool:
-                                hist = self._iv_history[product]
-                                hist['dates'] = data['dates']
-                                hist['ivs'] = data['ivs']
-                                spot_hist = self._spot_history[product]
-                                spot_hist['dates'] = list(data.get('spot_dates', []))
-                                spot_hist['spots'] = list(data.get('spots', []))
-                                cached_products.add(product)
-                except (json.JSONDecodeError, OSError) as exc:
-                    logger.warning("IV缓存加载失败: %s", exc)
+            cache_path = warmup_cache_path(OUTPUT_DIR)
+            cached_products = load_iv_warmup_cache(
+                cache_path,
+                product_pool,
+                self._iv_history,
+                self._spot_history,
+                required_end_date=warmup_dates[-1],
+                logger=logger,
+            )
 
             missing = set(product_pool - cached_products)
             if self.config.get('portfolio_dynamic_corr_control_enabled', True):
@@ -896,23 +884,14 @@ class ToolkitMinuteEngine:
                 logger.info("IV预热: 缓存命中 %d个品种, 补跑 %d个: %s",
                             len(cached_products), len(missing), sorted(missing))
                 self._warmup_iv_consistent(warmup_dates, missing)
-                # 更新缓存（合并已有+新增）
-                try:
-                    new_cache = {'_meta': {'end_date': warmup_dates[-1]}}
-                    for product, hist in self._iv_history.items():
-                        if hist['ivs']:
-                            spot_hist = self._spot_history.get(product, {'dates': [], 'spots': []})
-                            new_cache[product] = {
-                                'dates': hist['dates'],
-                                'ivs': hist['ivs'],
-                                'spot_dates': spot_hist.get('dates', []),
-                                'spots': spot_hist.get('spots', []),
-                            }
-                    with open(cache_path, 'w') as f:
-                        json.dump(new_cache, f)
-                    logger.info("  IV缓存已更新: %d个品种", len(new_cache) - 1)
-                except OSError:
-                    pass
+                save_iv_warmup_cache(
+                    cache_path,
+                    warmup_dates[-1],
+                    self._iv_history,
+                    self._spot_history,
+                    n_days=len(warmup_dates),
+                    logger=logger,
+                )
             else:
                 logger.info("IV预热: 从缓存加载, %d个品种全部命中", len(cached_products))
 
@@ -1284,249 +1263,38 @@ class ToolkitMinuteEngine:
         return like_sql
 
     def _get_warmup_contract_codes(self, product_pool, warmup_dates):
-        normalized_pool = normalize_product_pool(product_pool)
-        if not normalized_pool or not warmup_dates:
-            return []
-
-        max_dte = int(self.config.get('dte_max', 90) or 90)
-        warmup_start = pd.Timestamp(warmup_dates[0]).date()
-        max_expiry = pd.Timestamp(warmup_dates[-1]).date() + timedelta(days=max(max_dte, 90))
-        cache_key = (normalized_pool, warmup_start.isoformat(), max_expiry.isoformat())
-        cached_codes = self._warmup_contract_sql_cache.get(cache_key)
-        if cached_codes is not None:
-            return cached_codes
-
-        eligible_codes = []
-        for product in normalized_pool:
-            for code in self.ci.get_product_codes(product):
-                info = self.ci.lookup(code) or {}
-                expiry_text = info.get('expiry_date')
-                if not expiry_text:
-                    continue
-                try:
-                    expiry_date = datetime.strptime(expiry_text, '%Y-%m-%d').date()
-                except (TypeError, ValueError):
-                    continue
-                if warmup_start < expiry_date <= max_expiry:
-                    eligible_codes.append(code)
-        eligible_codes = sorted(set(eligible_codes))
-        self._warmup_contract_sql_cache[cache_key] = eligible_codes
-        return eligible_codes
+        return get_warmup_contract_codes(
+            product_pool,
+            warmup_dates,
+            self.ci,
+            max_dte=int(self.config.get('dte_max', 90) or 90),
+            cache=self._warmup_contract_sql_cache,
+        )
 
     def _warmup_iv_consistent(self, warmup_dates, product_pool):
-        """批量预热 ATM IV 历史：优先使用真实标的收盘价，缺失时才回退 PCP。"""
-        logger.info("IV预热: %d天 (%s ~ %s) - 真实标的优先",
-                    len(warmup_dates), warmup_dates[0], warmup_dates[-1])
-        t0 = time.time()
-        requested_products = set(product_pool)
-
+        """Warm up ATM IV history through the extracted IV warmup pipeline."""
         like_sql = self._build_product_like_sql(product_pool)
-        if not like_sql:
-            logger.warning("  品种池无匹配合约，跳过预热")
-            return
-
         contract_codes = self._get_warmup_contract_codes(product_pool, warmup_dates)
-        warmup_chunk_size = int(self.config.get('warmup_prefilter_chunk_size', 2000) or 2000)
-        max_prefilter_chunks = int(self.config.get('warmup_prefilter_max_chunks', 4) or 4)
-        prefilter_sqls = list(
-            iter_code_filter_sql(contract_codes, chunk_size=warmup_chunk_size)
-        ) if contract_codes else []
-        filter_sqls = prefilter_sqls if prefilter_sqls and len(prefilter_sqls) <= max_prefilter_chunks else [like_sql]
-        logger.info("  LIKE条件: %s", like_sql)
-
-        logger.info(
-            "  Warmup contract prefilter: %d contracts, %d candidate chunks, mode=%s",
-            len(contract_codes), len(prefilter_sqls),
-            'chunked' if filter_sqls is prefilter_sqls else 'like',
+        context = IVWarmupContext(
+            config=self.config,
+            contract_info=self.ci,
+            iv_history=self._iv_history,
+            spot_history=self._spot_history,
+            select_sql=select_bars_sql,
+            calc_iv_batch=calc_iv_batch,
+            update_product_first_trade_dates_from_frame=self._update_product_first_trade_dates_from_frame,
+            spot_tables_for_codes=self._spot_tables_for_codes,
+            option_minute_table=OPTION_MINUTE_TABLE,
+            risk_free_rate=RISK_FREE_RATE,
+            logger=logger,
         )
-        logger.info("  Executing warmup batch query...")
-        t_query = time.time()
-        df_parts = []
-        for filter_sql in filter_sqls:
-            query = f"""
-                SELECT
-                    toString(date) as trade_date,
-                    ths_code,
-                    argMax(toFloat64OrZero(close), time) as last_close,
-                    sum(toInt64OrZero(volume)) as total_volume
-                FROM {OPTION_MINUTE_TABLE}
-                WHERE date >= '{warmup_dates[0]}' AND date <= '{warmup_dates[-1]}'
-                  AND ({filter_sql})
-                  AND toFloat64OrZero(close) > 0
-                GROUP BY date, ths_code
-            """
-            part = select_bars_sql(query)
-            if part is not None and not part.empty:
-                df_parts.append(part)
-        if not df_parts:
-            logger.warning("  Warmup batch query returned no rows, skip IV warmup")
-            return
-        df = pd.concat(df_parts, ignore_index=True)
-        logger.info("  Warmup query done: %d rows, %.1fs", len(df), time.time() - t_query)
-
-        df['last_close'] = pd.to_numeric(df['last_close'], errors='coerce').fillna(0)
-        df['total_volume'] = pd.to_numeric(df['total_volume'], errors='coerce').fillna(0)
-
-        t_attr = time.time()
-        ci_cache = self.ci._cache
-        codes = df['ths_code'].values
-        df['strike'] = np.array([ci_cache.get(c, {}).get('strike', 0) for c in codes], dtype=float)
-        df['option_type'] = np.array([ci_cache.get(c, {}).get('option_type', '') for c in codes])
-        df['expiry_date'] = np.array([ci_cache.get(c, {}).get('expiry_date', '') for c in codes])
-        df['product'] = np.array([ci_cache.get(c, {}).get('product_root', '') for c in codes])
-        df['underlying_code'] = np.array([ci_cache.get(c, {}).get('underlying_code') for c in codes], dtype=object)
-        df = df[(df['strike'] > 0) & (df['option_type'] != '') & (df['product'] != '')].copy()
-        logger.info("  合约属性关联: %d行, %.1f秒", len(df), time.time() - t_attr)
-        observed_products = set(df['product'].dropna().unique())
-        self._update_product_first_trade_dates_from_frame(df, product_col='product', date_col='trade_date')
-        missing_option_products = sorted(requested_products - observed_products)
-        if missing_option_products:
-            logger.info("  预热区间无期权分钟数据，按品种跳过: %s", missing_option_products)
-
-        t_spot = time.time()
-        underlying_codes = sorted({code for code in df['underlying_code'].dropna().tolist() if code})
-        real_spot_df = pd.DataFrame(columns=['trade_date', 'underlying_code', 'spot'])
-        if underlying_codes:
-            alias_map = build_underlying_alias_map(underlying_codes)
-            lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
-            spot_filter_sql = build_code_filter_sql(lookup_codes)
-            spot_frames = []
-            for table_name in self._spot_tables_for_codes(lookup_codes):
-                spot_query = f"""
-                    SELECT
-                        toString(date) as trade_date,
-                        ths_code as underlying_code,
-                        argMax(toFloat64OrZero(close), time) as spot
-                    FROM {table_name}
-                    WHERE date >= '{warmup_dates[0]}' AND date <= '{warmup_dates[-1]}'
-                      AND ({spot_filter_sql})
-                      AND toFloat64OrZero(close) > 0
-                    GROUP BY date, ths_code
-                """
-                spot_part = select_bars_sql(spot_query)
-                if spot_part is not None and not spot_part.empty:
-                    spot_frames.append(spot_part)
-            if spot_frames:
-                real_spot_df = map_alias_spot_frame(
-                    pd.concat(spot_frames, ignore_index=True),
-                    alias_map,
-                    lookup_col='underlying_code',
-                    value_col='spot',
-                    sort_cols=['trade_date'],
-                )
-                df = df.merge(real_spot_df, on=['trade_date', 'underlying_code'], how='left')
-            else:
-                df['spot'] = np.nan
-        else:
-            df['spot'] = np.nan
-
-        if observed_products:
-            real_spot_products = set(df.loc[df['spot'].notna() & (df['spot'] > 0), 'product'].dropna().unique())
-            missing_real_spot_products = sorted(observed_products - real_spot_products)
-            if missing_real_spot_products:
-                logger.info("  无法直接匹配真实标的收盘价，转PCP回退: %s", missing_real_spot_products)
-
-        unresolved = df['spot'].isna() | (df['spot'] <= 0)
-        if unresolved.any():
-            fallback_src = df.loc[unresolved, ['trade_date', 'product', 'expiry_date', 'strike',
-                                               'option_type', 'last_close', 'total_volume']].copy()
-            spot_agg = build_pcp_spot_frame(fallback_src, risk_free_rate=RISK_FREE_RATE)
-            if not spot_agg.empty:
-                df = df.merge(
-                    spot_agg,
-                    on=['trade_date', 'product', 'expiry_date'],
-                    how='left'
-                )
-                fill_mask = (df['spot'].isna() | (df['spot'] <= 0)) & df['spot_pcp'].notna() & (df['spot_pcp'] > 0)
-                df.loc[fill_mask, 'spot'] = df.loc[fill_mask, 'spot_pcp']
-                df = df.drop(columns=['spot_pcp'], errors='ignore')
-
-        valid_spot_products = set(df.loc[df['spot'].notna() & (df['spot'] > 0), 'product'].dropna().unique())
-        skipped_products = sorted(requested_products - valid_spot_products)
-        if skipped_products:
-            logger.info("  无有效 spot，按品种跳过IV预热: %s", skipped_products)
-        if not valid_spot_products:
-            logger.warning("  真实spot与PCP回退后仍无有效spot，跳过IV预热")
-            return
-        logger.info("  warmup spot完成: 真实=%d, 有效行=%d, %.1f秒",
-                    len(real_spot_df),
-                    int((df['spot'].notna() & (df['spot'] > 0)).sum()),
-                    time.time() - t_spot)
-
-        t_iv = time.time()
-        df = df[df['spot'].notna() & (df['spot'] > 0)].copy()
-        spot_hist_df = df[['trade_date', 'product', 'expiry_date', 'spot']].copy()
-        spot_hist_df['trade_dt'] = pd.to_datetime(spot_hist_df['trade_date'], errors='coerce')
-        spot_hist_df['expiry_dt'] = pd.to_datetime(spot_hist_df['expiry_date'], errors='coerce')
-        spot_hist_df['dte'] = (spot_hist_df['expiry_dt'] - spot_hist_df['trade_dt']).dt.days.clip(lower=1)
-        target_dte = float(self.config.get('dte_target', 35))
-        spot_hist_df['dte_dist'] = (spot_hist_df['dte'] - target_dte).abs()
-        spot_hist_df = spot_hist_df.sort_values(
-            ['trade_date', 'product', 'dte_dist', 'dte', 'expiry_date'],
-            ascending=[True, True, True, True, True],
-            kind='mergesort',
+        warmup_iv_consistent(
+            warmup_dates,
+            product_pool,
+            like_sql=like_sql,
+            contract_codes=contract_codes,
+            context=context,
         )
-        spot_hist_df = spot_hist_df.drop_duplicates(['trade_date', 'product'], keep='first')
-        for row in spot_hist_df.itertuples(index=False):
-            product = row.product
-            if product in product_pool:
-                spot_hist = self._spot_history[product]
-                spot_hist['dates'].append(row.trade_date)
-                spot_hist['spots'].append(float(row.spot))
-        df['moneyness'] = df['strike'] / df['spot']
-
-        atm = df[df['moneyness'].between(0.95, 1.05)].copy()
-        if atm.empty:
-            logger.warning("  无ATM合约，跳过IV计算")
-            return
-
-        atm['trade_dt'] = pd.to_datetime(atm['trade_date'])
-        atm['expiry_dt'] = pd.to_datetime(atm['expiry_date'], errors='coerce')
-        atm['dte'] = (atm['expiry_dt'] - atm['trade_dt']).dt.days
-        atm = atm[(atm['dte'] > 0) & (atm['dte'] <= 90)].copy()
-        if atm.empty:
-            logger.warning("  无有效DTE的ATM合约")
-            return
-
-        atm = atm.rename(columns={'last_close': 'option_close', 'spot': 'spot_close'})
-        iv_series = calc_iv_batch(
-            atm, price_col='option_close', spot_col='spot_close',
-            strike_col='strike', dte_col='dte', otype_col='option_type'
-        )
-        atm['iv'] = iv_series.values
-        atm = atm[atm['iv'].notna() & (atm['iv'] > 0.01) & (atm['iv'] < 3.0)].copy()
-        logger.info("  IV计算: %d个ATM合约有效IV, %.1f秒", len(atm), time.time() - t_iv)
-
-        daily_iv = atm.groupby(['trade_date', 'product'])['iv'].mean().reset_index()
-        for row in daily_iv.itertuples(index=False):
-            product = row.product
-            if product in product_pool:
-                hist = self._iv_history[product]
-                hist['dates'].append(row.trade_date)
-                hist['ivs'].append(float(row.iv))
-
-        elapsed = time.time() - t0
-        n_products = sum(1 for h in self._iv_history.values() if h['ivs'])
-        logger.info("IV预热完成: %.0f秒, %d个品种有历史", elapsed, n_products)
-
-        cache_path = os.path.join(OUTPUT_DIR, 'iv_warmup_cache.json')
-        try:
-            cache = {'_meta': {'end_date': warmup_dates[-1], 'n_days': len(warmup_dates)}}
-            for product, hist in self._iv_history.items():
-                if hist['ivs']:
-                    spot_hist = self._spot_history.get(product, {'dates': [], 'spots': []})
-                    cache[product] = {
-                        'dates': hist['dates'],
-                        'ivs': hist['ivs'],
-                        'spot_dates': spot_hist.get('dates', []),
-                        'spots': spot_hist.get('spots', []),
-                    }
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cache, f)
-            logger.info("  IV缓存已保存: %s", cache_path)
-        except OSError as exc:
-            logger.warning("  IV缓存保存失败: %s", exc)
 
     # _estimate_spot_from_daily 已被向量化的 put-call parity merge 替代
 
