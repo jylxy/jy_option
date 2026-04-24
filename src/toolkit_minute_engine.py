@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore', message='.*Above Max Price.*')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from toolkit.selector import select_bars_sql, select
-from option_calc import calc_iv_single, calc_greeks_single, calc_iv_batch, calc_greeks_batch_vectorized, RISK_FREE_RATE
+from option_calc import calc_iv_single, calc_greeks_single, calc_iv_batch, RISK_FREE_RATE
 from strategy_rules import (
     select_s1_sell, select_s1_protect,
     select_s3_buy_by_otm, select_s3_sell_by_otm,
@@ -49,7 +49,6 @@ from spot_provider import (
     spot_tables_for_codes,
     map_alias_spot_frame,
     resolve_alias_value_map,
-    estimate_spot_pcp,
     build_pcp_spot_frame,
 )
 from budget_model import (
@@ -77,6 +76,12 @@ from product_lifecycle import (
     update_first_trade_dates,
     update_first_trade_dates_from_frame,
     product_observation_ready,
+)
+from daily_aggregation import (
+    attach_contract_columns,
+    normalize_preloaded_daily_agg,
+    aggregate_minute_daily,
+    enrich_daily_with_spot_iv_delta,
 )
 
 logger = logging.getLogger(__name__)
@@ -368,14 +373,7 @@ class ToolkitDayLoader:
         df['total_volume'] = pd.to_numeric(df['total_volume'], errors='coerce').fillna(0)
         df['last_oi'] = pd.to_numeric(df['last_oi'], errors='coerce').fillna(0)
 
-        # 关联合约属性
-        ci = contract_info
-        df['strike'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('strike', 0))
-        df['option_type'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('option_type', ''))
-        df['expiry_date'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('expiry_date', ''))
-        df['product'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('product_root', ''))
-        df['exchange'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('exchange', ''))
-        df['multiplier'] = df['ths_code'].map(lambda c: (ci.lookup(c) or {}).get('multiplier', 10))
+        df = attach_contract_columns(df, contract_info)
 
         # 过滤无效
         df = df[(df['strike'] > 0) & (df['option_type'] != '') & (df['last_close'] > 0)].copy()
@@ -400,190 +398,30 @@ class ToolkitDayLoader:
         if raw.empty:
             return pd.DataFrame()
 
-        current_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-
-        # 计算DTE
-        def _calc_dte(expiry_str):
-            try:
-                exp = datetime.strptime(str(expiry_str)[:10], '%Y-%m-%d').date()
-                return (exp - current_date).days
-            except (ValueError, TypeError):
-                return -1
-
-        df = raw.copy()
-        df['dte'] = df['expiry_date'].map(_calc_dte)
-        df = df[df['dte'] > 0].copy()
+        df = normalize_preloaded_daily_agg(raw, date_str, contract_info)
         if df.empty:
             return df
-        df['underlying_code'] = df['ths_code'].map(
-            lambda c: (contract_info.lookup(c) or {}).get('underlying_code')
-        )
 
-        # 重命名列以兼容 strategy_rules
-        df = df.rename(columns={
-            'ths_code': 'option_code',
-            'last_close': 'option_close',
-            'total_volume': 'volume',
-            'last_oi': 'open_interest',
-        })
-
-        # 推算标的价格（put-call parity）
         spot_map = self._get_spot_daily_close_map(
             date_str,
             [code for code in df['underlying_code'].dropna().tolist() if code]
         )
-        df['spot_close'] = np.nan
-        if spot_map:
-            df['spot_close'] = df['underlying_code'].map(spot_map)
-        for (product, expiry), group in df.groupby(['product', 'expiry_date']):
-            need_fill = group['spot_close'].isna() | (group['spot_close'] <= 0)
-            if need_fill.any():
-                spot = self._estimate_spot_pcp_from_agg(group)
-                if spot and spot > 0:
-                    df.loc[group.index[need_fill], 'spot_close'] = spot
-
-        df = df[df['spot_close'].notna() & (df['spot_close'] > 0)].copy()
-        if df.empty:
-            return df
-
-        df['moneyness'] = df['strike'] / df['spot_close']
-
-        # IV 和 delta（只对OTM合约，批量计算）
-        is_otm = (
-            ((df['option_type'] == 'P') & (df['moneyness'] < 1.0)) |
-            ((df['option_type'] == 'C') & (df['moneyness'] > 1.0))
-        )
-        in_range = df['moneyness'].between(0.70, 1.30)
-        candidate = is_otm & in_range
-
-        df['implied_vol'] = np.nan
-        df['delta'] = np.nan
-
-        if candidate.any():
-            iv = calc_iv_batch(df[candidate], price_col='option_close', spot_col='spot_close',
-                               strike_col='strike', dte_col='dte', otype_col='option_type')
-            df.loc[candidate, 'implied_vol'] = iv.values
-
-            has_iv = candidate & df['implied_vol'].notna() & (df['implied_vol'] > 0)
-            if has_iv.any():
-                greeks = calc_greeks_batch_vectorized(
-                    df[has_iv], spot_col='spot_close', strike_col='strike',
-                    dte_col='dte', iv_col='implied_vol', otype_col='option_type'
-                )
-                df.loc[has_iv, 'delta'] = greeks['delta'].values
-
-        return df
-
-    def _estimate_spot_pcp_from_agg(self, group):
-        """从日频聚合数据推算标的价格"""
-        return self._estimate_spot_pcp(group)
+        return enrich_daily_with_spot_iv_delta(df, spot_map=spot_map, risk_free_rate=RISK_FREE_RATE)
 
     def aggregate_daily(self, minute_df, date_str):
         """
         从分钟数据聚合成日频DataFrame，格式兼容 strategy_rules 选腿函数。
         用 put-call parity 推算标的价格。
         """
-        if minute_df.empty:
-            return pd.DataFrame()
+        df = aggregate_minute_daily(minute_df, date_str, self._ci)
+        if df.empty:
+            return df
 
-        current_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        records = []
-
-        for code, grp in minute_df.groupby('ths_code'):
-            info = self._ci.lookup(code)
-            if info is None:
-                continue
-
-            dte = self._ci.calc_dte(code, current_date)
-            if dte <= 0:
-                continue
-
-            grp_sorted = grp.sort_values('time')
-            valid = grp_sorted[grp_sorted['volume'] > 0]
-
-            if not valid.empty:
-                opt_close = float(valid.iloc[-1]['close'])
-                volume = int(valid['volume'].sum())
-                oi = int(valid.iloc[-1]['open_interest'])
-            else:
-                opt_close = float(grp_sorted.iloc[-1]['close'])
-                volume = 0
-                oi = int(grp_sorted.iloc[-1]['open_interest'])
-
-            if opt_close <= 0:
-                continue
-
-            records.append({
-                'option_code': code,
-                'strike': info['strike'],
-                'option_type': info['option_type'],
-                'option_close': opt_close,
-                'dte': dte,
-                'volume': volume,
-                'open_interest': oi,
-                'product': info['product_root'],
-                'exchange': info['exchange'],
-                'expiry_date': info['expiry_date'],
-                'multiplier': info['multiplier'],
-                'underlying_code': info.get('underlying_code'),
-            })
-
-        if not records:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(records)
-
-        # 推算标的价格（put-call parity）
         spot_map = self._get_spot_daily_close_map(
             date_str,
             [code for code in df['underlying_code'].dropna().tolist() if code]
         )
-        df['spot_close'] = np.nan
-        if spot_map:
-            df['spot_close'] = df['underlying_code'].map(spot_map)
-        for (product, expiry), group in df.groupby(['product', 'expiry_date']):
-            need_fill = group['spot_close'].isna() | (group['spot_close'] <= 0)
-            if need_fill.any():
-                spot = self._estimate_spot_pcp(group)
-                if spot and spot > 0:
-                    df.loc[group.index[need_fill], 'spot_close'] = spot
-
-        df = df[df['spot_close'].notna() & (df['spot_close'] > 0)].copy()
-        if df.empty:
-            return df
-
-        df['moneyness'] = df['strike'] / df['spot_close']
-
-        # IV 和 delta（只对OTM合约）
-        is_otm = (
-            ((df['option_type'] == 'P') & (df['moneyness'] < 1.0)) |
-            ((df['option_type'] == 'C') & (df['moneyness'] > 1.0))
-        )
-        in_range = df['moneyness'].between(0.70, 1.30)
-        candidate = is_otm & in_range
-
-        df['implied_vol'] = np.nan
-        df['delta'] = np.nan
-
-        if candidate.any():
-            cdf = df[candidate]
-            iv = calc_iv_batch(cdf, price_col='option_close', spot_col='spot_close',
-                               strike_col='strike', dte_col='dte', otype_col='option_type')
-            df.loc[candidate, 'implied_vol'] = iv.values
-
-            has_iv = candidate & df['implied_vol'].notna() & (df['implied_vol'] > 0)
-            if has_iv.any():
-                greeks = calc_greeks_batch_vectorized(
-                    df[has_iv], spot_col='spot_close', strike_col='strike',
-                    dte_col='dte', iv_col='implied_vol', otype_col='option_type'
-                )
-                df.loc[has_iv, 'delta'] = greeks['delta'].values
-
-        return df
-
-    def _estimate_spot_pcp(self, group):
-        """Estimate spot with put-call parity fallback."""
-        return estimate_spot_pcp(group, risk_free_rate=RISK_FREE_RATE)
+        return enrich_daily_with_spot_iv_delta(df, spot_map=spot_map, risk_free_rate=RISK_FREE_RATE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
