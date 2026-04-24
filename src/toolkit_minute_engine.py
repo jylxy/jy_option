@@ -1087,6 +1087,13 @@ class ToolkitMinuteEngine:
                 'effective_bucket_stress_loss_cap': item.get('effective_bucket_stress_loss_cap', np.nan),
                 'open_budget_risk_scale': item.get('open_budget_risk_scale', np.nan),
                 'open_budget_brake_reason': item.get('open_budget_brake_reason', ''),
+                'trend_state': item.get('trend_state', ''),
+                'trend_score': item.get('trend_score', np.nan),
+                'trend_confidence': item.get('trend_confidence', np.nan),
+                'trend_role': item.get('trend_role', ''),
+                'side_score_mult': item.get('side_score_mult', np.nan),
+                'side_budget_mult': item.get('side_budget_mult', np.nan),
+                'side_delta_cap': item.get('side_delta_cap', np.nan),
             })
             executed += 1
 
