@@ -69,6 +69,15 @@ from query_filters import (
     build_code_filter_sql,
     iter_code_filter_sql,
 )
+from product_lifecycle import (
+    product_first_trade_cache_path,
+    coerce_trade_date_str,
+    load_first_trade_cache,
+    save_first_trade_cache,
+    update_first_trade_dates,
+    update_first_trade_dates_from_frame,
+    product_observation_ready,
+)
 
 logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1644,115 +1653,49 @@ class ToolkitMinuteEngine:
 
     @staticmethod
     def _product_first_trade_cache_path():
-        return os.path.join(CACHE_DIR, 'product_first_trade_cache.json')
+        return product_first_trade_cache_path(CACHE_DIR)
 
     @staticmethod
     def _coerce_trade_date_str(value):
-        if value is None:
-            return ''
-        text = str(value).strip()
-        if not text:
-            return ''
-        if text.isdigit() and len(text) <= 6:
-            try:
-                ts = pd.Timestamp('1970-01-01') + pd.Timedelta(days=int(text))
-                return ts.strftime('%Y-%m-%d')
-            except (ValueError, OverflowError, TypeError):
-                return ''
-        try:
-            return pd.Timestamp(text).strftime('%Y-%m-%d')
-        except (ValueError, TypeError):
-            return ''
+        return coerce_trade_date_str(value)
 
     def _load_product_first_trade_cache(self):
         cache_path = self._product_first_trade_cache_path()
-        if not os.path.exists(cache_path):
-            return
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
-            if not isinstance(cache, dict):
-                return
-            for product, first_trade_date in cache.items():
-                key = str(product).upper().strip()
-                value = self._coerce_trade_date_str(first_trade_date)
-                if key and value:
-                    self._product_first_trade_dates[key] = value
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            logger.warning("product first-trade cache load failed: %s", exc)
+        self._product_first_trade_dates.update(
+            load_first_trade_cache(cache_path, logger=logger)
+        )
 
     def _save_product_first_trade_cache(self):
         cache_path = self._product_first_trade_cache_path()
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            cache = {
-                product: first_trade_date
-                for product, first_trade_date in sorted(self._product_first_trade_dates.items())
-                if first_trade_date
-            }
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cache, f)
-        except OSError as exc:
-            logger.warning("product first-trade cache save failed: %s", exc)
+        save_first_trade_cache(cache_path, self._product_first_trade_dates, logger=logger)
 
     def _ensure_product_first_trade_dates(self, product_pool):
         if not self._product_first_trade_dates:
             self._load_product_first_trade_cache()
 
     def _update_product_first_trade_dates(self, products, trade_date):
-        trade_date = self._coerce_trade_date_str(trade_date)
-        if not trade_date:
-            return
-        changed = False
-        for product in products:
-            key = self._normalize_product_key(product)
-            if not key:
-                continue
-            current = self._product_first_trade_dates.get(key)
-            if not current or trade_date < current:
-                self._product_first_trade_dates[key] = trade_date
-                changed = True
-        if changed:
+        if update_first_trade_dates(self._product_first_trade_dates, products, trade_date):
             self._save_product_first_trade_cache()
 
     def _update_product_first_trade_dates_from_frame(self, df, product_col='product', date_col='trade_date'):
-        if df is None or df.empty or product_col not in df.columns or date_col not in df.columns:
-            return
-        work = df[[product_col, date_col]].dropna().copy()
-        if work.empty:
-            return
-        work[product_col] = work[product_col].map(self._normalize_product_key)
-        work[date_col] = work[date_col].map(self._coerce_trade_date_str)
-        work = work[(work[product_col] != '') & (work[date_col] != '')]
-        if work.empty:
-            return
-        firsts = work.groupby(product_col, as_index=False)[date_col].min()
-        changed = False
-        for _, row in firsts.iterrows():
-            product = row[product_col]
-            trade_date = row[date_col]
-            current = self._product_first_trade_dates.get(product)
-            if not current or trade_date < current:
-                self._product_first_trade_dates[product] = trade_date
-                changed = True
-        if changed:
+        if update_first_trade_dates_from_frame(
+            self._product_first_trade_dates,
+            df,
+            product_col=product_col,
+            date_col=date_col,
+        ):
             self._save_product_first_trade_cache()
 
     def _product_observation_ready(self, product, date_str):
-        product = self._normalize_product_key(product)
-        first_trade_date = self._product_first_trade_dates.get(product)
-        if not first_trade_date:
-            return True
         observation_months = int(self.config.get('product_observation_months', 0) or 0)
         min_listing_days = int(self.config.get('product_min_listing_days', 0) or 0)
-        first_ts = pd.Timestamp(first_trade_date)
-        if observation_months > 0:
-            eligible_ts = first_ts + pd.DateOffset(months=observation_months)
-        elif min_listing_days > 0:
-            eligible_ts = first_ts + pd.Timedelta(days=min_listing_days)
-        else:
-            eligible_ts = first_ts
-        return pd.Timestamp(date_str) >= eligible_ts
+        return product_observation_ready(
+            self._product_first_trade_dates,
+            product,
+            date_str,
+            observation_months=observation_months,
+            min_listing_days=min_listing_days,
+        )
 
     def _passes_product_entry_filters(self, product, date_str):
         return self._product_observation_ready(product, date_str)
