@@ -87,6 +87,12 @@ from position_model import Position
 from runtime_paths import BASE_DIR, OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
+from trading_calendar import (
+    load_trading_dates_cache,
+    save_trading_dates_cache,
+    query_trading_dates,
+    filter_trading_dates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,39 +117,14 @@ class ToolkitDayLoader:
     def get_trading_dates(self, start_date=None, end_date=None):
         """获取交易日列表"""
         if self._trading_dates is None:
-            cache_path = os.path.join(CACHE_DIR, 'trading_dates_cache.json')
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        self._trading_dates = json.load(f)
-                    logger.info("交易日缓存加载完成: 共 %d 个交易日", len(self._trading_dates))
-                except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                    logger.warning("交易日缓存加载失败，回退数据库查询: %s", exc)
-                    self._trading_dates = None
-
+            self._trading_dates = load_trading_dates_cache(CACHE_DIR, logger=logger)
             if self._trading_dates is None:
                 logger.info("获取交易日列表...")
-                df = select_bars_sql(
-                    "SELECT DISTINCT toString(date) as date_str FROM option_hf_1min_non_ror ORDER BY date_str"
-                )
-                if df is not None and not df.empty:
-                    self._trading_dates = [str(d)[:10] for d in df['date_str'].tolist()]
-                else:
-                    self._trading_dates = []
+                self._trading_dates = query_trading_dates(select_bars_sql)
                 logger.info("  共 %d 个交易日", len(self._trading_dates))
-                try:
-                    os.makedirs(CACHE_DIR, exist_ok=True)
-                    with open(cache_path, 'w', encoding='utf-8') as f:
-                        json.dump(self._trading_dates, f)
-                except OSError as exc:
-                    logger.warning("交易日缓存保存失败: %s", exc)
+                save_trading_dates_cache(CACHE_DIR, self._trading_dates, logger=logger)
 
-        result = self._trading_dates
-        if start_date:
-            result = [d for d in result if d >= start_date]
-        if end_date:
-            result = [d for d in result if d <= end_date]
-        return result
+        return filter_trading_dates(self._trading_dates, start_date=start_date, end_date=end_date)
 
     def preload_batch(self, dates, like_sql=None):
         """
