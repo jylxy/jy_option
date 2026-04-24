@@ -579,9 +579,9 @@ class ToolkitMinuteEngine:
                 logger.info("IV预热: 从缓存加载, %d个品种全部命中", len(cached_products))
 
         # 主循环（批量预加载分钟数据）
-        batch_size = 5  # 每次预加载5天
+        batch_size = max(1, int(self.config.get('daily_agg_batch_size', 10) or 10))
         for di, date_str in enumerate(dates):
-            if di % 5 == 0:
+            if di % batch_size == 0:
                 nav = self.capital + (self.nav_records[-1]['cum_pnl'] if self.nav_records else 0)
                 elapsed = time.time() - t0
                 logger.info("  [%d/%d] %s NAV=%.0f 持仓=%d %.0fs",
@@ -895,18 +895,22 @@ class ToolkitMinuteEngine:
         executed = 0
         deferred = []  # 超量部分留到下一天
         day_volume = {}
+        bars_by_code = {}
         if not minute_df.empty:
             vol_agg = minute_df.groupby('ths_code')['volume'].sum()
             day_volume = vol_agg.to_dict()
+            bars_by_code = {
+                code: grp.sort_values('time')
+                for code, grp in minute_df.groupby('ths_code', sort=False)
+            }
 
         for item in self._pending_opens:
             code = item['code']
-            code_bars = minute_df[minute_df['ths_code'] == code]
+            code_bars = bars_by_code.get(code)
 
             # 计算全天TWAP/VWAP（只用当日真实分钟成交）
-            if not code_bars.empty:
-                sorted_bars = code_bars.sort_values('time')
-                valid = sorted_bars[sorted_bars['volume'] > 0]
+            if code_bars is not None and not code_bars.empty:
+                valid = code_bars[code_bars['volume'] > 0]
                 if not valid.empty:
                     prices = valid['close'].values.astype(float)
                     volumes = valid['volume'].values.astype(float)
@@ -1041,20 +1045,32 @@ class ToolkitMinuteEngine:
         """用日频聚合数据更新持仓价格和标的价格"""
         current_date = datetime.strptime(date_str, '%Y-%m-%d').date()
 
-        # 构建 option_code → (option_close, spot_close) 索引
         price_idx = {}
+        if {'option_code', 'option_close'}.issubset(daily_df.columns):
+            valid_prices = daily_df.loc[
+                daily_df['option_close'].fillna(0) > 0,
+                ['option_code', 'option_close'],
+            ].dropna(subset=['option_code'])
+            valid_prices = valid_prices[valid_prices['option_code'].astype(str) != '']
+            if not valid_prices.empty:
+                valid_prices = valid_prices.drop_duplicates('option_code', keep='last')
+                price_idx = dict(zip(valid_prices['option_code'], valid_prices['option_close']))
+
         spot_by_product = {}
         spot_by_underlying = {}
-        for _, row in daily_df.iterrows():
-            code = row.get('option_code', '')
-            if code and row.get('option_close', 0) > 0:
-                price_idx[code] = row['option_close']
-            product = row.get('product', '')
-            if product and pd.notna(row.get('spot_close')) and row['spot_close'] > 0:
-                spot_by_product[product] = row['spot_close']
-            underlying_code = row.get('underlying_code', '')
-            if underlying_code and pd.notna(row.get('spot_close')) and row['spot_close'] > 0:
-                spot_by_underlying[underlying_code] = row['spot_close']
+        if 'spot_close' in daily_df.columns:
+            valid_spots = daily_df[daily_df['spot_close'].notna() & (daily_df['spot_close'] > 0)]
+            if not valid_spots.empty and 'product' in valid_spots.columns:
+                product_spots = valid_spots[
+                    valid_spots['product'].notna() & (valid_spots['product'].astype(str) != '')
+                ][['product', 'spot_close']].drop_duplicates('product', keep='last')
+                spot_by_product = dict(zip(product_spots['product'], product_spots['spot_close']))
+            if not valid_spots.empty and 'underlying_code' in valid_spots.columns:
+                underlying_spots = valid_spots[
+                    valid_spots['underlying_code'].notna()
+                    & (valid_spots['underlying_code'].astype(str) != '')
+                ][['underlying_code', 'spot_close']].drop_duplicates('underlying_code', keep='last')
+                spot_by_underlying = dict(zip(underlying_spots['underlying_code'], underlying_spots['spot_close']))
 
         for pos in self.positions:
             if pos.code in price_idx:
@@ -1128,16 +1144,40 @@ class ToolkitMinuteEngine:
         product_iv_pcts = {}
         product_iv_state = {}
         target_dte = float(cfg.get('dte_target', 35))
-        for product in daily_df['product'].unique():
-            prod_df = daily_df[daily_df['product'] == product]
-            atm = prod_df[
-                (prod_df['moneyness'].between(0.95, 1.05)) &
-                (prod_df['dte'].between(15, 90)) &
-                (prod_df['implied_vol'] > 0)
-            ]
-            if atm.empty:
-                continue
-            daily_atm_iv = float(atm['implied_vol'].mean())
+        required_cols = {'product', 'moneyness', 'dte', 'implied_vol'}
+        if not required_cols.issubset(daily_df.columns):
+            self._update_contract_iv_history(daily_df, date_str)
+            self._current_iv_pcts = product_iv_pcts
+            self._current_iv_state = product_iv_state
+            self._refresh_vol_regime_state(date_str)
+            return product_iv_pcts
+
+        atm_mask = (
+            daily_df['moneyness'].between(0.95, 1.05)
+            & daily_df['dte'].between(15, 90)
+            & (daily_df['implied_vol'] > 0)
+        )
+        daily_atm_ivs = daily_df.loc[atm_mask].groupby('product', sort=False)['implied_vol'].mean()
+
+        daily_spots = {}
+        spot_cols = {'product', 'expiry_date', 'dte', 'spot_close'}
+        if spot_cols.issubset(daily_df.columns):
+            spot_candidates = daily_df.loc[
+                daily_df['spot_close'].notna() & (daily_df['spot_close'] > 0),
+                ['product', 'expiry_date', 'dte', 'spot_close'],
+            ].copy()
+            if not spot_candidates.empty:
+                spot_candidates['dte_dist'] = (spot_candidates['dte'] - target_dte).abs()
+                spot_candidates = spot_candidates.sort_values(
+                    ['product', 'dte_dist', 'dte', 'expiry_date'],
+                    ascending=[True, True, True, True],
+                    kind='mergesort',
+                )
+                spot_candidates = spot_candidates.drop_duplicates('product', keep='first')
+                daily_spots = dict(zip(spot_candidates['product'], spot_candidates['spot_close']))
+
+        for product, daily_atm_iv in daily_atm_ivs.items():
+            daily_atm_iv = float(daily_atm_iv)
             hist = self._iv_history[product]
             hist['dates'].append(date_str)
             hist['ivs'].append(daily_atm_iv)
@@ -1149,16 +1189,7 @@ class ToolkitMinuteEngine:
             )
             product_iv_pcts[product] = iv_pct
 
-            daily_spot = np.nan
-            spot_candidates = prod_df[['expiry_date', 'dte', 'spot_close']].dropna().copy()
-            if not spot_candidates.empty:
-                spot_candidates['dte_dist'] = (spot_candidates['dte'] - target_dte).abs()
-                spot_candidates = spot_candidates.sort_values(
-                    ['dte_dist', 'dte', 'expiry_date'],
-                    ascending=[True, True, True],
-                    kind='mergesort',
-                )
-                daily_spot = float(spot_candidates['spot_close'].iloc[0])
+            daily_spot = float(daily_spots.get(product, np.nan))
 
             if pd.notna(daily_spot) and daily_spot > 0:
                 spot_hist = self._spot_history[product]
@@ -1444,30 +1475,39 @@ class ToolkitMinuteEngine:
             time_points,
             self.config.get('intraday_risk_interval', 15),
         )
+        greek_refresh_interval = max(
+            1,
+            int(self.config.get(
+                'intraday_greeks_refresh_interval',
+                self.config.get('intraday_risk_interval', 15),
+            ) or 15),
+        )
+        greek_refresh_times = set(self._sample_intraday_times(time_points, greek_refresh_interval))
+        greek_refresh_times.add(time_points[-1])
         stop_pending = {}
         if self.config.get('intraday_stop_confirmation_use_full_minutes', True):
             monitor_times = list(time_points)
         for tm in monitor_times:
             spot_grp = spot_groups.get(tm)
             if spot_grp is not None:
-                for _, row in spot_grp.iterrows():
-                    for pos in pos_by_underlying.get(row['underlying_code'], []):
-                        pos.cur_spot = float(row['spot'])
+                for row in spot_grp.itertuples(index=False):
+                    for pos in pos_by_underlying.get(row.underlying_code, []):
+                        pos.cur_spot = float(row.spot)
 
             grp = price_groups.get(tm)
             if grp is not None:
-                for _, row in grp.iterrows():
-                    code = row['ths_code']
-                    price = float(row['close'])
-                    volume = float(row.get('volume', 0.0) or 0.0)
+                for row in grp.itertuples(index=False):
+                    code = row.ths_code
+                    price = float(row.close)
+                    volume = float(getattr(row, 'volume', 0.0) or 0.0)
                     if not self._confirm_intraday_stop_price(
                         code, price, volume, tm, stop_pending, pos_by_code, qty_by_code
                     ):
                         continue
-                    for pos in pos_by_code.get(row['ths_code'], []):
+                    for pos in pos_by_code.get(code, []):
                         pos.cur_price = price
 
-            if self.config.get('intraday_refresh_spot_greeks_for_attribution', True):
+            if self.config.get('intraday_refresh_spot_greeks_for_attribution', True) and tm in greek_refresh_times:
                 self._refresh_position_greeks()
 
             self._apply_exit_rules(

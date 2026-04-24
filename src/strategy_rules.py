@@ -16,6 +16,7 @@ from margin_model import estimate_margin, resolve_margin_ratio
 
 DEFAULT_PARAMS = {
     "capital": 10_000_000,
+    "daily_agg_batch_size": 10,
     "margin_per": 0.02,
     "margin_cap": 0.50,
     "s1_margin_cap": 0.25,
@@ -71,6 +72,7 @@ DEFAULT_PARAMS = {
     "greeks_exit_enabled": False,
     "initialize_open_greeks_for_attribution": True,
     "intraday_refresh_spot_greeks_for_attribution": True,
+    "intraday_greeks_refresh_interval": 15,
     "intraday_stop_liquidity_filter_enabled": True,
     "intraday_stop_min_trade_volume": 3,
     "intraday_stop_min_group_volume_ratio": 0.10,
