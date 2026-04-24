@@ -39,7 +39,8 @@ from strategy_rules import (
     extract_atm_iv_series, calc_iv_percentile, calc_iv_rv_features, get_iv_scale,
     should_pause_open, should_close_expiry, should_open_new, can_reopen,
     should_allow_open_low_iv_product, calc_stats,
-    choose_s1_option_sides,
+    choose_s1_option_sides, choose_s1_trend_confidence_sides,
+    classify_s1_trend_confidence, s1_trend_side_adjustment,
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
@@ -818,6 +819,21 @@ class ToolkitMinuteEngine:
             return np.nan
         lb = max(1, int(lookback or 1))
         return float(returns.tail(lb).sum())
+
+    def _s1_trend_confidence_info(self, product, date_str, iv_state=None):
+        returns = self._get_product_return_series(product, current_date=date_str)
+        iv_state = iv_state or {}
+        return classify_s1_trend_confidence(
+            returns,
+            rv_trend=iv_state.get('rv_trend', np.nan),
+            short_lookback=self.config.get('s1_trend_short_lookback', 5),
+            medium_lookback=self.config.get('s1_trend_medium_lookback', 10),
+            long_lookback=self.config.get('s1_trend_long_lookback', 20),
+            min_history=self.config.get('s1_trend_min_history', 10),
+            trend_threshold=self.config.get('s1_trend_threshold', 0.018),
+            range_threshold=self.config.get('s1_trend_range_threshold', 0.010),
+            rv_rising_threshold=self.config.get('s1_trend_rv_rising_threshold', 0.015),
+        )
 
     def _get_open_concentration_state(self, include_pending=True):
         return port_risk.get_open_concentration_state(
@@ -1708,10 +1724,11 @@ class ToolkitMinuteEngine:
                     if cfg.get('s1_side_selection_enabled', False):
                         s1_side_items = self._select_s1_side_items(
                             ef, product, mult, mr, exchange, date_str,
+                            iv_state=iv_state,
                         )
                     else:
-                        s1_side_items = [(ot, None) for ot in ['P', 'C']]
-                    for ot, preselected_candidates in s1_side_items:
+                        s1_side_items = [(ot, None, {}) for ot in ['P', 'C']]
+                    for ot, preselected_candidates, side_meta in s1_side_items:
                         if (
                             not cfg.get('s1_allow_add_same_side', False) and
                             (product, ot) in open_s1_sell_sides
@@ -1725,7 +1742,8 @@ class ToolkitMinuteEngine:
                                           reentry_plan=s1_plan,
                                           iv_state=iv_state,
                                           margin_cap=margin_cap, strategy_cap=s1_cap,
-                                          preselected_candidates=preselected_candidates)
+                                          preselected_candidates=preselected_candidates,
+                                          side_meta=side_meta)
 
                 if cfg.get('enable_s3', True) and s3_m / nav < s3_cap and not expiry_has_position:
                     for ot in ['P', 'C']:
@@ -1837,60 +1855,147 @@ class ToolkitMinuteEngine:
             product=product,
         )
 
-    def _select_s1_side_items(self, ef, product, mult, mr, exchange, date_str):
+    def _select_s1_side_items(self, ef, product, mult, mr, exchange, date_str,
+                              iv_state=None):
         max_candidates = self._s1_max_selection_candidates()
+        trend_enabled = bool(self.config.get('s1_trend_confidence_enabled', False))
+        trend_info = (
+            self._s1_trend_confidence_info(product, date_str, iv_state)
+            if trend_enabled else {}
+        )
         side_candidates = {}
         side_frames = {}
+        side_meta = {}
         for ot in ['P', 'C']:
             if self._is_reentry_blocked('S1', product, ot, date_str):
                 continue
             reentry_plan = self._get_reentry_plan('S1', product, ot, date_str)
             min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
+            adjustment = {
+                'trend_role': 'neutral',
+                'score_mult': 1.0,
+                'budget_mult': 1.0,
+                'delta_cap': None,
+            }
+            if trend_enabled:
+                adjustment = s1_trend_side_adjustment(
+                    ot,
+                    trend_info.get('trend_state', 'uncertain'),
+                    trend_info.get('trend_confidence', 0.0),
+                    weak_delta_cap=self.config.get('s1_trend_weak_side_delta_cap', 0.060),
+                    weak_score_mult=self.config.get('s1_trend_weak_side_score_mult', 0.60),
+                    weak_budget_mult=self.config.get('s1_trend_weak_side_budget_mult', 0.50),
+                    strong_score_mult=self.config.get('s1_trend_strong_side_score_mult', 1.00),
+                )
+                weak_delta_cap = adjustment.get('delta_cap')
+                if weak_delta_cap is not None and float(weak_delta_cap or 0.0) > 0:
+                    delta_cap = min(delta_cap, float(weak_delta_cap))
+                    min_abs_delta = min(min_abs_delta, delta_cap)
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
                 min_abs_delta, delta_cap, max_candidates,
             )
             if candidates is None or candidates.empty:
                 continue
+            candidates = candidates.copy()
+            score_mult = float(adjustment.get('score_mult', 1.0) or 0.0)
+            if trend_enabled and score_mult != 1.0 and 'quality_score' in candidates.columns:
+                candidates['quality_score'] = pd.to_numeric(
+                    candidates['quality_score'], errors='coerce'
+                ) * score_mult
+                sort_cols = [
+                    col for col in (
+                        'quality_score', 'premium_stress', 'theta_stress',
+                        'premium_margin', 'volume', 'open_interest', 'option_code',
+                    )
+                    if col in candidates.columns
+                ]
+                ascending = [False] * len(sort_cols)
+                if sort_cols and sort_cols[-1] == 'option_code':
+                    ascending[-1] = True
+                candidates = candidates.sort_values(
+                    sort_cols,
+                    ascending=ascending,
+                    kind='mergesort',
+                )
+            if trend_enabled:
+                candidates['trend_state'] = trend_info.get('trend_state', '')
+                candidates['trend_score'] = trend_info.get('trend_score', np.nan)
+                candidates['trend_confidence'] = trend_info.get('trend_confidence', np.nan)
+                candidates['trend_role'] = adjustment.get('trend_role', '')
+                candidates['side_score_mult'] = score_mult
+                candidates['side_budget_mult'] = float(adjustment.get('budget_mult', 1.0) or 0.0)
             side_frames[ot] = candidates
             side_candidates[ot] = candidates.iloc[0]
+            side_meta[ot] = {
+                **trend_info,
+                **adjustment,
+                'delta_cap': delta_cap,
+            }
 
         momentum = self._recent_product_momentum(
             product,
             date_str,
             self.config.get('s1_side_momentum_lookback', 5),
         )
-        selected_sides = choose_s1_option_sides(
-            side_candidates,
-            enabled=bool(self.config.get('s1_side_selection_enabled', False)),
-            conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
-            current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
-            momentum=momentum,
-            momentum_threshold=float(self.config.get('s1_side_momentum_threshold', 0.02) or 0.02),
-            momentum_penalty=float(self.config.get('s1_side_momentum_penalty', 0.75) or 0.0),
-            allowed_strangle_regimes=self.config.get(
-                's1_conditional_strangle_allowed_regimes',
-                ['falling_vol_carry', 'low_stable_vol'],
-            ),
-            strangle_max_abs_momentum=float(
-                self.config.get('s1_conditional_strangle_max_abs_momentum', 0.015) or 0.0
-            ),
-            strangle_min_score_ratio=float(
-                self.config.get('s1_conditional_strangle_min_score_ratio', 0.90) or 0.0
-            ),
-            strangle_min_adjusted_score=float(
-                self.config.get('s1_conditional_strangle_min_adjusted_score', 0.35) or 0.0
-            ),
-            strangle_require_momentum=bool(
-                self.config.get('s1_conditional_strangle_require_momentum', True)
-            ),
-        )
-        return [(ot, side_frames.get(ot)) for ot in selected_sides if ot in side_frames]
+        if trend_enabled:
+            selected_sides = choose_s1_trend_confidence_sides(
+                side_candidates,
+                trend_state=trend_info.get('trend_state', 'uncertain'),
+                current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
+                conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
+                allowed_strangle_regimes=self.config.get(
+                    's1_conditional_strangle_allowed_regimes',
+                    ['falling_vol_carry', 'low_stable_vol'],
+                ),
+                strangle_states=self.config.get('s1_trend_strangle_states', ['range_bound']),
+                strangle_min_score_ratio=float(
+                    self.config.get('s1_conditional_strangle_min_score_ratio', 0.90) or 0.0
+                ),
+                strangle_min_adjusted_score=float(
+                    self.config.get('s1_conditional_strangle_min_adjusted_score', 0.35) or 0.0
+                ),
+                allow_weak_side=bool(self.config.get('s1_trend_allow_weak_side', True)),
+                weak_side_min_score_ratio=float(
+                    self.config.get('s1_trend_weak_side_min_score_ratio', 0.75) or 0.0
+                ),
+            )
+        else:
+            selected_sides = choose_s1_option_sides(
+                side_candidates,
+                enabled=bool(self.config.get('s1_side_selection_enabled', False)),
+                conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
+                current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
+                momentum=momentum,
+                momentum_threshold=float(self.config.get('s1_side_momentum_threshold', 0.02) or 0.02),
+                momentum_penalty=float(self.config.get('s1_side_momentum_penalty', 0.75) or 0.0),
+                allowed_strangle_regimes=self.config.get(
+                    's1_conditional_strangle_allowed_regimes',
+                    ['falling_vol_carry', 'low_stable_vol'],
+                ),
+                strangle_max_abs_momentum=float(
+                    self.config.get('s1_conditional_strangle_max_abs_momentum', 0.015) or 0.0
+                ),
+                strangle_min_score_ratio=float(
+                    self.config.get('s1_conditional_strangle_min_score_ratio', 0.90) or 0.0
+                ),
+                strangle_min_adjusted_score=float(
+                    self.config.get('s1_conditional_strangle_min_adjusted_score', 0.35) or 0.0
+                ),
+                strangle_require_momentum=bool(
+                    self.config.get('s1_conditional_strangle_require_momentum', True)
+                ),
+            )
+        return [
+            (ot, side_frames.get(ot), side_meta.get(ot, {}))
+            for ot in selected_sides
+            if ot in side_frames
+        ]
 
     def _try_open_s1(self, ef, product, ot, mult, mr, exchange, exp,
                      nav, margin_per, iv_scale, date_str, reentry_plan=None,
                      iv_state=None, margin_cap=None, strategy_cap=None,
-                     preselected_candidates=None):
+                     preselected_candidates=None, side_meta=None):
         """S1开仓"""
         min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
         split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
@@ -1918,6 +2023,7 @@ class ToolkitMinuteEngine:
         if candidates.empty:
             return
         iv_state = iv_state or {}
+        side_meta = side_meta or {}
         effective_margin_cap = self.config.get('margin_cap', 0.50) if margin_cap is None else margin_cap
         effective_strategy_cap = self.config.get('s1_margin_cap', 0.25) if strategy_cap is None else strategy_cap
         base_margin_per = float(self.config.get('margin_per', 0.02) or 0.02)
@@ -1927,8 +2033,9 @@ class ToolkitMinuteEngine:
             stress_budget_pct = float(open_budget.get('s1_stress_loss_budget_pct') or 0.0)
         else:
             stress_budget_pct = float(self.config.get('s1_stress_loss_budget_pct', 0.0010) or 0.0) * regime_scale
-        remaining_stress_budget = nav * stress_budget_pct * float(iv_scale or 1.0)
-        remaining_margin_budget = nav * float(margin_per or 0.0) / 2.0 * float(iv_scale or 1.0)
+        side_budget_mult = max(0.0, float(side_meta.get('budget_mult', 1.0) or 0.0))
+        remaining_stress_budget = nav * stress_budget_pct * float(iv_scale or 1.0) * side_budget_mult
+        remaining_margin_budget = nav * float(margin_per or 0.0) / 2.0 * float(iv_scale or 1.0) * side_budget_mult
         min_qty = int(self.config.get('s1_stress_min_qty', 1) or 1)
         max_qty = int(self.config.get('s1_stress_max_qty', 50) or 50)
         group_id = f"S1_{product}_{ot}_{exp}_{date_str}"
@@ -2014,6 +2121,13 @@ class ToolkitMinuteEngine:
                 'contract_iv': c.get('contract_iv', np.nan),
                 'contract_iv_change_1d': c.get('contract_iv_change_1d', np.nan),
                 'contract_price_change_1d': c.get('contract_price_change_1d', np.nan),
+                'trend_state': side_meta.get('trend_state', c.get('trend_state', '')),
+                'trend_score': side_meta.get('trend_score', c.get('trend_score', np.nan)),
+                'trend_confidence': side_meta.get('trend_confidence', c.get('trend_confidence', np.nan)),
+                'trend_role': side_meta.get('trend_role', c.get('trend_role', '')),
+                'side_score_mult': side_meta.get('score_mult', c.get('side_score_mult', np.nan)),
+                'side_budget_mult': side_budget_mult,
+                'side_delta_cap': side_meta.get('delta_cap', np.nan),
             }
             pending_item.update(self._pending_budget_fields(effective_strategy_cap))
             self._pending_opens.append(pending_item)

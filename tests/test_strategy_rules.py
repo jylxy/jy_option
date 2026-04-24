@@ -9,7 +9,13 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from strategy_rules import choose_s1_option_sides, select_s1_sell  # noqa: E402
+from strategy_rules import (  # noqa: E402
+    choose_s1_option_sides,
+    choose_s1_trend_confidence_sides,
+    classify_s1_trend_confidence,
+    s1_trend_side_adjustment,
+    select_s1_sell,
+)
 
 
 class StrategyRulesTest(unittest.TestCase):
@@ -121,6 +127,68 @@ class StrategyRulesTest(unittest.TestCase):
         )
 
         self.assertEqual(directional, ["P"])
+
+    def test_s1_trend_confidence_classifies_range_and_trend(self):
+        range_state = classify_s1_trend_confidence(
+            [0.001, -0.001, 0.0005, -0.0005, 0.0] * 4,
+            min_history=5,
+            trend_threshold=0.018,
+            range_threshold=0.010,
+        )
+        up_state = classify_s1_trend_confidence(
+            [0.004] * 20,
+            min_history=5,
+            trend_threshold=0.018,
+            range_threshold=0.010,
+        )
+
+        self.assertEqual(range_state["trend_state"], "range_bound")
+        self.assertEqual(up_state["trend_state"], "uptrend")
+        self.assertGreater(up_state["trend_confidence"], 0.0)
+
+    def test_s1_trend_side_adjustment_makes_uptrend_call_weaker(self):
+        call_adj = s1_trend_side_adjustment(
+            "C",
+            "uptrend",
+            1.0,
+            weak_delta_cap=0.06,
+            weak_score_mult=0.60,
+            weak_budget_mult=0.50,
+        )
+        put_adj = s1_trend_side_adjustment("P", "uptrend", 1.0)
+
+        self.assertEqual(call_adj["trend_role"], "weak")
+        self.assertEqual(call_adj["delta_cap"], 0.06)
+        self.assertLess(call_adj["score_mult"], 1.0)
+        self.assertLess(call_adj["budget_mult"], 1.0)
+        self.assertEqual(put_adj["trend_role"], "strong")
+
+    def test_s1_trend_choice_allows_range_strangle_and_trend_weak_side(self):
+        side_candidates = {
+            "P": {"quality_score": 0.60},
+            "C": {"quality_score": 0.57},
+        }
+        range_choice = choose_s1_trend_confidence_sides(
+            side_candidates,
+            trend_state="range_bound",
+            current_regime="falling_vol_carry",
+            conditional_strangle_enabled=True,
+            strangle_states=["range_bound"],
+            strangle_min_score_ratio=0.90,
+            strangle_min_adjusted_score=0.35,
+        )
+        uptrend_choice = choose_s1_trend_confidence_sides(
+            side_candidates,
+            trend_state="uptrend",
+            current_regime="falling_vol_carry",
+            conditional_strangle_enabled=True,
+            allow_weak_side=True,
+            weak_side_min_score_ratio=0.90,
+            strangle_min_adjusted_score=0.35,
+        )
+
+        self.assertEqual(range_choice, ["P", "C"])
+        self.assertEqual(uptrend_choice, ["P", "C"])
 
 
 if __name__ == "__main__":
