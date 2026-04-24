@@ -204,6 +204,53 @@ class VolRegimeTest(unittest.TestCase):
 
         self.assertEqual(vr.recent_stop_count(cfg, stop_history, "2025-05-07"), 2)
 
+    def test_s1_entry_can_isolate_positive_carry_only(self):
+        cfg = self.base_config()
+        cfg.update({
+            "s1_falling_framework_enabled": True,
+            "vol_regime_min_iv_rv_spread": 0.0,
+            "vol_regime_min_iv_rv_ratio": 1.0,
+            "s1_entry_check_vol_trend": False,
+            "s1_entry_block_high_rising_regime": False,
+        })
+        state = {
+            "iv_rv_spread": 0.01,
+            "iv_rv_ratio": 1.02,
+            "iv_trend": 0.20,
+            "rv_trend": 0.20,
+        }
+
+        self.assertTrue(vr.passes_s1_falling_framework_entry(
+            cfg,
+            product="CU",
+            iv_state=state,
+            current_vol_regimes={"CU": vr.HIGH_RISING_VOL},
+            iv_history={},
+        ))
+        self.assertFalse(vr.passes_s1_falling_framework_entry(
+            cfg,
+            product="CU",
+            iv_state={**state, "iv_rv_spread": -0.001},
+            current_vol_regimes={"CU": vr.HIGH_RISING_VOL},
+            iv_history={},
+        ))
+
+    def test_s1_regime_prioritization_can_be_disabled(self):
+        cfg = self.base_config()
+        cfg.update({
+            "s1_falling_framework_enabled": True,
+            "s1_prioritize_products_by_regime": False,
+        })
+
+        products = ["CU", "AU"]
+        ordered = vr.prioritize_products_by_regime(
+            cfg,
+            products,
+            {"CU": vr.HIGH_RISING_VOL, "AU": vr.FALLING_VOL_CARRY},
+        )
+
+        self.assertEqual(ordered, products)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -451,24 +451,30 @@ def passes_s1_falling_framework_entry(config, *, product, iv_state,
 
     spread = iv_state.get("iv_rv_spread", np.nan)
     ratio = iv_state.get("iv_rv_ratio", np.nan)
-    rv_trend = iv_state.get("rv_trend", np.nan)
-    iv_trend = iv_state.get("iv_trend", np.nan)
     min_spread = float(config.get("vol_regime_min_iv_rv_spread", 0.02) or 0.0)
     min_ratio = float(config.get("vol_regime_min_iv_rv_ratio", 1.10) or 0.0)
-    max_rv_trend = float(config.get(
-        "s1_entry_max_rv_trend",
-        config.get("vol_regime_max_low_rv_trend", 0.02),
-    ) or 0.0)
-    max_iv_trend = float(config.get("s1_entry_max_iv_trend", 0.0) or 0.0)
     if pd.isna(spread) or spread < min_spread:
         return False
     if pd.isna(ratio) or ratio < min_ratio:
         return False
-    if pd.notna(rv_trend) and rv_trend > max_rv_trend:
-        return False
-    if pd.notna(iv_trend) and iv_trend > max_iv_trend:
-        return False
-    if current_vol_regimes.get(product) in (HIGH_RISING_VOL, POST_STOP_COOLDOWN):
+
+    if bool(config.get("s1_entry_check_vol_trend", True)):
+        rv_trend = iv_state.get("rv_trend", np.nan)
+        iv_trend = iv_state.get("iv_trend", np.nan)
+        max_rv_trend = float(config.get(
+            "s1_entry_max_rv_trend",
+            config.get("vol_regime_max_low_rv_trend", 0.02),
+        ) or 0.0)
+        max_iv_trend = float(config.get("s1_entry_max_iv_trend", 0.0) or 0.0)
+        if pd.notna(rv_trend) and rv_trend > max_rv_trend:
+            return False
+        if pd.notna(iv_trend) and iv_trend > max_iv_trend:
+            return False
+
+    if (
+        bool(config.get("s1_entry_block_high_rising_regime", True)) and
+        current_vol_regimes.get(product) in (HIGH_RISING_VOL, POST_STOP_COOLDOWN)
+    ):
         return False
     return passes_s1_risk_release_entry(
         config,
@@ -496,7 +502,10 @@ def recent_stop_count(config, stop_history, date_str):
 
 
 def prioritize_products_by_regime(config, products, current_vol_regimes):
-    if not config.get("s1_falling_framework_enabled", False):
+    if (
+        not config.get("s1_falling_framework_enabled", False) or
+        not config.get("s1_prioritize_products_by_regime", True)
+    ):
         return list(products)
     order = {p: i for i, p in enumerate(products)}
     return sorted(
