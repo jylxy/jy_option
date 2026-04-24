@@ -84,17 +84,10 @@ from daily_aggregation import (
     enrich_daily_with_spot_iv_delta,
 )
 from position_model import Position
+from runtime_paths import BASE_DIR, OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
+from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 
 logger = logging.getLogger(__name__)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "..", "output")
-CONFIG_PATH = os.path.join(BASE_DIR, "..", "config.json")
-CACHE_DIR = os.path.join(OUTPUT_DIR, "cache")
-
-OPTION_INFO_TABLE = "option_basic_info"
-OPTION_MINUTE_TABLE = "option_hf_1min_non_ror"
-FUTURE_MINUTE_TABLE = "future_hf_1min"
-ETF_MINUTE_TABLE = "etf_hf_1min_non_ror"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 合约属性管理
