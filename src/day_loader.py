@@ -184,8 +184,66 @@ class ToolkitDayLoader:
         """
         return select_bars_sql(query)
 
+    def _query_spot_daily_table_batch(self, table_name, dates, code_list_sql):
+        date_list = ", ".join(f"'{d}'" for d in dates)
+        query = f"""
+            SELECT
+                toString(date) as trade_date,
+                ths_code,
+                argMax(toFloat64OrZero(close), time) as last_close
+            FROM {table_name}
+            WHERE date IN ({date_list})
+              AND ths_code IN ({code_list_sql})
+              AND toFloat64OrZero(close) > 0
+            GROUP BY date, ths_code
+        """
+        return select_bars_sql(query)
+
     def _spot_tables_for_codes(self, underlying_codes):
         return spot_tables_for_codes(underlying_codes, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE)
+
+    def _preload_spot_daily_close_batch(self, dates, underlying_codes):
+        dates = [d for d in dates if d]
+        requested = sorted({str(code) for code in underlying_codes if code})
+        if not dates or not requested:
+            return
+
+        missing_by_date = {}
+        missing_codes = set()
+        for date_str in dates:
+            cache = self._spot_daily_cache.setdefault(date_str, {})
+            missing = [code for code in requested if code not in cache]
+            if missing:
+                missing_by_date[date_str] = missing
+                missing_codes.update(missing)
+        if not missing_codes:
+            return
+
+        alias_map = build_underlying_alias_map(sorted(missing_codes))
+        lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
+        if not lookup_codes:
+            return
+
+        code_list_sql = ", ".join(f"'{code}'" for code in lookup_codes)
+        frames = []
+        for table_name in self._spot_tables_for_codes(lookup_codes):
+            df = self._query_spot_daily_table_batch(table_name, dates, code_list_sql)
+            if df is not None and not df.empty:
+                frames.append(df)
+
+        if frames:
+            merged = pd.concat(frames, ignore_index=True)
+            merged["last_close"] = pd.to_numeric(merged["last_close"], errors="coerce")
+            merged = merged[merged["last_close"].notna() & (merged["last_close"] > 0)]
+            for row in merged.itertuples(index=False):
+                cache = self._spot_daily_cache.setdefault(str(row.trade_date), {})
+                cache[str(row.ths_code)] = float(row.last_close)
+
+        for date_str, missing in missing_by_date.items():
+            cache = self._spot_daily_cache.setdefault(date_str, {})
+            cache.update(resolve_alias_value_map(cache, alias_map))
+            for code in missing:
+                cache.setdefault(code, None)
 
     def _get_spot_daily_close_map(self, date_str, underlying_codes):
         if not underlying_codes:
@@ -256,6 +314,10 @@ class ToolkitDayLoader:
         df["last_oi"] = pd.to_numeric(df["last_oi"], errors="coerce").fillna(0)
         df = attach_contract_columns(df, contract_info)
         df = df[(df["strike"] > 0) & (df["option_type"] != "") & (df["last_close"] > 0)].copy()
+        self._preload_spot_daily_close_batch(
+            to_load,
+            [code for code in df["underlying_code"].dropna().tolist() if code],
+        )
 
         n_rows = len(df)
         for d in to_load:

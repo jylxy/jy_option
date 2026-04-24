@@ -46,6 +46,27 @@ class DayLoaderTest(unittest.TestCase):
         self.assertTrue(loader.load_spot_day_minute("2025-01-02", []).empty)
         self.assertTrue(loader.load_day_minute("2025-01-02", code_list=[]).empty)
 
+    def test_preload_spot_daily_close_batch_populates_cache(self):
+        loader = ToolkitDayLoader(FakeContractInfo())
+        calls = []
+
+        def fake_query(table_name, dates, code_list_sql):
+            calls.append((table_name, tuple(dates), code_list_sql))
+            return pd.DataFrame([
+                {"trade_date": "2025-01-02", "ths_code": "510300.SH", "last_close": 3.5},
+                {"trade_date": "2025-01-03", "ths_code": "510300.SH", "last_close": 3.6},
+            ])
+
+        loader._spot_tables_for_codes = lambda _codes: ["etf_table"]
+        loader._query_spot_daily_table_batch = fake_query
+        loader._query_spot_daily_table = lambda *_args: self.fail("spot batch cache was not used")
+
+        loader._preload_spot_daily_close_batch(["2025-01-02", "2025-01-03"], ["510300.SH"])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(loader._get_spot_daily_close_map("2025-01-02", ["510300.SH"]), {"510300.SH": 3.5})
+        self.assertEqual(loader._get_spot_daily_close_map("2025-01-03", ["510300.SH"]), {"510300.SH": 3.6})
+
 
 if __name__ == "__main__":
     unittest.main()

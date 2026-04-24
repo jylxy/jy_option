@@ -612,20 +612,42 @@ class ToolkitMinuteEngine:
 
             t_day = time.time()
             minute_df = pd.DataFrame()
+            pending_codes = {
+                item['code'] for item in self._pending_opens if item.get('code')
+            }
+            pre_open_held_codes = {pos.code for pos in self.positions if pos.code}
+            exit_codes = set(pre_open_held_codes)
+            if not self.config.get('skip_same_day_exit_for_vwap_opens', True):
+                exit_codes |= pending_codes
+            needed_minute_codes = pending_codes | exit_codes
+            if needed_minute_codes:
+                minute_df = self.loader.load_day_minute(date_str, code_list=needed_minute_codes)
 
             # Phase 0: 执行昨日待开仓（需要分钟数据做T+1 VWAP）
             if self._pending_opens:
-                pending_codes = {item['code'] for item in self._pending_opens if item.get('code')}
-                minute_df = self.loader.load_day_minute(date_str, code_list=pending_codes)
-            if self._pending_opens:
-                if not minute_df.empty:
-                    self._execute_pending_opens(minute_df, date_str)
+                pending_minute_df = (
+                    minute_df[minute_df['ths_code'].isin(pending_codes)].copy()
+                    if pending_codes and not minute_df.empty
+                    else pd.DataFrame()
+                )
+                if not pending_minute_df.empty:
+                    self._execute_pending_opens(pending_minute_df, date_str)
 
             intraday_exit_done = False
             if self.positions:
-                held_codes = {pos.code for pos in self.positions if pos.code}
-                exit_minute_df = self.loader.load_day_minute(date_str, code_list=held_codes)
-                if not exit_minute_df.empty:
+                if self.config.get('skip_same_day_exit_for_vwap_opens', True):
+                    held_codes = {
+                        pos.code for pos in self.positions
+                        if pos.code and pos.open_date != date_str
+                    }
+                else:
+                    held_codes = {pos.code for pos in self.positions if pos.code}
+                exit_minute_df = (
+                    minute_df[minute_df['ths_code'].isin(held_codes)].copy()
+                    if held_codes and not minute_df.empty
+                    else pd.DataFrame()
+                )
+                if held_codes and not exit_minute_df.empty:
                     intraday_exit_done = self._process_intraday_exits(exit_minute_df, date_str)
 
             # Phase A+B: 用日频聚合数据（不需要分钟明细）
