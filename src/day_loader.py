@@ -314,9 +314,13 @@ class ToolkitDayLoader:
         df["last_oi"] = pd.to_numeric(df["last_oi"], errors="coerce").fillna(0)
         df = attach_contract_columns(df, contract_info)
         df = df[(df["strike"] > 0) & (df["option_type"] != "") & (df["last_close"] > 0)].copy()
+        underlying_codes = [
+            (contract_info.lookup(code) or {}).get("underlying_code")
+            for code in df["ths_code"].dropna().unique()
+        ]
         self._preload_spot_daily_close_batch(
             to_load,
-            [code for code in df["underlying_code"].dropna().tolist() if code],
+            [code for code in underlying_codes if code],
         )
 
         n_rows = len(df)
