@@ -152,6 +152,19 @@ DEFAULT_PARAMS = {
     "s1_split_across_neighbor_contracts": True,
     "s1_neighbor_contract_count": 3,
     "s1_neighbor_max_delta_gap": 0.025,
+    "s1_side_selection_enabled": False,
+    "s1_conditional_strangle_enabled": False,
+    "s1_conditional_strangle_allowed_regimes": [
+        "falling_vol_carry",
+        "low_stable_vol",
+    ],
+    "s1_side_momentum_lookback": 5,
+    "s1_side_momentum_threshold": 0.02,
+    "s1_side_momentum_penalty": 0.75,
+    "s1_conditional_strangle_max_abs_momentum": 0.015,
+    "s1_conditional_strangle_min_score_ratio": 0.90,
+    "s1_conditional_strangle_min_adjusted_score": 0.35,
+    "s1_conditional_strangle_require_momentum": True,
     "s3_reentry_otm_shift": 2.0,
     # 品种准入
     "product_min_listing_days": 180,
@@ -300,6 +313,115 @@ def _pct_rank_low(series, fill_value=0.0):
     if values.notna().sum() <= 1:
         return pd.Series(fill_value, index=series.index, dtype=float)
     return (1.0 - values.rank(method="average", pct=True)).fillna(fill_value)
+
+
+def _float_or_nan(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    return value if np.isfinite(value) else np.nan
+
+
+def s1_side_adjusted_score(row, option_type, momentum=np.nan,
+                           momentum_threshold=0.02, momentum_penalty=0.75):
+    """Score a side after penalizing adverse short-term underlying momentum.
+
+    Selling puts is vulnerable to falling underlyings; selling calls is
+    vulnerable to rising underlyings. The penalty is intentionally mild and
+    parameterized because F2 tests direction selection, not a hard trend filter.
+    """
+    if row is None:
+        return np.nan
+    raw_score = _float_or_nan(row.get("quality_score", row.get("carry_score", np.nan)))
+    if pd.isna(raw_score):
+        return np.nan
+    momentum = _float_or_nan(momentum)
+    if pd.isna(momentum):
+        return raw_score
+
+    threshold = max(float(momentum_threshold or 0.0), 0.0)
+    penalty_weight = max(float(momentum_penalty or 0.0), 0.0)
+    if penalty_weight <= 0:
+        return raw_score
+
+    opt = str(option_type or "").upper()
+    if opt == "P":
+        adverse_move = max(0.0, -momentum - threshold)
+    elif opt == "C":
+        adverse_move = max(0.0, momentum - threshold)
+    else:
+        adverse_move = 0.0
+    if adverse_move <= 0:
+        return raw_score
+
+    adverse_units = adverse_move / threshold if threshold > 0 else 1.0
+    return raw_score / (1.0 + penalty_weight * adverse_units)
+
+
+def choose_s1_option_sides(side_candidates, *, enabled=False,
+                           conditional_strangle_enabled=False,
+                           current_regime="normal_vol", momentum=np.nan,
+                           momentum_threshold=0.02, momentum_penalty=0.75,
+                           allowed_strangle_regimes=None,
+                           strangle_max_abs_momentum=0.015,
+                           strangle_min_score_ratio=0.90,
+                           strangle_min_adjusted_score=0.35,
+                           strangle_require_momentum=True):
+    """Choose S1 sides from top put/call candidates.
+
+    When disabled, preserve the legacy behavior of trying P then C. When
+    enabled, select the better side by adjusted score and only return both
+    sides when strangle quality and neutrality checks pass.
+    """
+    side_candidates = side_candidates or {}
+    legacy_sides = [ot for ot in ("P", "C") if side_candidates.get(ot) is not None]
+    if not enabled:
+        return legacy_sides
+
+    ranked = []
+    for ot in ("P", "C"):
+        row = side_candidates.get(ot)
+        if row is None:
+            continue
+        adjusted = s1_side_adjusted_score(
+            row,
+            ot,
+            momentum=momentum,
+            momentum_threshold=momentum_threshold,
+            momentum_penalty=momentum_penalty,
+        )
+        if pd.isna(adjusted):
+            continue
+        ranked.append((ot, float(adjusted)))
+    if not ranked:
+        return []
+
+    ranked.sort(key=lambda item: (-item[1], item[0]))
+    best_side = [ranked[0][0]]
+    if not conditional_strangle_enabled or len(ranked) < 2:
+        return best_side
+
+    allowed = set(allowed_strangle_regimes or ("falling_vol_carry", "low_stable_vol"))
+    if current_regime not in allowed:
+        return best_side
+
+    momentum = _float_or_nan(momentum)
+    if strangle_require_momentum and pd.isna(momentum):
+        return best_side
+    max_abs_momentum = float(strangle_max_abs_momentum or 0.0)
+    if pd.notna(momentum) and max_abs_momentum >= 0 and abs(momentum) > max_abs_momentum:
+        return best_side
+
+    high_score = ranked[0][1]
+    low_score = ranked[1][1]
+    min_score = float(strangle_min_adjusted_score or 0.0)
+    if min_score > 0 and low_score < min_score:
+        return best_side
+    ratio = float(strangle_min_score_ratio or 0.0)
+    if ratio > 0 and high_score > 0 and low_score < high_score * ratio:
+        return best_side
+    return [ranked[0][0], ranked[1][0]]
 
 
 def select_s1_protect(day_df, sell_row, mode="inner",

@@ -39,6 +39,7 @@ from strategy_rules import (
     extract_atm_iv_series, calc_iv_percentile, calc_iv_rv_features, get_iv_scale,
     should_pause_open, should_close_expiry, should_open_new, can_reopen,
     should_allow_open_low_iv_product, calc_stats,
+    choose_s1_option_sides,
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
@@ -810,6 +811,13 @@ class ToolkitMinuteEngine:
             peer_product,
             current_date,
         )
+
+    def _recent_product_momentum(self, product, date_str, lookback):
+        returns = self._get_product_return_series(product, current_date=date_str)
+        if returns.empty:
+            return np.nan
+        lb = max(1, int(lookback or 1))
+        return float(returns.tail(lb).sum())
 
     def _get_open_concentration_state(self, include_pending=True):
         return port_risk.get_open_concentration_state(
@@ -1697,7 +1705,13 @@ class ToolkitMinuteEngine:
                 ):
                     if not self._passes_s1_falling_framework_entry(product, iv_state):
                         continue
-                    for ot in ['P', 'C']:
+                    if cfg.get('s1_side_selection_enabled', False):
+                        s1_side_items = self._select_s1_side_items(
+                            ef, product, mult, mr, exchange, date_str,
+                        )
+                    else:
+                        s1_side_items = [(ot, None) for ot in ['P', 'C']]
+                    for ot, preselected_candidates in s1_side_items:
                         if (
                             not cfg.get('s1_allow_add_same_side', False) and
                             (product, ot) in open_s1_sell_sides
@@ -1710,7 +1724,8 @@ class ToolkitMinuteEngine:
                                           nav, product_margin_per, iv_scale, date_str,
                                           reentry_plan=s1_plan,
                                           iv_state=iv_state,
-                                          margin_cap=margin_cap, strategy_cap=s1_cap)
+                                          margin_cap=margin_cap, strategy_cap=s1_cap,
+                                          preselected_candidates=preselected_candidates)
 
                 if cfg.get('enable_s3', True) and s3_m / nav < s3_cap and not expiry_has_position:
                     for ot in ['P', 'C']:
@@ -1769,27 +1784,33 @@ class ToolkitMinuteEngine:
 
     # ── 开仓辅助 ─────────────────────────────────────────────────────────────
 
-    def _try_open_s1(self, ef, product, ot, mult, mr, exchange, exp,
-                     nav, margin_per, iv_scale, date_str, reentry_plan=None,
-                     iv_state=None, margin_cap=None, strategy_cap=None):
-        """S1开仓"""
+    def _s1_delta_bounds(self, reentry_plan=None):
         delta_cap = float(self.config.get('s1_sell_delta_cap', 0.10))
         min_abs_delta = float(self.config.get('s1_sell_delta_floor', 0.0))
         if reentry_plan:
             delta_cap = float(self.config.get('s1_reentry_delta_cap', 0.15))
             min_abs_delta = min(
                 delta_cap,
-                max(min_abs_delta, float(reentry_plan.get('delta_abs', 0.0)) + float(self.config.get('s1_reentry_delta_step', 0.02)))
+                max(
+                    min_abs_delta,
+                    float(reentry_plan.get('delta_abs', 0.0))
+                    + float(self.config.get('s1_reentry_delta_step', 0.02)),
+                ),
             )
         if self.config.get('s1_falling_framework_enabled', False):
             delta_cap = min(delta_cap, 0.10)
             min_abs_delta = min(min_abs_delta, delta_cap)
-        split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
-        max_candidates = 1
-        if split_enabled:
-            max_candidates = max(1, int(self.config.get('s1_neighbor_contract_count', 3) or 1))
+        return min_abs_delta, delta_cap
+
+    def _s1_max_selection_candidates(self):
+        if bool(self.config.get('s1_split_across_neighbor_contracts', False)):
+            return max(1, int(self.config.get('s1_neighbor_contract_count', 3) or 1))
+        return 1
+
+    def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
+                                   min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
-        candidates = select_s1_sell(
+        return select_s1_sell(
             s1_frame, ot, mult, mr,
             min_volume=int(self.config.get('s1_min_volume', 0)),
             min_oi=int(self.config.get('s1_min_oi', 0)),
@@ -1815,6 +1836,72 @@ class ToolkitMinuteEngine:
             exchange=exchange,
             product=product,
         )
+
+    def _select_s1_side_items(self, ef, product, mult, mr, exchange, date_str):
+        max_candidates = self._s1_max_selection_candidates()
+        side_candidates = {}
+        side_frames = {}
+        for ot in ['P', 'C']:
+            if self._is_reentry_blocked('S1', product, ot, date_str):
+                continue
+            reentry_plan = self._get_reentry_plan('S1', product, ot, date_str)
+            min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
+            candidates = self._select_s1_sell_candidates(
+                ef, product, ot, mult, mr, exchange,
+                min_abs_delta, delta_cap, max_candidates,
+            )
+            if candidates is None or candidates.empty:
+                continue
+            side_frames[ot] = candidates
+            side_candidates[ot] = candidates.iloc[0]
+
+        momentum = self._recent_product_momentum(
+            product,
+            date_str,
+            self.config.get('s1_side_momentum_lookback', 5),
+        )
+        selected_sides = choose_s1_option_sides(
+            side_candidates,
+            enabled=bool(self.config.get('s1_side_selection_enabled', False)),
+            conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
+            current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
+            momentum=momentum,
+            momentum_threshold=float(self.config.get('s1_side_momentum_threshold', 0.02) or 0.02),
+            momentum_penalty=float(self.config.get('s1_side_momentum_penalty', 0.75) or 0.0),
+            allowed_strangle_regimes=self.config.get(
+                's1_conditional_strangle_allowed_regimes',
+                ['falling_vol_carry', 'low_stable_vol'],
+            ),
+            strangle_max_abs_momentum=float(
+                self.config.get('s1_conditional_strangle_max_abs_momentum', 0.015) or 0.0
+            ),
+            strangle_min_score_ratio=float(
+                self.config.get('s1_conditional_strangle_min_score_ratio', 0.90) or 0.0
+            ),
+            strangle_min_adjusted_score=float(
+                self.config.get('s1_conditional_strangle_min_adjusted_score', 0.35) or 0.0
+            ),
+            strangle_require_momentum=bool(
+                self.config.get('s1_conditional_strangle_require_momentum', True)
+            ),
+        )
+        return [(ot, side_frames.get(ot)) for ot in selected_sides if ot in side_frames]
+
+    def _try_open_s1(self, ef, product, ot, mult, mr, exchange, exp,
+                     nav, margin_per, iv_scale, date_str, reentry_plan=None,
+                     iv_state=None, margin_cap=None, strategy_cap=None,
+                     preselected_candidates=None):
+        """S1开仓"""
+        min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
+        split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
+        max_candidates = self._s1_max_selection_candidates()
+        if preselected_candidates is None:
+            candidates = self._select_s1_sell_candidates(
+                ef, product, ot, mult, mr, exchange,
+                min_abs_delta, delta_cap, max_candidates,
+            )
+        else:
+            candidates = preselected_candidates.copy()
         if candidates is None or candidates.empty:
             return
         candidates = candidates.copy()
