@@ -82,6 +82,7 @@ from iv_warmup import (
     warmup_cache_path,
     warmup_iv_consistent,
 )
+import vol_regime as vol_rules
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +142,7 @@ class ToolkitMinuteEngine:
         return spot_tables_for_codes(underlying_codes, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE)
 
     def _reentry_key(self, strat, product, opt_type=None):
-        return (str(strat), str(product))
+        return vol_rules.reentry_key(strat, product, opt_type)
 
     def _shift_trading_date(self, date_str, offset):
         if offset <= 0:
@@ -174,107 +175,48 @@ class ToolkitMinuteEngine:
         return selected
 
     def _register_reentry_plan(self, pos, date_str):
-        cooldown_days = max(int(self.config.get('cooldown_days_after_stop', 1)), 0)
-        product = self._normalize_product_key(pos.product)
-        hist = self._stop_history[product]
-        hist.append(date_str)
-        lookback_days = int(self.config.get('cooldown_repeat_lookback_days', 20) or 0)
-        threshold = int(self.config.get('cooldown_repeat_threshold', 2) or 0)
-        extra_days = int(self.config.get('cooldown_repeat_extra_days', 2) or 0)
-        if lookback_days > 0 and threshold > 0 and extra_days > 0:
-            cur_ts = pd.Timestamp(date_str)
-            recent = [
-                d for d in hist
-                if (cur_ts - pd.Timestamp(d)).days <= lookback_days
-            ]
-            hist[:] = recent
-            if len(recent) >= threshold:
-                cooldown_days += extra_days * (len(recent) - threshold + 1)
-        plan = {
-            'earliest_date': self._shift_trading_date(date_str, cooldown_days),
-            'delta_abs': abs(float(getattr(pos, 'cur_delta', 0.0) or 0.0)),
-            'trigger_opt_type': str(getattr(pos, 'opt_type', '') or ''),
-            'cooldown_days': cooldown_days,
-        }
-        spot = float(getattr(pos, 'cur_spot', 0.0) or 0.0)
-        if spot > 0:
-            plan['otm_pct'] = abs(1 - float(pos.strike) / spot) * 100.0
-        self._reentry_plans[self._reentry_key(pos.strat, pos.product, pos.opt_type)] = plan
+        return vol_rules.register_reentry_plan(
+            pos,
+            date_str,
+            config=self.config,
+            stop_history=self._stop_history,
+            reentry_plans=self._reentry_plans,
+            shift_trading_date=self._shift_trading_date,
+            normalize_product_key=self._normalize_product_key,
+        )
 
     def _product_iv_turns_lower(self, product):
-        hist = self._iv_history.get(product)
-        if not hist:
-            return False
-        ivs = list(hist.get('ivs', []))
-        dates = list(hist.get('dates', []))
-        if len(ivs) < 2 or len(dates) < 2:
-            return False
-        cur_iv = pd.to_numeric(pd.Series(ivs), errors='coerce').iloc[-1]
-        prev_iv = pd.to_numeric(pd.Series(ivs), errors='coerce').iloc[-2]
-        if pd.isna(cur_iv) or pd.isna(prev_iv):
-            return False
-        return float(cur_iv) < float(prev_iv)
+        return vol_rules.product_iv_turns_lower(self._iv_history, product)
 
     def _product_iv_not_falling(self, product):
-        hist = self._iv_history.get(product)
-        if not hist:
-            return True
-        ivs = list(hist.get('ivs', []))
-        dates = list(hist.get('dates', []))
-        if len(ivs) < 2 or len(dates) < 2:
-            return True
-        cur_iv = pd.to_numeric(pd.Series(ivs), errors='coerce').iloc[-1]
-        prev_iv = pd.to_numeric(pd.Series(ivs), errors='coerce').iloc[-2]
-        if pd.isna(cur_iv) or pd.isna(prev_iv):
-            return True
-        return float(cur_iv) >= float(prev_iv)
+        return vol_rules.product_iv_not_falling(self._iv_history, product)
 
     def _reentry_requires_falling_regime(self, strat):
-        cfg = self.config
-        strat = str(strat or '').upper()
-        if strat == 'S1':
-            return bool(cfg.get('s1_reentry_require_falling_regime', True))
-        if strat == 'S3':
-            return bool(cfg.get('s3_reentry_require_falling_regime', False))
-        return bool(cfg.get('reentry_require_falling_regime', False))
+        return vol_rules.reentry_requires_falling_regime(self.config, strat)
 
     def _reentry_requires_daily_iv_drop(self, strat):
-        cfg = self.config
-        strat = str(strat or '').upper()
-        if strat == 'S1':
-            return bool(cfg.get('s1_reentry_require_daily_iv_drop',
-                                cfg.get('s1_risk_release_require_daily_iv_drop', False)))
-        if strat == 'S3':
-            return bool(cfg.get('s3_reentry_require_daily_iv_drop', True))
-        return bool(cfg.get('reentry_require_daily_iv_drop', True))
+        return vol_rules.reentry_requires_daily_iv_drop(self.config, strat)
 
     def _reentry_plan_blocks(self, strat, product, opt_type, date_str, plan=None, base_regime=None):
         plan = plan or self._reentry_plans.get(self._reentry_key(strat, product, opt_type))
-        if not plan:
-            return False
-        if date_str < plan.get('earliest_date', date_str):
-            return True
-        if self._reentry_requires_daily_iv_drop(strat) and not self._product_iv_turns_lower(product):
-            return True
-        if self._reentry_requires_falling_regime(strat):
-            if base_regime is None:
-                base_regime = self._classify_product_vol_regime_base(
-                    product,
-                    self._current_iv_state.get(product, {}),
-                )
-            return base_regime != 'falling_vol_carry'
-        return False
+        return vol_rules.reentry_plan_blocks(
+            self.config,
+            plan=plan,
+            strat=strat,
+            product=product,
+            date_str=date_str,
+            iv_history=self._iv_history,
+            current_iv_state=self._current_iv_state,
+            base_regime=base_regime,
+        )
 
     def _should_trigger_premium_stop(self, pos, product_iv_pcts=None):
-        multiple = float(self.config.get('premium_stop_multiple', 0.0) or 0.0)
-        if multiple <= 0 or pos.cur_price < pos.open_price * multiple:
-            return False
-        require_daily_iv = bool(self.config.get('premium_stop_requires_daily_iv_non_decrease', True))
-        if not require_daily_iv:
-            return True
-        if not product_iv_pcts or pos.product not in product_iv_pcts:
-            return True
-        return self._product_iv_not_falling(pos.product)
+        return vol_rules.should_trigger_premium_stop(
+            self.config,
+            pos,
+            product_iv_pcts,
+            self._iv_history,
+        )
 
     def _is_reentry_blocked(self, strat, product, opt_type, date_str):
         plan = self._reentry_plans.get(self._reentry_key(strat, product, opt_type))
@@ -294,18 +236,7 @@ class ToolkitMinuteEngine:
         self._reentry_plans.pop(self._reentry_key(strat, product, opt_type), None)
 
     def _last_iv_trend(self, product, lookback=5):
-        hist = self._iv_history.get(product)
-        if not hist:
-            return np.nan
-        ivs = pd.to_numeric(pd.Series(hist.get('ivs', [])), errors='coerce').dropna()
-        if len(ivs) < 2:
-            return np.nan
-        lb = max(int(lookback or 2), 2)
-        prev = ivs.iloc[-min(lb, len(ivs))]
-        cur = ivs.iloc[-1]
-        if pd.isna(cur) or pd.isna(prev):
-            return np.nan
-        return float(cur - prev)
+        return vol_rules.last_iv_trend(self._iv_history, product, lookback=lookback)
 
     def _update_contract_iv_history(self, daily_df, date_str):
         if not self.config.get('s1_track_contract_iv_trend', True):
@@ -393,141 +324,51 @@ class ToolkitMinuteEngine:
         return side
 
     def _has_active_reentry_plan(self, product, date_str, base_regime=None):
-        product = self._normalize_product_key(product)
-        for (strat, plan_product), plan in self._reentry_plans.items():
-            if self._normalize_product_key(plan_product) != product:
-                continue
-            if self._reentry_plan_blocks(strat, product, None, date_str,
-                                         plan=plan, base_regime=base_regime):
-                return True
-        return False
+        return vol_rules.has_active_reentry_plan(
+            self.config,
+            product=product,
+            date_str=date_str,
+            reentry_plans=self._reentry_plans,
+            iv_history=self._iv_history,
+            current_iv_state=self._current_iv_state,
+            normalize_product_key=self._normalize_product_key,
+            base_regime=base_regime,
+        )
 
     def _classify_product_vol_regime_base(self, product, state):
-        cfg = self.config
-        iv_pct = state.get('iv_pct', np.nan)
-        spread = state.get('iv_rv_spread', np.nan)
-        ratio = state.get('iv_rv_ratio', np.nan)
-        rv_trend = state.get('rv_trend', np.nan)
-        iv_trend = state.get('iv_trend', np.nan)
-
-        high_iv_trend = float(cfg.get('vol_regime_high_iv_trend', 0.03) or 0.03)
-        high_rv_trend = float(cfg.get('vol_regime_high_rv_trend', 0.05) or 0.05)
-        if pd.notna(iv_trend) and iv_trend >= high_iv_trend:
-            return 'high_rising_vol'
-        if pd.notna(rv_trend) and rv_trend >= high_rv_trend:
-            return 'high_rising_vol'
-
-        min_spread = float(cfg.get('vol_regime_min_iv_rv_spread', 0.02) or 0.0)
-        min_ratio = float(cfg.get('vol_regime_min_iv_rv_ratio', 1.10) or 0.0)
-        falling_iv_min = float(cfg.get('vol_regime_falling_iv_pct_min', 25) or 0.0)
-        falling_iv_max = float(cfg.get('vol_regime_falling_iv_pct_max', 85) or 100.0)
-        falling_iv_trend = float(cfg.get('vol_regime_falling_iv_trend', -0.01) or -0.01)
-        falling_rv_max = float(cfg.get('vol_regime_falling_rv_trend_max', 0.01) or 0.0)
-        if (
-            pd.notna(iv_pct) and falling_iv_min <= float(iv_pct) <= falling_iv_max and
-            pd.notna(spread) and spread >= min_spread and
-            pd.notna(ratio) and ratio >= min_ratio and
-            pd.notna(iv_trend) and iv_trend <= falling_iv_trend and
-            (pd.isna(rv_trend) or rv_trend <= falling_rv_max)
-        ):
-            return 'falling_vol_carry'
-
-        high_iv_pct = float(cfg.get('vol_regime_high_iv_pct', 75) or 75)
-        if pd.notna(iv_pct) and iv_pct >= high_iv_pct:
-            return 'high_rising_vol'
-
-        low_iv_pct = float(cfg.get('vol_regime_low_iv_pct', 45) or 45)
-        max_rv_trend = float(cfg.get('vol_regime_max_low_rv_trend', 0.02) or 0.0)
-        max_iv_trend = float(cfg.get('vol_regime_max_low_iv_trend', 0.00) or 0.0)
-        if (
-            pd.notna(iv_pct) and iv_pct <= low_iv_pct and
-            pd.notna(spread) and spread >= min_spread and
-            pd.notna(ratio) and ratio >= min_ratio and
-            (pd.isna(rv_trend) or rv_trend <= max_rv_trend) and
-            (pd.isna(iv_trend) or iv_trend <= max_iv_trend)
-        ):
-            return 'low_stable_vol'
-
-        return 'normal_vol'
+        return vol_rules.classify_product_vol_regime_base(self.config, state)
 
     def _classify_product_vol_regime(self, product, state, date_str):
-        base_regime = self._classify_product_vol_regime_base(product, state)
-        if self._has_active_reentry_plan(product, date_str, base_regime=base_regime):
-            return 'post_stop_cooldown'
-        return base_regime
+        return vol_rules.classify_product_vol_regime(
+            self.config,
+            product=product,
+            state=state,
+            date_str=date_str,
+            reentry_plans=self._reentry_plans,
+            iv_history=self._iv_history,
+            current_iv_state=self._current_iv_state,
+            normalize_product_key=self._normalize_product_key,
+        )
 
     def _is_structural_low_iv_product(self, product, state=None):
-        cfg = self.config
-        product = self._normalize_product_key(product)
-        allowed = {
-            self._normalize_product_key(p)
-            for p in cfg.get('low_iv_allowed_products', [])
-            if str(p).strip()
-        }
-        if product in allowed:
-            return True
-        if not cfg.get('low_iv_structural_auto_enabled', False):
-            return False
-
-        hist = self._iv_history.get(product)
-        if not hist:
-            return False
-        ivs = pd.to_numeric(pd.Series(hist.get('ivs', [])), errors='coerce').dropna()
-        min_history = int(cfg.get('low_iv_structural_min_history', 120) or 0)
-        if len(ivs) < max(min_history, 20):
-            return False
-        window = min(len(ivs), int(cfg.get('iv_window', 252) or 252))
-        recent = ivs.iloc[-window:]
-        median_iv = float(recent.median())
-        iv_std = float(recent.std(ddof=0))
-        max_median_iv = float(cfg.get('low_iv_structural_max_median_iv', 0.24) or 0.0)
-        max_iv_std = float(cfg.get('low_iv_structural_max_iv_std', 0.08) or 0.0)
-        if max_median_iv > 0 and median_iv > max_median_iv:
-            return False
-        if max_iv_std > 0 and iv_std > max_iv_std:
-            return False
-
-        state = state or self._current_iv_state.get(product, {})
-        max_current_iv_pct = cfg.get('low_iv_structural_max_current_iv_pct', None)
-        if max_current_iv_pct is not None:
-            iv_pct = state.get('iv_pct', np.nan)
-            if pd.isna(iv_pct) or float(iv_pct) > float(max_current_iv_pct):
-                return False
-        spread = state.get('iv_rv_spread', np.nan)
-        ratio = state.get('iv_rv_ratio', np.nan)
-        min_spread = float(cfg.get('low_iv_min_iv_rv_spread', 0.02) or 0.0)
-        min_ratio = float(cfg.get('low_iv_min_iv_rv_ratio', 1.10) or 0.0)
-        if pd.isna(spread) or spread < min_spread:
-            return False
-        if pd.isna(ratio) or ratio < min_ratio:
-            return False
-        return True
+        return vol_rules.is_structural_low_iv_product(
+            self.config,
+            product=product,
+            iv_history=self._iv_history,
+            current_iv_state=self._current_iv_state,
+            normalize_product_key=self._normalize_product_key,
+            state=state,
+        )
 
     def _refresh_vol_regime_state(self, date_str):
-        regimes = {}
-        for product, state in self._current_iv_state.items():
-            regimes[product] = self._classify_product_vol_regime(product, state, date_str)
-            state['is_structural_low_iv'] = self._is_structural_low_iv_product(product, state)
-        counts = Counter(regimes.values())
-        active = sum(counts.get(k, 0) for k in ('falling_vol_carry', 'low_stable_vol', 'normal_vol', 'high_rising_vol'))
-        high_ratio = counts.get('high_rising_vol', 0) / active if active else 0.0
-        low_ratio = counts.get('low_stable_vol', 0) / active if active else 0.0
-        falling_ratio = counts.get('falling_vol_carry', 0) / active if active else 0.0
-        cfg = self.config
-        count_post_stop_as_high = bool(cfg.get('vol_regime_count_post_stop_as_high', False))
-        if (
-            count_post_stop_as_high and
-            counts.get('post_stop_cooldown', 0) >= int(cfg.get('vol_regime_portfolio_stop_count', 3) or 3)
-        ):
-            portfolio_regime = 'high_rising_vol'
-        elif high_ratio >= float(cfg.get('vol_regime_portfolio_high_ratio', 0.25) or 0.25):
-            portfolio_regime = 'high_rising_vol'
-        elif falling_ratio >= float(cfg.get('vol_regime_portfolio_falling_ratio', 0.25) or 0.25):
-            portfolio_regime = 'falling_vol_carry'
-        elif active > 0 and low_ratio >= float(cfg.get('vol_regime_portfolio_low_ratio', 0.50) or 0.50) and counts.get('high_rising_vol', 0) == 0:
-            portfolio_regime = 'low_stable_vol'
-        else:
-            portfolio_regime = 'normal_vol'
+        regimes, counts, portfolio_regime = vol_rules.refresh_vol_regime_state(
+            self.config,
+            current_iv_state=self._current_iv_state,
+            reentry_plans=self._reentry_plans,
+            iv_history=self._iv_history,
+            normalize_product_key=self._normalize_product_key,
+            date_str=date_str,
+        )
         self._current_vol_regimes = regimes
         self._current_vol_regime_counts = counts
         self._current_portfolio_regime = portfolio_regime
@@ -565,111 +406,32 @@ class ToolkitMinuteEngine:
         return budget
 
     def _product_margin_per_multiplier(self, product):
-        cfg = self.config
-        if not cfg.get('vol_regime_sizing_enabled', False):
-            return 1.0
-        regime = self._current_vol_regimes.get(product, 'normal_vol')
-        structural = self._is_structural_low_iv_product(product)
-        structural_requires_low = bool(cfg.get('low_iv_structural_require_low_stable', True))
-        if regime == 'falling_vol_carry':
-            return float(cfg.get('s1_falling_vol_margin_per_mult', 1.50) or 1.0)
-        if regime == 'low_stable_vol':
-            mult = float(cfg.get('vol_regime_low_margin_per_mult', 1.12) or 1.0)
-            if structural:
-                structural_mult = float(cfg.get('low_iv_structural_margin_per_mult', 1.25) or mult)
-                mult = max(mult, structural_mult)
-            return mult
-        if regime == 'high_rising_vol':
-            return float(cfg.get('vol_regime_high_margin_per_mult', 0.30) or 1.0)
-        if regime == 'post_stop_cooldown':
-            return float(cfg.get('vol_regime_post_stop_margin_per_mult', 0.0) or 0.0)
-        mult = float(cfg.get('vol_regime_normal_margin_per_mult', 1.0) or 1.0)
-        if structural and not structural_requires_low:
-            structural_mult = float(cfg.get('low_iv_structural_margin_per_mult', 1.25) or mult)
-            mult = max(mult, structural_mult)
-        return mult
+        return vol_rules.product_margin_per_multiplier(
+            self.config,
+            product=product,
+            current_vol_regimes=self._current_vol_regimes,
+            iv_history=self._iv_history,
+            current_iv_state=self._current_iv_state,
+            normalize_product_key=self._normalize_product_key,
+        )
 
     def _passes_s1_falling_framework_entry(self, product, iv_state):
-        cfg = self.config
-        if not cfg.get('s1_falling_framework_enabled', False):
-            return True
-        spread = iv_state.get('iv_rv_spread', np.nan)
-        ratio = iv_state.get('iv_rv_ratio', np.nan)
-        rv_trend = iv_state.get('rv_trend', np.nan)
-        iv_trend = iv_state.get('iv_trend', np.nan)
-        min_spread = float(cfg.get('vol_regime_min_iv_rv_spread', 0.02) or 0.0)
-        min_ratio = float(cfg.get('vol_regime_min_iv_rv_ratio', 1.10) or 0.0)
-        max_rv_trend = float(cfg.get('s1_entry_max_rv_trend', cfg.get('vol_regime_max_low_rv_trend', 0.02)) or 0.0)
-        max_iv_trend = float(cfg.get('s1_entry_max_iv_trend', 0.0) or 0.0)
-        if pd.isna(spread) or spread < min_spread:
-            return False
-        if pd.isna(ratio) or ratio < min_ratio:
-            return False
-        if pd.notna(rv_trend) and rv_trend > max_rv_trend:
-            return False
-        if pd.notna(iv_trend) and iv_trend > max_iv_trend:
-            return False
-        if self._current_vol_regimes.get(product) in ('high_rising_vol', 'post_stop_cooldown'):
-            return False
-        if not self._passes_s1_risk_release_entry(product, iv_state):
-            return False
-        return True
+        return vol_rules.passes_s1_falling_framework_entry(
+            self.config,
+            product=product,
+            iv_state=iv_state,
+            current_vol_regimes=self._current_vol_regimes,
+            iv_history=self._iv_history,
+        )
 
     def _passes_s1_risk_release_entry(self, product, iv_state):
-        cfg = self.config
-        if not cfg.get('s1_require_risk_release_entry', False):
-            return True
-
-        regime = self._current_vol_regimes.get(product)
-        if regime in ('high_rising_vol', 'post_stop_cooldown'):
-            return False
-
-        iv_pct = iv_state.get('iv_pct', np.nan)
-        spread = iv_state.get('iv_rv_spread', np.nan)
-        ratio = iv_state.get('iv_rv_ratio', np.nan)
-        rv_trend = iv_state.get('rv_trend', np.nan)
-        iv_trend = iv_state.get('iv_trend', np.nan)
-        allow_structural_low = bool(cfg.get('s1_risk_release_allow_structural_low', False))
-        is_structural_low = bool(iv_state.get('is_structural_low_iv', False))
-
-        if cfg.get('s1_risk_release_require_falling_regime', False):
-            if regime != 'falling_vol_carry':
-                if not (allow_structural_low and is_structural_low and regime == 'low_stable_vol'):
-                    return False
-
-        min_spread = float(cfg.get('s1_risk_release_min_iv_rv_spread',
-                                   cfg.get('vol_regime_min_iv_rv_spread', 0.02)) or 0.0)
-        min_ratio = float(cfg.get('s1_risk_release_min_iv_rv_ratio',
-                                  cfg.get('vol_regime_min_iv_rv_ratio', 1.10)) or 0.0)
-        if pd.isna(spread) or float(spread) < min_spread:
-            return False
-        if pd.isna(ratio) or float(ratio) < min_ratio:
-            return False
-
-        min_iv_pct = cfg.get('s1_risk_release_min_iv_pct', None)
-        max_iv_pct = cfg.get('s1_risk_release_max_iv_pct', None)
-        if min_iv_pct is not None and not (allow_structural_low and is_structural_low):
-            if pd.isna(iv_pct) or float(iv_pct) < float(min_iv_pct):
-                return False
-        if max_iv_pct is not None:
-            if pd.isna(iv_pct) or float(iv_pct) > float(max_iv_pct):
-                return False
-
-        max_iv_trend = float(cfg.get('s1_risk_release_max_iv_trend', -0.005) or 0.0)
-        if pd.isna(iv_trend) or float(iv_trend) > max_iv_trend:
-            return False
-        if bool(cfg.get('s1_risk_release_require_daily_iv_drop', True)):
-            if not self._product_iv_turns_lower(product):
-                return False
-
-        require_rv_trend = bool(cfg.get('s1_risk_release_require_rv_trend', True))
-        max_rv_trend = float(cfg.get('s1_risk_release_max_rv_trend',
-                                     cfg.get('s1_entry_max_rv_trend', 0.0)) or 0.0)
-        if pd.isna(rv_trend):
-            return not require_rv_trend
-        if float(rv_trend) > max_rv_trend:
-            return False
-        return True
+        return vol_rules.passes_s1_risk_release_entry(
+            self.config,
+            product=product,
+            iv_state=iv_state,
+            current_vol_regimes=self._current_vol_regimes,
+            iv_history=self._iv_history,
+        )
 
     def _candidate_cash_greeks(self, row, opt_type, mult, qty, role='sell'):
         sign = 1.0 if role in ('buy', 'protect') else -1.0
@@ -773,24 +535,9 @@ class ToolkitMinuteEngine:
         return max(0.0, 1.0 - nav / peak)
 
     def _recent_stop_count(self, date_str=None):
-        cfg = self.config
-        lookback_days = int(cfg.get('portfolio_stop_cluster_lookback_days', 5) or 0)
-        if lookback_days <= 0:
-            return 0
         if date_str is None:
             date_str = self._current_date_str
-        if not date_str:
-            return 0
-        cur_ts = pd.Timestamp(date_str)
-        count = 0
-        for dates in self._stop_history.values():
-            for stop_date in dates:
-                try:
-                    if (cur_ts - pd.Timestamp(stop_date)).days <= lookback_days:
-                        count += 1
-                except (TypeError, ValueError):
-                    continue
-        return count
+        return vol_rules.recent_stop_count(self.config, self._stop_history, date_str)
 
     def _pending_budget_fields(self, strategy_cap):
         budget = self._current_open_budget or self._get_effective_open_budget()
@@ -1230,19 +977,10 @@ class ToolkitMinuteEngine:
         return diversified
 
     def _prioritize_products_by_regime(self, products):
-        if not self.config.get('s1_falling_framework_enabled', False):
-            return list(products)
-        priority = {
-            'falling_vol_carry': 0,
-            'low_stable_vol': 1,
-            'normal_vol': 2,
-            'high_rising_vol': 3,
-            'post_stop_cooldown': 4,
-        }
-        order = {p: i for i, p in enumerate(products)}
-        return sorted(
-            list(products),
-            key=lambda p: (priority.get(self._current_vol_regimes.get(p, 'normal_vol'), 2), order.get(p, 0)),
+        return vol_rules.prioritize_products_by_regime(
+            self.config,
+            products,
+            self._current_vol_regimes,
         )
 
     def _build_product_like_sql(self, product_pool):
