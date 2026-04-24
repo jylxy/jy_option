@@ -17,7 +17,7 @@ import json
 import time
 import logging
 import argparse
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore', message='.*Above Max Price.*')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from toolkit.selector import select_bars_sql, select
+from toolkit.selector import select_bars_sql
 from option_calc import calc_iv_single, calc_greeks_single, calc_iv_batch, RISK_FREE_RATE
 from strategy_rules import (
     select_s1_sell, select_s1_protect,
@@ -48,7 +48,6 @@ from spot_provider import (
     build_underlying_alias_map,
     spot_tables_for_codes,
     map_alias_spot_frame,
-    resolve_alias_value_map,
     build_pcp_spot_frame,
 )
 from budget_model import (
@@ -77,332 +76,13 @@ from product_lifecycle import (
     update_first_trade_dates_from_frame,
     product_observation_ready,
 )
-from daily_aggregation import (
-    attach_contract_columns,
-    normalize_preloaded_daily_agg,
-    aggregate_minute_daily,
-    enrich_daily_with_spot_iv_delta,
-)
 from position_model import Position
-from runtime_paths import BASE_DIR, OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
+from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
-from trading_calendar import (
-    load_trading_dates_cache,
-    save_trading_dates_cache,
-    query_trading_dates,
-    filter_trading_dates,
-)
+from day_loader import ToolkitDayLoader
 
 logger = logging.getLogger(__name__)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 合约属性管理
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-
-class ToolkitDayLoader:
-    """从 toolkit 批量拉取分钟数据并聚合"""
-
-    def __init__(self, contract_info):
-        self._ci = contract_info
-        self._trading_dates = None
-        # 批量缓存
-        self._day_cache = {}  # 分钟明细：{date_str: DataFrame}
-        self._daily_agg_cache = {}  # 日频聚合：{date_str: DataFrame}
-        self._spot_daily_cache = {}  # {date_str: {underlying_code: last_close}}
-        self._batch_size = 5
-
-    def get_trading_dates(self, start_date=None, end_date=None):
-        """获取交易日列表"""
-        if self._trading_dates is None:
-            self._trading_dates = load_trading_dates_cache(CACHE_DIR, logger=logger)
-            if self._trading_dates is None:
-                logger.info("获取交易日列表...")
-                self._trading_dates = query_trading_dates(select_bars_sql)
-                logger.info("  共 %d 个交易日", len(self._trading_dates))
-                save_trading_dates_cache(CACHE_DIR, self._trading_dates, logger=logger)
-
-        return filter_trading_dates(self._trading_dates, start_date=start_date, end_date=end_date)
-
-    def preload_batch(self, dates, like_sql=None):
-        """
-        批量预加载多天的分钟数据到内存缓存。
-
-        一条SQL拉取多天数据，按date分组存入 _day_cache。
-        比逐天查询快 N 倍（N=天数）。
-
-        Args:
-            dates: 日期列表 ['2024-06-03', '2024-06-04', ...]
-            like_sql: 品种过滤条件（如 "ths_code LIKE 'M%.DCE' OR ths_code LIKE 'CU%.SHF'"）
-        """
-        # 过滤已缓存的日期
-        to_load = [d for d in dates if d not in self._day_cache]
-        if not to_load:
-            return
-
-        # 分批加载（避免单次查询太大）
-        chunk_size = self._batch_size
-        for i in range(0, len(to_load), chunk_size):
-            chunk = to_load[i:i + chunk_size]
-            date_list = ", ".join(f"'{d}'" for d in chunk)
-            where = f"date IN ({date_list})"
-            if like_sql:
-                where += f" AND ({like_sql})"
-
-            query = f"""
-                SELECT toString(date) as trade_date,
-                       ths_code, time, open, high, low, close, volume, open_interest
-                FROM option_hf_1min_non_ror
-                WHERE {where}
-            """
-            t0 = time.time()
-            df = select_bars_sql(query)
-            elapsed = time.time() - t0
-
-            if df is None or df.empty:
-                for d in chunk:
-                    self._day_cache[d] = pd.DataFrame()
-                logger.debug("  批量加载 %d天 无数据 (%.1fs)", len(chunk), elapsed)
-                continue
-
-            # 类型转换
-            for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            df = df[df['close'] > 0].copy()
-
-            # 按日期分组存入缓存
-            n_rows = len(df)
-            for d in chunk:
-                day_df = df[df['trade_date'] == d].drop(columns=['trade_date'], errors='ignore')
-                self._day_cache[d] = day_df
-            logger.debug("  批量加载 %d天 %d行 (%.1fs)", len(chunk), n_rows, elapsed)
-
-    def load_day_minute(self, date_str, like_sql=None, code_list=None):
-        """
-        加载某天的分钟数据。优先从缓存读取，缓存未命中则单独查询。
-        """
-        if code_list is not None and not any(code_list):
-            return pd.DataFrame()
-        if like_sql is None and not code_list and date_str in self._day_cache:
-            return self._day_cache[date_str].copy()
-
-        # 缓存未命中，单独查询
-        where = f"date = '{date_str}'"
-        if code_list:
-            code_sql = ", ".join(f"'{str(code)}'" for code in sorted({str(code) for code in code_list if code}))
-            if code_sql:
-                where += f" AND ths_code IN ({code_sql})"
-        elif like_sql:
-            where += f" AND ({like_sql})"
-        query = f"""
-            SELECT ths_code, time, open, high, low, close, volume, open_interest
-            FROM option_hf_1min_non_ror
-            WHERE {where}
-        """
-        df = select_bars_sql(query)
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        for col in ['open', 'high', 'low', 'close', 'volume', 'open_interest']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        df = df[df['close'] > 0].copy()
-        if like_sql is None and not code_list:
-            self._day_cache[date_str] = df
-        return df
-
-    def load_spot_day_minute(self, date_str, underlying_codes):
-        if not underlying_codes:
-            return pd.DataFrame()
-
-        alias_map = build_underlying_alias_map(underlying_codes)
-        lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
-        if not lookup_codes:
-            return pd.DataFrame()
-
-        code_sql = ", ".join(f"'{code}'" for code in lookup_codes)
-        frames = []
-        for table_name in self._spot_tables_for_codes(lookup_codes):
-            query = f"""
-                SELECT ths_code, time, close
-                FROM {table_name}
-                WHERE date = '{date_str}'
-                  AND ths_code IN ({code_sql})
-                  AND toFloat64OrZero(close) > 0
-            """
-            part = select_bars_sql(query)
-            if part is not None and not part.empty:
-                frames.append(part)
-        if not frames:
-            return pd.DataFrame()
-
-        return map_alias_spot_frame(
-            pd.concat(frames, ignore_index=True),
-            alias_map,
-            lookup_col='ths_code',
-            value_col='close',
-            sort_cols=['time'],
-        )
-
-    def clear_cache(self, keep_dates=None):
-        """清理缓存，释放内存。可选保留指定日期。"""
-        if keep_dates:
-            self._day_cache = {d: v for d, v in self._day_cache.items() if d in keep_dates}
-            self._daily_agg_cache = {d: v for d, v in self._daily_agg_cache.items() if d in keep_dates}
-            self._spot_daily_cache = {d: v for d, v in self._spot_daily_cache.items() if d in keep_dates}
-        else:
-            self._day_cache.clear()
-            self._daily_agg_cache.clear()
-            self._spot_daily_cache.clear()
-
-    def _query_spot_daily_table(self, table_name, date_str, code_list_sql):
-        query = f"""
-            SELECT
-                toString(date) as trade_date,
-                ths_code,
-                argMax(toFloat64OrZero(close), time) as last_close
-            FROM {table_name}
-            WHERE date = '{date_str}'
-              AND ths_code IN ({code_list_sql})
-              AND toFloat64OrZero(close) > 0
-            GROUP BY date, ths_code
-        """
-        return select_bars_sql(query)
-
-    def _spot_tables_for_codes(self, underlying_codes):
-        return spot_tables_for_codes(underlying_codes, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE)
-
-    def _get_spot_daily_close_map(self, date_str, underlying_codes):
-        if not underlying_codes:
-            return {}
-
-        cache = self._spot_daily_cache.setdefault(date_str, {})
-        missing = [code for code in sorted(set(underlying_codes)) if code and code not in cache]
-        if missing:
-            alias_map = build_underlying_alias_map(missing)
-            lookup_codes = sorted({alias for aliases in alias_map.values() for alias in aliases})
-            code_list_sql = ", ".join(f"'{code}'" for code in lookup_codes)
-            frames = []
-            for table_name in self._spot_tables_for_codes(lookup_codes):
-                df = self._query_spot_daily_table(table_name, date_str, code_list_sql)
-                if df is not None and not df.empty:
-                    frames.append(df)
-            if frames:
-                merged = pd.concat(frames, ignore_index=True)
-                merged['last_close'] = pd.to_numeric(merged['last_close'], errors='coerce')
-                merged = merged[merged['last_close'].notna() & (merged['last_close'] > 0)]
-                for _, row in merged.iterrows():
-                    cache[str(row['ths_code'])] = float(row['last_close'])
-            cache.update(resolve_alias_value_map(cache, alias_map))
-            for code in missing:
-                cache.setdefault(code, None)
-
-        return {
-            code: cache.get(code)
-            for code in underlying_codes
-            if cache.get(code) is not None and cache.get(code) > 0
-        }
-
-    def preload_daily_agg_batch(self, dates, like_sql, contract_info):
-        """
-        批量预加载多天的日频聚合数据（ClickHouse端聚合，不拉分钟明细）。
-
-        一条SQL完成：每天每合约的收盘价、成交量、持仓量。
-        比拉分钟明细再Python聚合快10倍+。
-        """
-        to_load = [d for d in dates if d not in self._daily_agg_cache]
-        if not to_load:
-            return
-
-        date_list = ", ".join(f"'{d}'" for d in to_load)
-        where = f"date IN ({date_list})"
-        if like_sql:
-            where += f" AND ({like_sql})"
-
-        query = f"""
-            SELECT
-                toString(date) as trade_date,
-                ths_code,
-                argMax(toFloat64OrZero(close), time) as last_close,
-                sum(toInt64OrZero(volume)) as total_volume,
-                argMax(toInt64OrZero(open_interest), time) as last_oi
-            FROM option_hf_1min_non_ror
-            WHERE {where}
-              AND toFloat64OrZero(close) > 0
-            GROUP BY date, ths_code
-        """
-        t0 = time.time()
-        df = select_bars_sql(query)
-        elapsed = time.time() - t0
-
-        if df is None or df.empty:
-            for d in to_load:
-                self._daily_agg_cache[d] = pd.DataFrame()
-            logger.debug("  日频聚合 %d天 无数据 (%.1fs)", len(to_load), elapsed)
-            return
-
-        # 类型转换
-        df['last_close'] = pd.to_numeric(df['last_close'], errors='coerce').fillna(0)
-        df['total_volume'] = pd.to_numeric(df['total_volume'], errors='coerce').fillna(0)
-        df['last_oi'] = pd.to_numeric(df['last_oi'], errors='coerce').fillna(0)
-
-        df = attach_contract_columns(df, contract_info)
-
-        # 过滤无效
-        df = df[(df['strike'] > 0) & (df['option_type'] != '') & (df['last_close'] > 0)].copy()
-
-        # 按日期分组存入缓存
-        n_rows = len(df)
-        for d in to_load:
-            day_df = df[df['trade_date'] == d].copy()
-            self._daily_agg_cache[d] = day_df
-        logger.debug("  日频聚合 %d天 %d行 (%.1fs)", len(to_load), n_rows, elapsed)
-
-    def get_daily_agg(self, date_str, contract_info):
-        """
-        获取某天的日频聚合数据，格式兼容 strategy_rules。
-        优先从缓存读取。包含 spot_close（put-call parity）、IV、delta。
-        """
-        if date_str in self._daily_agg_cache:
-            raw = self._daily_agg_cache[date_str]
-        else:
-            return pd.DataFrame()
-
-        if raw.empty:
-            return pd.DataFrame()
-
-        df = normalize_preloaded_daily_agg(raw, date_str, contract_info)
-        if df.empty:
-            return df
-
-        spot_map = self._get_spot_daily_close_map(
-            date_str,
-            [code for code in df['underlying_code'].dropna().tolist() if code]
-        )
-        return enrich_daily_with_spot_iv_delta(df, spot_map=spot_map, risk_free_rate=RISK_FREE_RATE)
-
-    def aggregate_daily(self, minute_df, date_str):
-        """
-        从分钟数据聚合成日频DataFrame，格式兼容 strategy_rules 选腿函数。
-        用 put-call parity 推算标的价格。
-        """
-        df = aggregate_minute_daily(minute_df, date_str, self._ci)
-        if df.empty:
-            return df
-
-        spot_map = self._get_spot_daily_close_map(
-            date_str,
-            [code for code in df['underlying_code'].dropna().tolist() if code]
-        )
-        return enrich_daily_with_spot_iv_delta(df, spot_map=spot_map, risk_free_rate=RISK_FREE_RATE)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 主引擎
-# ══════════════════════════════════════════════════════════════════════════════
 
 class ToolkitMinuteEngine:
     """基于 Toolkit 数据源的回测引擎"""
