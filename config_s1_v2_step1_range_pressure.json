@@ -1,5 +1,5 @@
 {
-  "strategy_version": "s1_v2_step1_range_pressure",
+  "strategy_version": "s1_v2_step1b_range_pressure_loose",
   "margin_ratio_by_product": {
     "510050": 0.12,
     "510300": 0.12,
@@ -52,9 +52,9 @@
   "s1_trend_rv_rising_threshold": 0.005,
   "s1_trend_range_pressure_enabled": true,
   "s1_trend_range_pressure_lookback": 20,
-  "s1_trend_range_pressure_upper": 0.80,
-  "s1_trend_range_pressure_lower": 0.20,
-  "s1_trend_range_pressure_min_short_ret": 0.004,
+  "s1_trend_range_pressure_upper": 0.70,
+  "s1_trend_range_pressure_lower": 0.30,
+  "s1_trend_range_pressure_min_short_ret": 0.002,
   "s1_trend_allow_weak_side": true,
   "s1_trend_weak_side_delta_cap": 0.060,
   "s1_trend_weak_side_score_mult": 0.60,
