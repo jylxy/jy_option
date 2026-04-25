@@ -146,6 +146,35 @@ class StrategyRulesTest(unittest.TestCase):
         self.assertEqual(up_state["trend_state"], "uptrend")
         self.assertGreater(up_state["trend_confidence"], 0.0)
 
+    def test_s1_trend_range_pressure_reclassifies_range_edges(self):
+        upper_edge = classify_s1_trend_confidence(
+            [-0.004, 0.002, -0.003, 0.001, 0.0005] * 3 + [0.004, 0.004, 0.004],
+            min_history=5,
+            trend_threshold=0.018,
+            range_threshold=0.020,
+            range_pressure_enabled=True,
+            range_pressure_lookback=18,
+            range_pressure_upper=0.75,
+            range_pressure_lower=0.25,
+            range_pressure_min_short_ret=0.004,
+        )
+        lower_edge = classify_s1_trend_confidence(
+            [0.004, -0.002, 0.003, -0.001, -0.0005] * 3 + [-0.004, -0.004, -0.004],
+            min_history=5,
+            trend_threshold=0.018,
+            range_threshold=0.020,
+            range_pressure_enabled=True,
+            range_pressure_lookback=18,
+            range_pressure_upper=0.75,
+            range_pressure_lower=0.25,
+            range_pressure_min_short_ret=0.004,
+        )
+
+        self.assertEqual(upper_edge["trend_state"], "uptrend")
+        self.assertEqual(upper_edge["trend_range_pressure"], "upper")
+        self.assertEqual(lower_edge["trend_state"], "downtrend")
+        self.assertEqual(lower_edge["trend_range_pressure"], "lower")
+
     def test_s1_trend_side_adjustment_makes_uptrend_call_weaker(self):
         call_adj = s1_trend_side_adjustment(
             "C",

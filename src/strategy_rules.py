@@ -343,7 +343,12 @@ def classify_s1_trend_confidence(returns, rv_trend=np.nan, *,
                                  long_lookback=20, min_history=10,
                                  trend_threshold=0.018,
                                  range_threshold=0.010,
-                                 rv_rising_threshold=0.015):
+                                 rv_rising_threshold=0.015,
+                                 range_pressure_enabled=False,
+                                 range_pressure_lookback=20,
+                                 range_pressure_upper=0.80,
+                                 range_pressure_lower=0.20,
+                                 range_pressure_min_short_ret=0.004):
     """Classify rough trend state from trailing underlying returns.
 
     This is deliberately a confidence gauge, not a directional forecast. It
@@ -368,6 +373,8 @@ def classify_s1_trend_confidence(returns, rv_trend=np.nan, *,
             "trend_short_ret": np.nan,
             "trend_medium_ret": np.nan,
             "trend_long_ret": np.nan,
+            "trend_range_position": np.nan,
+            "trend_range_pressure": "",
         }
 
     def trailing_sum(window):
@@ -402,6 +409,45 @@ def classify_s1_trend_confidence(returns, rv_trend=np.nan, *,
     else:
         state = "uncertain"
 
+    range_position = np.nan
+    range_pressure = ""
+    if range_pressure_enabled and state == "range_bound":
+        pressure_window = max(int(range_pressure_lookback or long_lookback or 1), 2)
+        pressure_values = values.tail(min(pressure_window, len(values)))
+        clipped = pressure_values.clip(lower=-0.95)
+        price_path = np.exp(np.log1p(clipped).cumsum())
+        if len(price_path) >= 2:
+            low = float(price_path.min())
+            high = float(price_path.max())
+            span = high - low
+            if span > 1e-12:
+                range_position = float((price_path.iloc[-1] - low) / span)
+                upper = min(max(float(range_pressure_upper or 0.80), 0.0), 1.0)
+                lower = min(max(float(range_pressure_lower or 0.20), 0.0), 1.0)
+                min_short_ret = max(float(range_pressure_min_short_ret or 0.0), 0.0)
+                if range_position >= upper and short_ret >= min_short_ret:
+                    state = "uptrend"
+                    range_pressure = "upper"
+                    edge_strength = (
+                        (range_position - upper) / max(1.0 - upper, 1e-12)
+                    )
+                    momentum_strength = min(abs(short_ret) / threshold, 1.0)
+                    confidence = max(
+                        confidence,
+                        min(1.0, 0.35 + 0.65 * (0.60 * edge_strength + 0.40 * momentum_strength)),
+                    )
+                elif range_position <= lower and short_ret <= -min_short_ret:
+                    state = "downtrend"
+                    range_pressure = "lower"
+                    edge_strength = (
+                        (lower - range_position) / max(lower, 1e-12)
+                    )
+                    momentum_strength = min(abs(short_ret) / threshold, 1.0)
+                    confidence = max(
+                        confidence,
+                        min(1.0, 0.35 + 0.65 * (0.60 * edge_strength + 0.40 * momentum_strength)),
+                    )
+
     rv_trend = _float_or_nan(rv_trend)
     if (
         state == "range_bound" and
@@ -418,6 +464,8 @@ def classify_s1_trend_confidence(returns, rv_trend=np.nan, *,
         "trend_short_ret": short_ret,
         "trend_medium_ret": medium_ret,
         "trend_long_ret": long_ret,
+        "trend_range_position": range_position,
+        "trend_range_pressure": range_pressure,
     }
 
 

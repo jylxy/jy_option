@@ -834,6 +834,14 @@ class ToolkitMinuteEngine:
             trend_threshold=self.config.get('s1_trend_threshold', 0.018),
             range_threshold=self.config.get('s1_trend_range_threshold', 0.010),
             rv_rising_threshold=self.config.get('s1_trend_rv_rising_threshold', 0.015),
+            range_pressure_enabled=bool(self.config.get('s1_trend_range_pressure_enabled', False)),
+            range_pressure_lookback=self.config.get('s1_trend_range_pressure_lookback', 20),
+            range_pressure_upper=self.config.get('s1_trend_range_pressure_upper', 0.80),
+            range_pressure_lower=self.config.get('s1_trend_range_pressure_lower', 0.20),
+            range_pressure_min_short_ret=self.config.get(
+                's1_trend_range_pressure_min_short_ret',
+                0.004,
+            ),
         )
 
     def _get_open_concentration_state(self, include_pending=True):
@@ -1191,6 +1199,8 @@ class ToolkitMinuteEngine:
                 'trend_state': item.get('trend_state', ''),
                 'trend_score': item.get('trend_score', np.nan),
                 'trend_confidence': item.get('trend_confidence', np.nan),
+                'trend_range_position': item.get('trend_range_position', np.nan),
+                'trend_range_pressure': item.get('trend_range_pressure', ''),
                 'trend_role': item.get('trend_role', ''),
                 'side_score_mult': item.get('side_score_mult', np.nan),
                 'side_budget_mult': item.get('side_budget_mult', np.nan),
@@ -2333,6 +2343,14 @@ class ToolkitMinuteEngine:
                 'trend_state': side_meta.get('trend_state', c.get('trend_state', '')),
                 'trend_score': side_meta.get('trend_score', c.get('trend_score', np.nan)),
                 'trend_confidence': side_meta.get('trend_confidence', c.get('trend_confidence', np.nan)),
+                'trend_range_position': side_meta.get(
+                    'trend_range_position',
+                    c.get('trend_range_position', np.nan),
+                ),
+                'trend_range_pressure': side_meta.get(
+                    'trend_range_pressure',
+                    c.get('trend_range_pressure', ''),
+                ),
                 'trend_role': side_meta.get('trend_role', c.get('trend_role', '')),
                 'side_score_mult': side_meta.get('score_mult', c.get('side_score_mult', np.nan)),
                 'side_budget_mult': side_budget_mult,
