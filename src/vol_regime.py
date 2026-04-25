@@ -325,6 +325,10 @@ def refresh_vol_regime_state(config, *, current_iv_state, reentry_plans,
     high_ratio = counts.get(HIGH_RISING_VOL, 0) / active if active else 0.0
     low_ratio = counts.get(LOW_STABLE_VOL, 0) / active if active else 0.0
     falling_ratio = counts.get(FALLING_VOL_CARRY, 0) / active if active else 0.0
+    release_ratio = (
+        (counts.get(FALLING_VOL_CARRY, 0) + counts.get(LOW_STABLE_VOL, 0)) / active
+        if active else 0.0
+    )
 
     count_post_stop_as_high = bool(config.get("vol_regime_count_post_stop_as_high", False))
     if (
@@ -332,6 +336,17 @@ def refresh_vol_regime_state(config, *, current_iv_state, reentry_plans,
         counts.get(POST_STOP_COOLDOWN, 0) >= int(config.get("vol_regime_portfolio_stop_count", 3) or 3)
     ):
         portfolio_regime = HIGH_RISING_VOL
+    elif (
+        config.get("vol_regime_portfolio_falling_release_enabled", False) and
+        counts.get(FALLING_VOL_CARRY, 0) >= int(
+            config.get("vol_regime_portfolio_falling_release_min_products", 1) or 1
+        ) and
+        release_ratio >= float(config.get("vol_regime_portfolio_falling_release_ratio", 0.30) or 0.30) and
+        high_ratio <= float(
+            config.get("vol_regime_portfolio_falling_release_high_ratio_max", 0.35) or 0.35
+        )
+    ):
+        portfolio_regime = FALLING_VOL_CARRY
     elif high_ratio >= float(config.get("vol_regime_portfolio_high_ratio", 0.25) or 0.25):
         portfolio_regime = HIGH_RISING_VOL
     elif falling_ratio >= float(config.get("vol_regime_portfolio_falling_ratio", 0.25) or 0.25):

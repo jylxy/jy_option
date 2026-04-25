@@ -163,6 +163,67 @@ class VolRegimeTest(unittest.TestCase):
         self.assertEqual(counts[vr.POST_STOP_COOLDOWN], 1)
         self.assertEqual(portfolio, vr.LOW_STABLE_VOL)
 
+    def test_portfolio_falling_release_can_override_moderate_high_ratio(self):
+        cfg = self.base_config()
+        states = {}
+        states["FALL"] = {
+            "iv_pct": 55,
+            "iv_rv_spread": 0.03,
+            "iv_rv_ratio": 1.2,
+            "iv_trend": -0.02,
+            "rv_trend": 0.0,
+        }
+        for idx in range(3):
+            states[f"LOW{idx}"] = {
+                "iv_pct": 35,
+                "iv_rv_spread": 0.03,
+                "iv_rv_ratio": 1.2,
+                "iv_trend": -0.001,
+                "rv_trend": 0.0,
+            }
+        for idx in range(5):
+            states[f"NORM{idx}"] = {
+                "iv_pct": 55,
+                "iv_rv_spread": 0.03,
+                "iv_rv_ratio": 1.2,
+                "iv_trend": 0.0,
+                "rv_trend": 0.0,
+            }
+        for idx in range(3):
+            states[f"HIGH{idx}"] = {
+                "iv_pct": 80,
+                "iv_rv_spread": 0.03,
+                "iv_rv_ratio": 1.2,
+                "iv_trend": 0.0,
+                "rv_trend": 0.0,
+            }
+
+        _, _, default_portfolio = vr.refresh_vol_regime_state(
+            cfg,
+            current_iv_state=states,
+            reentry_plans={},
+            iv_history={},
+            normalize_product_key=norm,
+            date_str="2025-05-08",
+        )
+        self.assertEqual(default_portfolio, vr.HIGH_RISING_VOL)
+
+        cfg.update({
+            "vol_regime_portfolio_falling_release_enabled": True,
+            "vol_regime_portfolio_falling_release_ratio": 0.30,
+            "vol_regime_portfolio_falling_release_high_ratio_max": 0.35,
+            "vol_regime_portfolio_falling_release_min_products": 1,
+        })
+        _, _, release_portfolio = vr.refresh_vol_regime_state(
+            cfg,
+            current_iv_state=states,
+            reentry_plans={},
+            iv_history={},
+            normalize_product_key=norm,
+            date_str="2025-05-08",
+        )
+        self.assertEqual(release_portfolio, vr.FALLING_VOL_CARRY)
+
     def test_structural_low_iv_product_can_raise_low_vol_multiplier(self):
         cfg = self.base_config()
         cfg.update({
