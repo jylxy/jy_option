@@ -41,6 +41,7 @@ from strategy_rules import (
     should_allow_open_low_iv_product, calc_stats,
     choose_s1_option_sides, choose_s1_trend_confidence_sides,
     classify_s1_trend_confidence, s1_trend_side_adjustment,
+    s1_forward_vega_quality_filter,
     DEFAULT_PARAMS,
 )
 from margin_model import estimate_margin, resolve_margin_ratio
@@ -138,7 +139,10 @@ class ToolkitMinuteEngine:
         'vol_regime', 'selection_score', 'selection_rank',
         'entry_atm_iv', 'entry_iv_pct', 'entry_iv_trend', 'entry_rv_trend',
         'entry_iv_rv_spread', 'entry_iv_rv_ratio',
-        'contract_iv', 'contract_iv_change_1d', 'contract_price_change_1d',
+        'contract_iv', 'contract_iv_change_1d', 'contract_iv_change_3d',
+        'contract_iv_change_5d', 'contract_iv_change_for_vega',
+        'contract_iv_skew_to_atm', 'contract_skew_change_for_vega',
+        'contract_price_change_1d',
         'effective_margin_cap', 'effective_strategy_margin_cap',
         'effective_product_margin_cap', 'effective_bucket_margin_cap',
         'effective_stress_loss_cap', 'effective_bucket_stress_loss_cap',
@@ -300,8 +304,12 @@ class ToolkitMinuteEngine:
         state = {
             'contract_iv': np.nan,
             'contract_iv_change_1d': np.nan,
+            'contract_iv_change_3d': np.nan,
+            'contract_iv_change_5d': np.nan,
             'contract_price': np.nan,
             'contract_price_change_1d': np.nan,
+            'contract_price_change_3d': np.nan,
+            'contract_price_change_5d': np.nan,
         }
         if not hist:
             return state
@@ -317,6 +325,13 @@ class ToolkitMinuteEngine:
             prev = float(prices.iloc[-2])
             if prev > 0:
                 state['contract_price_change_1d'] = float(prices.iloc[-1] / prev - 1.0)
+        for lookback in (3, 5):
+            if len(ivs) > lookback and pd.notna(ivs.iloc[-1]) and pd.notna(ivs.iloc[-1 - lookback]):
+                state[f'contract_iv_change_{lookback}d'] = float(ivs.iloc[-1] - ivs.iloc[-1 - lookback])
+            if len(prices) > lookback and pd.notna(prices.iloc[-1]) and pd.notna(prices.iloc[-1 - lookback]):
+                prev = float(prices.iloc[-1 - lookback])
+                if prev > 0:
+                    state[f'contract_price_change_{lookback}d'] = float(prices.iloc[-1] / prev - 1.0)
         return state
 
     def _prepare_s1_selection_frame(self, ef, option_type):
@@ -350,6 +365,23 @@ class ToolkitMinuteEngine:
             side = side[known_ok | missing_ok].copy()
 
         return side
+
+    def _filter_s1_forward_vega_candidates(self, candidates, product, ot,
+                                           iv_state=None, side_meta=None):
+        """Apply causal wing-IV quality gates before committing S1 short vega."""
+        iv_context = dict(iv_state or {})
+        iv_context['vol_regime'] = self._current_vol_regimes.get(product, '')
+        filtered, stats = s1_forward_vega_quality_filter(
+            candidates,
+            ot,
+            iv_state=iv_context,
+            side_meta=side_meta or {},
+            config=self.config,
+        )
+        for key, value in stats.items():
+            if value:
+                self._bump_s1_funnel(key, value)
+        return filtered
 
     def _has_active_reentry_plan(self, product, date_str, base_regime=None):
         return vol_rules.has_active_reentry_plan(
@@ -1215,6 +1247,11 @@ class ToolkitMinuteEngine:
                 'entry_iv_rv_ratio': item.get('entry_iv_rv_ratio', np.nan),
                 'contract_iv': item.get('contract_iv', np.nan),
                 'contract_iv_change_1d': item.get('contract_iv_change_1d', np.nan),
+                'contract_iv_change_3d': item.get('contract_iv_change_3d', np.nan),
+                'contract_iv_change_5d': item.get('contract_iv_change_5d', np.nan),
+                'contract_iv_change_for_vega': item.get('contract_iv_change_for_vega', np.nan),
+                'contract_iv_skew_to_atm': item.get('contract_iv_skew_to_atm', np.nan),
+                'contract_skew_change_for_vega': item.get('contract_skew_change_for_vega', np.nan),
                 'contract_price_change_1d': item.get('contract_price_change_1d', np.nan),
                 'effective_margin_cap': item.get('effective_margin_cap', np.nan),
                 'effective_strategy_margin_cap': item.get('effective_strategy_margin_cap', np.nan),
@@ -2105,6 +2142,12 @@ class ToolkitMinuteEngine:
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
                                    min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
+        candidate_multiplier = 3
+        if self.config.get('s1_forward_vega_filter_enabled', False):
+            candidate_multiplier = max(
+                candidate_multiplier,
+                int(self.config.get('s1_forward_vega_candidate_multiplier', 8) or 8),
+            )
         return select_s1_sell(
             s1_frame, ot, mult, mr,
             min_volume=int(self.config.get('s1_min_volume', 0)),
@@ -2127,7 +2170,7 @@ class ToolkitMinuteEngine:
             liquidity_weight=float(self.config.get('s1_score_liquidity_weight', 0.05) or 0.0),
             delta_weight=float(self.config.get('s1_score_delta_weight', 0.0) or 0.0),
             return_candidates=True,
-            max_candidates=max_candidates * 3,
+            max_candidates=max_candidates * candidate_multiplier,
             exchange=exchange,
             product=product,
         )
@@ -2175,6 +2218,18 @@ class ToolkitMinuteEngine:
                 ef, product, ot, mult, mr, exchange,
                 min_abs_delta, delta_cap, max_candidates,
             )
+            filter_meta = {
+                **trend_info,
+                **adjustment,
+                'delta_cap': delta_cap,
+            }
+            candidates = self._filter_s1_forward_vega_candidates(
+                candidates,
+                product,
+                ot,
+                iv_state=iv_state,
+                side_meta=filter_meta,
+            )
             if candidates is None or candidates.empty:
                 self._bump_s1_funnel('side_no_candidates')
                 continue
@@ -2210,11 +2265,7 @@ class ToolkitMinuteEngine:
                 candidates['side_budget_mult'] = float(adjustment.get('budget_mult', 1.0) or 0.0)
             side_frames[ot] = candidates
             side_candidates[ot] = candidates.iloc[0]
-            side_meta[ot] = {
-                **trend_info,
-                **adjustment,
-                'delta_cap': delta_cap,
-            }
+            side_meta[ot] = filter_meta
 
         momentum = self._recent_product_momentum(
             product,
@@ -2292,6 +2343,13 @@ class ToolkitMinuteEngine:
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
                 min_abs_delta, delta_cap, max_candidates,
+            )
+            candidates = self._filter_s1_forward_vega_candidates(
+                candidates,
+                product,
+                ot,
+                iv_state=iv_state,
+                side_meta=side_meta,
             )
         else:
             candidates = preselected_candidates.copy()
@@ -2438,6 +2496,11 @@ class ToolkitMinuteEngine:
                 'entry_iv_rv_ratio': iv_state.get('iv_rv_ratio', np.nan),
                 'contract_iv': c.get('contract_iv', np.nan),
                 'contract_iv_change_1d': c.get('contract_iv_change_1d', np.nan),
+                'contract_iv_change_3d': c.get('contract_iv_change_3d', np.nan),
+                'contract_iv_change_5d': c.get('contract_iv_change_5d', np.nan),
+                'contract_iv_change_for_vega': c.get('contract_iv_change_for_vega', np.nan),
+                'contract_iv_skew_to_atm': c.get('contract_iv_skew_to_atm', np.nan),
+                'contract_skew_change_for_vega': c.get('contract_skew_change_for_vega', np.nan),
                 'contract_price_change_1d': c.get('contract_price_change_1d', np.nan),
                 'trend_state': side_meta.get('trend_state', c.get('trend_state', '')),
                 'trend_score': side_meta.get('trend_score', c.get('trend_score', np.nan)),

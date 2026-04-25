@@ -14,6 +14,7 @@ from strategy_rules import (  # noqa: E402
     choose_s1_trend_confidence_sides,
     classify_s1_trend_confidence,
     s1_trend_side_adjustment,
+    s1_forward_vega_quality_filter,
     select_s1_sell,
 )
 
@@ -218,6 +219,72 @@ class StrategyRulesTest(unittest.TestCase):
 
         self.assertEqual(range_choice, ["P", "C"])
         self.assertEqual(uptrend_choice, ["P", "C"])
+
+    def test_forward_vega_filter_blocks_wing_iv_steepening(self):
+        candidates = pd.DataFrame([
+            {
+                "option_code": "GOOD",
+                "contract_iv": 0.24,
+                "contract_iv_change_5d": -0.020,
+                "contract_price_change_1d": -0.10,
+            },
+            {
+                "option_code": "BAD",
+                "contract_iv": 0.28,
+                "contract_iv_change_5d": 0.004,
+                "contract_price_change_1d": 0.05,
+            },
+        ])
+
+        filtered, stats = s1_forward_vega_quality_filter(
+            candidates,
+            "C",
+            iv_state={"atm_iv": 0.20, "iv_trend": -0.010, "rv_trend": -0.002},
+            side_meta={},
+            config={
+                "s1_forward_vega_filter_enabled": True,
+                "s1_forward_vega_contract_iv_lookback": 5,
+                "s1_forward_vega_contract_iv_max_change": 0.0,
+                "s1_forward_vega_max_skew_steepen": 0.005,
+            },
+        )
+
+        self.assertEqual(filtered["option_code"].tolist(), ["GOOD"])
+        self.assertEqual(int(stats["skip_forward_vega_contract_iv"]), 1)
+
+    def test_forward_vega_filter_blocks_structural_low_breakout_pressure(self):
+        candidates = pd.DataFrame([
+            {
+                "option_code": "VCP_CALL",
+                "contract_iv": 0.15,
+                "contract_iv_change_5d": -0.010,
+            }
+        ])
+
+        filtered, stats = s1_forward_vega_quality_filter(
+            candidates,
+            "C",
+            iv_state={
+                "atm_iv": 0.14,
+                "iv_trend": -0.010,
+                "rv_trend": 0.002,
+                "is_structural_low_iv": True,
+                "vol_regime": "low_stable_vol",
+            },
+            side_meta={
+                "trend_state": "uptrend",
+                "trend_confidence": 0.70,
+                "trend_range_pressure": "upper",
+            },
+            config={
+                "s1_forward_vega_filter_enabled": True,
+                "s1_forward_vega_contract_iv_lookback": 5,
+                "s1_forward_vega_block_structural_low_breakout": True,
+            },
+        )
+
+        self.assertTrue(filtered.empty)
+        self.assertEqual(int(stats["skip_forward_vega_vcp"]), 1)
 
 
 if __name__ == "__main__":

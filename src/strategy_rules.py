@@ -7,6 +7,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 from scipy.stats import percentileofscore
@@ -128,6 +130,24 @@ DEFAULT_PARAMS = {
     "s1_contract_iv_missing_policy": "skip",
     "s1_require_contract_price_not_rising": False,
     "s1_contract_price_max_change_1d": 0.10,
+    "s1_forward_vega_filter_enabled": False,
+    "s1_forward_vega_missing_policy": "skip",
+    "s1_forward_vega_candidate_multiplier": 8,
+    "s1_forward_vega_contract_iv_lookback": 5,
+    "s1_forward_vega_require_contract_iv_falling": True,
+    "s1_forward_vega_contract_iv_max_change": 0.0,
+    "s1_forward_vega_require_atm_iv_not_rising": True,
+    "s1_forward_vega_atm_iv_max_trend": 0.0,
+    "s1_forward_vega_require_rv_not_rising": True,
+    "s1_forward_vega_rv_max_trend": 0.01,
+    "s1_forward_vega_require_skew_not_steepening": True,
+    "s1_forward_vega_max_skew_steepen": 0.005,
+    "s1_forward_vega_require_contract_price_not_rising": False,
+    "s1_forward_vega_contract_price_max_change": 0.10,
+    "s1_forward_vega_block_structural_low_breakout": True,
+    "s1_forward_vega_structural_low_max_rv_trend": 0.0,
+    "s1_forward_vega_structural_low_block_pressure": True,
+    "s1_forward_vega_structural_low_min_trend_confidence": 0.35,
     "s1_use_stress_score": False,
     "s1_min_premium_fee_multiple": 2.0,
     "s1_stress_spot_move_pct": 0.03,
@@ -1455,6 +1475,157 @@ def should_allow_open_low_iv_product(product, iv_pct, feature_state,
     if max_rv_trend is not None and pd.notna(rv_trend) and rv_trend > float(max_rv_trend):
         return False
     return True
+
+
+def s1_forward_vega_quality_filter(candidates, option_type, *, iv_state=None,
+                                   side_meta=None, config=None):
+    """Filter S1 candidates whose wing IV quality does not support short vega.
+
+    The filter is causal: it only uses signal-date ATM IV, contract IV history,
+    realized-vol trend, and trailing trend pressure.  It deliberately checks the
+    actual wing contract, because ATM IV falling is not enough for a short-vega
+    trade when skew is steepening.
+    """
+    stats = defaultdict(float)
+    if candidates is None or candidates.empty:
+        return candidates, stats
+
+    cfg = config or {}
+    if not cfg.get("s1_forward_vega_filter_enabled", False):
+        return candidates, stats
+
+    df = candidates.copy()
+    mask = pd.Series(True, index=df.index)
+    policy = str(cfg.get("s1_forward_vega_missing_policy", "skip") or "skip").lower()
+
+    def finite_number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        return value if np.isfinite(value) else np.nan
+
+    def numeric_col(name, default=np.nan):
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce")
+        return pd.Series(default, index=df.index, dtype=float)
+
+    def apply_rule(rule_ok, key):
+        nonlocal mask
+        rule_ok = pd.Series(rule_ok, index=df.index).fillna(False)
+        failed = mask & ~rule_ok
+        stats[key] += float(failed.sum())
+        mask = mask & rule_ok
+
+    def threshold_rule(values, max_value):
+        values = pd.to_numeric(values, errors="coerce")
+        known_ok = values.notna() & (values <= float(max_value))
+        missing_ok = values.isna() & (policy != "skip")
+        return known_ok | missing_ok
+
+    lookback = max(1, int(cfg.get("s1_forward_vega_contract_iv_lookback", 5) or 1))
+    contract_change_col = f"contract_iv_change_{lookback}d"
+    if contract_change_col in df.columns:
+        contract_iv_change = numeric_col(contract_change_col)
+    else:
+        contract_iv_change = numeric_col("contract_iv_change_1d")
+    df["contract_iv_change_for_vega"] = contract_iv_change
+
+    atm_iv = finite_number((iv_state or {}).get("atm_iv", np.nan))
+    atm_trend = finite_number((iv_state or {}).get("iv_trend", np.nan))
+    rv_trend = finite_number((iv_state or {}).get("rv_trend", np.nan))
+    contract_iv = numeric_col("contract_iv")
+    if np.isfinite(atm_iv):
+        df["contract_iv_skew_to_atm"] = contract_iv - atm_iv
+    else:
+        df["contract_iv_skew_to_atm"] = np.nan
+    if np.isfinite(atm_trend):
+        df["contract_skew_change_for_vega"] = contract_iv_change - atm_trend
+    else:
+        df["contract_skew_change_for_vega"] = np.nan
+
+    if cfg.get("s1_forward_vega_require_contract_iv_falling", True):
+        apply_rule(
+            threshold_rule(
+                contract_iv_change,
+                cfg.get("s1_forward_vega_contract_iv_max_change", 0.0),
+            ),
+            "skip_forward_vega_contract_iv",
+        )
+
+    if cfg.get("s1_forward_vega_require_atm_iv_not_rising", True):
+        if np.isfinite(atm_trend):
+            rule = pd.Series(
+                atm_trend <= float(cfg.get("s1_forward_vega_atm_iv_max_trend", 0.0) or 0.0),
+                index=df.index,
+            )
+        else:
+            rule = pd.Series(policy != "skip", index=df.index)
+        apply_rule(rule, "skip_forward_vega_atm_iv")
+
+    if cfg.get("s1_forward_vega_require_rv_not_rising", True):
+        if np.isfinite(rv_trend):
+            rule = pd.Series(
+                rv_trend <= float(cfg.get("s1_forward_vega_rv_max_trend", 0.01) or 0.0),
+                index=df.index,
+            )
+        else:
+            rule = pd.Series(policy != "skip", index=df.index)
+        apply_rule(rule, "skip_forward_vega_rv")
+
+    if cfg.get("s1_forward_vega_require_skew_not_steepening", True):
+        apply_rule(
+            threshold_rule(
+                df["contract_skew_change_for_vega"],
+                cfg.get("s1_forward_vega_max_skew_steepen", 0.005),
+            ),
+            "skip_forward_vega_skew",
+        )
+
+    if cfg.get("s1_forward_vega_require_contract_price_not_rising", False):
+        price_change = numeric_col("contract_price_change_1d")
+        apply_rule(
+            threshold_rule(
+                price_change,
+                cfg.get("s1_forward_vega_contract_price_max_change", 0.10),
+            ),
+            "skip_forward_vega_price",
+        )
+
+    if cfg.get("s1_forward_vega_block_structural_low_breakout", True):
+        iv_state = iv_state or {}
+        side_meta = side_meta or {}
+        regime = str(iv_state.get("vol_regime", "") or "").lower()
+        structural_low = bool(iv_state.get("is_structural_low_iv", False))
+        if structural_low and not regime.startswith("falling"):
+            block = False
+            if np.isfinite(rv_trend):
+                max_rv = float(
+                    cfg.get("s1_forward_vega_structural_low_max_rv_trend", 0.0) or 0.0
+                )
+                block = block or rv_trend > max_rv
+            if cfg.get("s1_forward_vega_structural_low_block_pressure", True):
+                pressure = str(side_meta.get("trend_range_pressure", "") or "").lower()
+                trend_state = str(side_meta.get("trend_state", "") or "").lower()
+                confidence = finite_number(side_meta.get("trend_confidence", np.nan))
+                min_conf = float(
+                    cfg.get("s1_forward_vega_structural_low_min_trend_confidence", 0.35) or 0.0
+                )
+                opt = str(option_type or "").upper()[:1]
+                call_pressure = pressure == "upper" or (
+                    trend_state == "uptrend" and np.isfinite(confidence) and confidence >= min_conf
+                )
+                put_pressure = pressure == "lower" or (
+                    trend_state == "downtrend" and np.isfinite(confidence) and confidence >= min_conf
+                )
+                block = block or (opt == "C" and call_pressure) or (opt == "P" and put_pressure)
+            if block:
+                apply_rule(pd.Series(False, index=df.index), "skip_forward_vega_vcp")
+
+    filtered = df[mask].copy()
+    stats["forward_vega_candidates_before"] += float(len(df))
+    stats["forward_vega_candidates_after"] += float(len(filtered))
+    return filtered, stats
 
 
 def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
