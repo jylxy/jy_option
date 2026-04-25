@@ -13,6 +13,7 @@ from strategy_rules import (  # noqa: E402
     choose_s1_option_sides,
     choose_s1_trend_confidence_sides,
     classify_s1_trend_confidence,
+    calc_s1_stress_loss,
     s1_trend_side_adjustment,
     s1_forward_vega_quality_filter,
     select_s1_sell,
@@ -20,6 +21,24 @@ from strategy_rules import (  # noqa: E402
 
 
 class StrategyRulesTest(unittest.TestCase):
+    def test_s1_stress_loss_uses_premium_tail_floor(self):
+        row = {
+            "option_close": 100.0,
+            "spot_close": 1000.0,
+            "delta": 0.0,
+            "gamma": 0.0,
+            "vega": 0.0,
+        }
+
+        loss = calc_s1_stress_loss(
+            row,
+            "P",
+            mult=2,
+            premium_loss_multiple=5.0,
+        )
+
+        self.assertEqual(loss, 1000.0)
+
     def test_s1_risk_reward_ranking_can_override_target_delta(self):
         rows = pd.DataFrame([
             {

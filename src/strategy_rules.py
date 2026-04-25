@@ -144,6 +144,7 @@ DEFAULT_PARAMS = {
     "s1_forward_vega_filter_enabled": False,
     "s1_forward_vega_missing_policy": "skip",
     "s1_forward_vega_candidate_multiplier": 8,
+    "s1_forward_vega_falling_candidate_multiplier": 0,
     "s1_forward_vega_contract_iv_lookback": 5,
     "s1_forward_vega_require_contract_iv_falling": True,
     "s1_forward_vega_contract_iv_max_change": 0.0,
@@ -163,12 +164,14 @@ DEFAULT_PARAMS = {
     "s1_min_premium_fee_multiple": 2.0,
     "s1_stress_spot_move_pct": 0.03,
     "s1_stress_iv_up_points": 5.0,
+    "s1_stress_premium_loss_multiple": 0.0,
     "s1_use_stress_sizing": False,
     "s1_stress_loss_budget_pct": 0.0010,
     "s1_stress_min_qty": 1,
     "s1_stress_max_qty": 50,
     "s1_product_regime_budget_overrides_enabled": False,
     "s1_product_regime_budget_override_prefixes": ["falling"],
+    "s1_product_regime_budget_clamp_non_release_enabled": False,
     "s1_gamma_penalty": 0.0,
     "s1_vega_penalty": 0.0,
     "s1_falling_vol_margin_per_mult": 1.50,
@@ -1071,7 +1074,7 @@ def calc_s1_size(nav, margin_per, single_margin, iv_scale):
 
 
 def calc_s1_stress_loss(row, option_type, mult, spot_move_pct=0.03,
-                        iv_up_points=5.0):
+                        iv_up_points=5.0, premium_loss_multiple=0.0):
     """Estimate one-contract short-option stress loss with delta/gamma/vega."""
     spot = float(row.get("spot_close", 0.0) or 0.0)
     if spot <= 0:
@@ -1082,7 +1085,12 @@ def calc_s1_stress_loss(row, option_type, mult, spot_move_pct=0.03,
     move = max(float(spot_move_pct or 0.0), 0.0)
     ds = -spot * move if option_type == "P" else spot * move
     long_change = delta * ds + 0.5 * gamma * ds * ds + vega * float(iv_up_points or 0.0)
-    return max(float(long_change), 0.0) * float(mult)
+    greek_loss = max(float(long_change), 0.0) * float(mult)
+    premium_loss_multiple = max(float(premium_loss_multiple or 0.0), 0.0)
+    if premium_loss_multiple <= 0:
+        return greek_loss
+    premium = float(row.get("option_close", 0.0) or 0.0) * float(mult)
+    return max(greek_loss, premium * premium_loss_multiple)
 
 
 def calc_s1_stress_size(nav, stress_budget_pct, one_contract_stress_loss,
@@ -1652,6 +1660,7 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                    roundtrip_fee_per_contract=None,
                    min_premium_fee_multiple=0.0, use_stress_score=False,
                    stress_spot_move_pct=0.03, stress_iv_up_points=5.0,
+                   stress_premium_loss_multiple=0.0,
                    gamma_penalty=0.0, vega_penalty=0.0,
                    ranking_mode="target_delta",
                    premium_stress_weight=0.55,
@@ -1736,6 +1745,7 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             r, option_type, mult,
             spot_move_pct=stress_spot_move_pct,
             iv_up_points=stress_iv_up_points,
+            premium_loss_multiple=stress_premium_loss_multiple,
         ),
         axis=1,
     )

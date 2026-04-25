@@ -53,8 +53,13 @@ class S1LadderShapeTest(unittest.TestCase):
             "s1_product_regime_budget_overrides_enabled": True,
             "s1_product_regime_budget_override_prefixes": ["falling"],
             "vol_regime_falling_product_margin_cap": 0.12,
+            "vol_regime_falling_product_side_margin_cap": 0.06,
             "vol_regime_falling_bucket_margin_cap": 0.24,
+            "vol_regime_falling_corr_group_margin_cap": 0.15,
             "vol_regime_falling_bucket_stress_loss_cap": 0.006,
+            "vol_regime_falling_product_side_stress_loss_cap": 0.003,
+            "vol_regime_falling_corr_group_stress_loss_cap": 0.004,
+            "vol_regime_falling_contract_stress_loss_cap": 0.002,
         }
         engine = self.make_engine(
             config,
@@ -64,9 +69,14 @@ class S1LadderShapeTest(unittest.TestCase):
             "margin_cap": 0.50,
             "s1_margin_cap": 0.25,
             "product_margin_cap": 0.08,
+            "product_side_margin_cap": 0.04,
             "bucket_margin_cap": 0.18,
+            "corr_group_margin_cap": 0.10,
             "portfolio_stress_loss_cap": 0.015,
             "portfolio_bucket_stress_loss_cap": 0.004,
+            "product_side_stress_loss_cap": 0.002,
+            "corr_group_stress_loss_cap": 0.003,
+            "contract_stress_loss_cap": 0.001,
             "s1_stress_loss_budget_pct": 0.0012,
         }
 
@@ -74,11 +84,42 @@ class S1LadderShapeTest(unittest.TestCase):
         normal_budget = engine._product_regime_open_budget("AU", base_budget)
 
         self.assertAlmostEqual(falling_budget["product_margin_cap"], 0.12)
+        self.assertAlmostEqual(falling_budget["product_side_margin_cap"], 0.06)
         self.assertAlmostEqual(falling_budget["bucket_margin_cap"], 0.24)
+        self.assertAlmostEqual(falling_budget["corr_group_margin_cap"], 0.15)
         self.assertAlmostEqual(falling_budget["portfolio_bucket_stress_loss_cap"], 0.006)
+        self.assertAlmostEqual(falling_budget["product_side_stress_loss_cap"], 0.003)
+        self.assertAlmostEqual(falling_budget["corr_group_stress_loss_cap"], 0.004)
+        self.assertAlmostEqual(falling_budget["contract_stress_loss_cap"], 0.002)
         self.assertAlmostEqual(normal_budget["product_margin_cap"], 0.08)
         self.assertAlmostEqual(normal_budget["bucket_margin_cap"], 0.18)
         self.assertAlmostEqual(normal_budget["portfolio_bucket_stress_loss_cap"], 0.004)
+
+    def test_non_release_regime_can_be_clamped_back_to_product_regime_caps(self):
+        config = {
+            "s1_product_regime_budget_overrides_enabled": True,
+            "s1_product_regime_budget_override_prefixes": ["falling"],
+            "s1_product_regime_budget_clamp_non_release_enabled": True,
+            "vol_regime_low_product_margin_cap": 0.09,
+            "vol_regime_low_bucket_margin_cap": 0.20,
+            "vol_regime_low_bucket_stress_loss_cap": 0.005,
+        }
+        engine = self.make_engine(config, {"NI": "low_stable_vol"})
+        falling_portfolio_budget = {
+            "margin_cap": 0.60,
+            "s1_margin_cap": 0.40,
+            "product_margin_cap": 0.14,
+            "bucket_margin_cap": 0.32,
+            "portfolio_stress_loss_cap": 0.022,
+            "portfolio_bucket_stress_loss_cap": 0.010,
+            "s1_stress_loss_budget_pct": 0.006,
+        }
+
+        budget = engine._product_regime_open_budget("NI", falling_portfolio_budget)
+
+        self.assertAlmostEqual(budget["product_margin_cap"], 0.09)
+        self.assertAlmostEqual(budget["bucket_margin_cap"], 0.20)
+        self.assertAlmostEqual(budget["portfolio_bucket_stress_loss_cap"], 0.005)
 
     def test_structural_low_caution_reduces_non_falling_stress_budget(self):
         config = {

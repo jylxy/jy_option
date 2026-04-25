@@ -1359,9 +1359,14 @@ class ToolkitMinuteEngine:
                 'effective_margin_cap': item.get('effective_margin_cap', np.nan),
                 'effective_strategy_margin_cap': item.get('effective_strategy_margin_cap', np.nan),
                 'effective_product_margin_cap': item.get('effective_product_margin_cap', np.nan),
+                'effective_product_side_margin_cap': item.get('effective_product_side_margin_cap', np.nan),
                 'effective_bucket_margin_cap': item.get('effective_bucket_margin_cap', np.nan),
+                'effective_corr_group_margin_cap': item.get('effective_corr_group_margin_cap', np.nan),
                 'effective_stress_loss_cap': item.get('effective_stress_loss_cap', np.nan),
                 'effective_bucket_stress_loss_cap': item.get('effective_bucket_stress_loss_cap', np.nan),
+                'effective_product_side_stress_loss_cap': item.get('effective_product_side_stress_loss_cap', np.nan),
+                'effective_corr_group_stress_loss_cap': item.get('effective_corr_group_stress_loss_cap', np.nan),
+                'effective_contract_stress_loss_cap': item.get('effective_contract_stress_loss_cap', np.nan),
                 'open_budget_risk_scale': item.get('open_budget_risk_scale', np.nan),
                 'open_budget_brake_reason': item.get('open_budget_brake_reason', ''),
                 'trend_state': item.get('trend_state', ''),
@@ -2226,21 +2231,35 @@ class ToolkitMinuteEngine:
         if isinstance(enabled_prefixes, str):
             enabled_prefixes = [enabled_prefixes]
         enabled_prefixes = {str(p).lower() for p in (enabled_prefixes or [])}
-        if prefix not in enabled_prefixes:
+        strict_clamp = bool(self.config.get(
+            's1_product_regime_budget_clamp_non_release_enabled',
+            False,
+        ))
+        if prefix not in enabled_prefixes and not strict_clamp:
             return budget
 
         adjusted = dict(budget)
         override_keys = (
             ('product_margin_cap', f'vol_regime_{prefix}_product_margin_cap'),
+            ('product_side_margin_cap', f'vol_regime_{prefix}_product_side_margin_cap'),
             ('bucket_margin_cap', f'vol_regime_{prefix}_bucket_margin_cap'),
+            ('corr_group_margin_cap', f'vol_regime_{prefix}_corr_group_margin_cap'),
             ('portfolio_bucket_stress_loss_cap', f'vol_regime_{prefix}_bucket_stress_loss_cap'),
+            ('product_side_stress_loss_cap', f'vol_regime_{prefix}_product_side_stress_loss_cap'),
+            ('corr_group_stress_loss_cap', f'vol_regime_{prefix}_corr_group_stress_loss_cap'),
+            ('contract_stress_loss_cap', f'vol_regime_{prefix}_contract_stress_loss_cap'),
         )
         for budget_key, config_key in override_keys:
             if config_key not in self.config:
                 continue
             override = float(self.config.get(config_key, 0.0) or 0.0)
-            if override > 0:
+            if override <= 0:
+                continue
+            if prefix in enabled_prefixes:
                 adjusted[budget_key] = max(float(adjusted.get(budget_key, 0.0) or 0.0), override)
+            else:
+                current = float(adjusted.get(budget_key, 0.0) or 0.0)
+                adjusted[budget_key] = min(current, override) if current > 0 else override
         return normalize_open_budget(adjusted)
 
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
@@ -2248,10 +2267,13 @@ class ToolkitMinuteEngine:
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
         candidate_multiplier = 3
         if self.config.get('s1_forward_vega_filter_enabled', False):
-            candidate_multiplier = max(
-                candidate_multiplier,
-                int(self.config.get('s1_forward_vega_candidate_multiplier', 8) or 8),
+            base_multiplier = int(self.config.get('s1_forward_vega_candidate_multiplier', 8) or 8)
+            falling_multiplier = int(
+                self.config.get('s1_forward_vega_falling_candidate_multiplier', 0) or 0
             )
+            if self._s1_vol_regime_prefix(product) == 'falling' and falling_multiplier > 0:
+                base_multiplier = max(base_multiplier, falling_multiplier)
+            candidate_multiplier = max(candidate_multiplier, base_multiplier)
         return select_s1_sell(
             s1_frame, ot, mult, mr,
             min_volume=int(self.config.get('s1_min_volume', 0)),
@@ -2266,6 +2288,9 @@ class ToolkitMinuteEngine:
             use_stress_score=bool(self.config.get('s1_use_stress_score', False)),
             stress_spot_move_pct=float(self.config.get('s1_stress_spot_move_pct', 0.03) or 0.03),
             stress_iv_up_points=float(self.config.get('s1_stress_iv_up_points', 5.0) or 5.0),
+            stress_premium_loss_multiple=float(
+                self.config.get('s1_stress_premium_loss_multiple', 0.0) or 0.0
+            ),
             gamma_penalty=float(self.config.get('s1_gamma_penalty', 0.0) or 0.0),
             vega_penalty=float(self.config.get('s1_vega_penalty', 0.0) or 0.0),
             ranking_mode=self.config.get('s1_ranking_mode', 'target_delta'),

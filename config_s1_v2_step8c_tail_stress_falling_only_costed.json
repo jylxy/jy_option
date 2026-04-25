@@ -1,0 +1,9 @@
+{
+  "extends": "config_s1_v2_step8b_falling_granularity_costed.json",
+  "strategy_version": "s1_v2_step8c_tail_stress_falling_only_costed",
+  "s1_stress_premium_loss_multiple": 10.0,
+  "s1_forward_vega_candidate_multiplier": 8,
+  "s1_forward_vega_falling_candidate_multiplier": 12,
+  "s1_product_regime_budget_clamp_non_release_enabled": true,
+  "portfolio_contract_lot_cap": 15
+}
