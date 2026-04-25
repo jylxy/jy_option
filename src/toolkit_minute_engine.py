@@ -128,6 +128,30 @@ class ToolkitMinuteEngine:
         # DTE 30-45（次月合约），止盈50%不重开
         # 30品种时 margin_per 调低，避免保证金上限卡住太多品种
 
+    _ENTRY_META_FIELDS = (
+        'signal_date',
+        'signal_ref_price', 'execution_price_drift',
+        'premium_stress', 'theta_stress', 'premium_margin',
+        'signal_premium_stress', 'signal_theta_stress', 'signal_premium_margin',
+        'abs_delta', 'delta', 'gamma', 'vega', 'theta',
+        'volume', 'open_interest', 'moneyness', 'liquidity_score',
+        'vol_regime', 'selection_score', 'selection_rank',
+        'entry_atm_iv', 'entry_iv_pct', 'entry_iv_trend', 'entry_rv_trend',
+        'entry_iv_rv_spread', 'entry_iv_rv_ratio',
+        'contract_iv', 'contract_iv_change_1d', 'contract_price_change_1d',
+        'effective_margin_cap', 'effective_strategy_margin_cap',
+        'effective_product_margin_cap', 'effective_bucket_margin_cap',
+        'effective_stress_loss_cap', 'effective_bucket_stress_loss_cap',
+        'open_budget_risk_scale', 'open_budget_brake_reason',
+        'trend_state', 'trend_score', 'trend_confidence',
+        'trend_range_position', 'trend_range_pressure',
+        'trend_role', 'side_score_mult', 'side_budget_mult', 'side_delta_cap',
+        'ladder_candidate_count', 'ladder_delta_gap', 'effective_s1_stress_max_qty',
+    )
+
+    def _entry_meta_from_item(self, item):
+        return {key: item.get(key, np.nan) for key in self._ENTRY_META_FIELDS}
+
     def _load_config(self, path):
         return load_engine_config(path, DEFAULT_PARAMS, logger=logger)
 
@@ -1112,6 +1136,7 @@ class ToolkitMinuteEngine:
                 group_id=item.get('group_id', ''),
                 underlying_code=item.get('underlying_code', ''),
             )
+            pos.entry_meta = self._entry_meta_from_item(item)
             one_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0)
             if one_loss > 0:
                 pos.stress_loss = one_loss * actual_n
@@ -2543,7 +2568,7 @@ class ToolkitMinuteEngine:
                 if pos.role == 'sell' and open_premium_cash > 0
                 else np.nan
             )
-            self.orders.append({
+            order_record = {
                 'date': date_str, 'action': reason,
                 'time': exec_time or '',
                 'strategy': pos.strat, 'product': pos.product,
@@ -2558,7 +2583,10 @@ class ToolkitMinuteEngine:
                 'premium_retained_cash': round(premium_retained_cash, 2)
                 if np.isfinite(premium_retained_cash) else np.nan,
                 'premium_retained_pct': premium_retained_pct,
-            })
+            }
+            for key, value in getattr(pos, 'entry_meta', {}).items():
+                order_record.setdefault(key, value)
+            self.orders.append(order_record)
 
         self.positions = [p for p in self.positions if p not in to_close]
 

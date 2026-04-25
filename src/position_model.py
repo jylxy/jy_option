@@ -14,7 +14,7 @@ class Position:
         "prev_price", "cur_price", "cur_spot", "prev_spot", "exchange", "underlying_code",
         "prev_delta", "prev_gamma", "prev_vega", "prev_theta", "prev_iv",
         "cur_delta", "cur_gamma", "cur_vega", "cur_theta", "cur_iv",
-        "group_id", "dte", "stress_loss",
+        "group_id", "dte", "stress_loss", "entry_meta",
     ]
 
     def __init__(
@@ -67,6 +67,7 @@ class Position:
         self.group_id = group_id
         self.dte = 0
         self.stress_loss = 0.0
+        self.entry_meta = {}
 
     def daily_pnl(self):
         if self.role in ("buy", "protect"):
