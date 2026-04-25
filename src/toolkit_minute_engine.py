@@ -836,6 +836,24 @@ class ToolkitMinuteEngine:
             rv_rising_threshold=self.config.get('s1_trend_rv_rising_threshold', 0.015),
         )
 
+    def _should_filter_s1_range_call(self, option_type, trend_info, current_regime):
+        """Skip range-bound short calls unless the vol regime explicitly pays for them."""
+        if not self.config.get('s1_range_call_filter_enabled', False):
+            return False
+        if str(option_type).upper() != 'C':
+            return False
+        trend_state = str((trend_info or {}).get('trend_state', 'uncertain') or 'uncertain')
+        filter_states = self.config.get('s1_range_call_filter_states', ['range_bound'])
+        if trend_state not in set(str(s) for s in (filter_states or [])):
+            return False
+        allowed_regimes = set(
+            str(r) for r in self.config.get(
+                's1_range_call_filter_allowed_regimes',
+                ['falling_vol_carry'],
+            )
+        )
+        return str(current_regime or 'normal_vol') not in allowed_regimes
+
     def _get_open_concentration_state(self, include_pending=True):
         return port_risk.get_open_concentration_state(
             self.positions,
@@ -2038,6 +2056,7 @@ class ToolkitMinuteEngine:
             self._s1_trend_confidence_info(product, date_str, iv_state)
             if trend_enabled else {}
         )
+        current_regime = self._current_vol_regimes.get(product, 'normal_vol')
         side_candidates = {}
         side_frames = {}
         side_meta = {}
@@ -2068,6 +2087,9 @@ class ToolkitMinuteEngine:
                 if weak_delta_cap is not None and float(weak_delta_cap or 0.0) > 0:
                     delta_cap = min(delta_cap, float(weak_delta_cap))
                     min_abs_delta = min(min_abs_delta, delta_cap)
+            if self._should_filter_s1_range_call(ot, trend_info, current_regime):
+                self._bump_s1_funnel('side_range_call_filtered')
+                continue
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
                 min_abs_delta, delta_cap, max_candidates,
@@ -2122,7 +2144,7 @@ class ToolkitMinuteEngine:
             selected_sides = choose_s1_trend_confidence_sides(
                 side_candidates,
                 trend_state=trend_info.get('trend_state', 'uncertain'),
-                current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
+                current_regime=current_regime,
                 conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
                 allowed_strangle_regimes=self.config.get(
                     's1_conditional_strangle_allowed_regimes',
@@ -2145,7 +2167,7 @@ class ToolkitMinuteEngine:
                 side_candidates,
                 enabled=bool(self.config.get('s1_side_selection_enabled', False)),
                 conditional_strangle_enabled=bool(self.config.get('s1_conditional_strangle_enabled', False)),
-                current_regime=self._current_vol_regimes.get(product, 'normal_vol'),
+                current_regime=current_regime,
                 momentum=momentum,
                 momentum_threshold=float(self.config.get('s1_side_momentum_threshold', 0.02) or 0.02),
                 momentum_penalty=float(self.config.get('s1_side_momentum_penalty', 0.75) or 0.0),
