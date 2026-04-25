@@ -516,8 +516,11 @@ class ToolkitMinuteEngine:
             date_str = self._current_date_str
         return vol_rules.recent_stop_count(self.config, self._stop_history, date_str)
 
-    def _pending_budget_fields(self, strategy_cap):
-        budget = self._current_open_budget or self._get_effective_open_budget()
+    def _pending_budget_fields(self, budget=None, strategy_cap=None):
+        if strategy_cap is None:
+            strategy_cap = budget
+            budget = None
+        budget = budget or self._current_open_budget or self._get_effective_open_budget()
         return pending_budget_fields(budget, strategy_cap)
 
     def _execution_budget_for_item(self, item):
@@ -2060,6 +2063,35 @@ class ToolkitMinuteEngine:
         risk_scale = float((self._current_open_budget or {}).get('risk_scale', 1.0) or 1.0)
         return product_pct * max(0.0, risk_scale)
 
+    def _product_regime_open_budget(self, product, budget):
+        budget = normalize_open_budget(budget or {})
+        if not self.config.get('s1_product_regime_budget_overrides_enabled', False):
+            return budget
+        prefix = self._s1_vol_regime_prefix(product)
+        enabled_prefixes = self.config.get(
+            's1_product_regime_budget_override_prefixes',
+            ['falling'],
+        )
+        if isinstance(enabled_prefixes, str):
+            enabled_prefixes = [enabled_prefixes]
+        enabled_prefixes = {str(p).lower() for p in (enabled_prefixes or [])}
+        if prefix not in enabled_prefixes:
+            return budget
+
+        adjusted = dict(budget)
+        override_keys = (
+            ('product_margin_cap', f'vol_regime_{prefix}_product_margin_cap'),
+            ('bucket_margin_cap', f'vol_regime_{prefix}_bucket_margin_cap'),
+            ('portfolio_bucket_stress_loss_cap', f'vol_regime_{prefix}_bucket_stress_loss_cap'),
+        )
+        for budget_key, config_key in override_keys:
+            if config_key not in self.config:
+                continue
+            override = float(self.config.get(config_key, 0.0) or 0.0)
+            if override > 0:
+                adjusted[budget_key] = max(float(adjusted.get(budget_key, 0.0) or 0.0), override)
+        return normalize_open_budget(adjusted)
+
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
                                    min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
@@ -2278,6 +2310,7 @@ class ToolkitMinuteEngine:
         base_margin_per = float(self.config.get('margin_per', 0.02) or 0.02)
         regime_scale = margin_per / base_margin_per if base_margin_per > 0 else 1.0
         open_budget = self._current_open_budget or {}
+        product_budget = self._product_regime_open_budget(product, open_budget)
         if 's1_stress_loss_budget_pct' in open_budget:
             stress_budget_pct = float(open_budget.get('s1_stress_loss_budget_pct') or 0.0)
         else:
@@ -2310,6 +2343,7 @@ class ToolkitMinuteEngine:
                     new_cash_vega=new_greeks['cash_vega'],
                     new_cash_gamma=new_greeks['cash_gamma'],
                     new_stress_loss=total_stress_loss,
+                    budget=product_budget,
                 )
 
             lo, hi = 0, target_qty
@@ -2410,7 +2444,7 @@ class ToolkitMinuteEngine:
                 'ladder_delta_gap': max_delta_gap,
                 'effective_s1_stress_max_qty': max_qty,
             }
-            pending_item.update(self._pending_budget_fields(effective_strategy_cap))
+            pending_item.update(self._pending_budget_fields(product_budget, effective_strategy_cap))
             pending_item['effective_s1_stress_budget_pct'] = stress_budget_pct
             self._pending_opens.append(pending_item)
             self._bump_s1_funnel('open_sell_legs')

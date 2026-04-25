@@ -312,4 +312,14 @@ def execution_budget_for_item(item, current_budget, config):
             safe_pct(current.get(key, 0.0), 0.0),
             safe_pct(signal.get(key, current.get(key, 0.0)), current.get(key, 0.0)),
         )
+    if (config or {}).get("portfolio_execution_allow_signal_product_overrides", False):
+        for key in (
+            "product_margin_cap",
+            "bucket_margin_cap",
+            "portfolio_bucket_stress_loss_cap",
+        ):
+            budget[key] = max(
+                safe_pct(budget.get(key, 0.0), 0.0),
+                safe_pct(signal.get(key, 0.0), 0.0),
+            )
     return normalize_open_budget(budget)
