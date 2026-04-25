@@ -66,7 +66,27 @@ class MarginModelTest(unittest.TestCase):
                 config=config,
                 data_ratio=0.05,
             ),
-            0.05,
+            0.16,
+        )
+
+    def test_broker_product_table_overrides_exchange_default(self):
+        self.assertAlmostEqual(
+            resolve_margin_ratio(exchange="SHFE", product="AG2506", config={}),
+            0.16,
+        )
+        self.assertAlmostEqual(
+            resolve_margin_ratio(exchange="CFFEX", product="IO2506", config={}),
+            0.12,
+        )
+
+    def test_broker_product_table_can_be_disabled(self):
+        config = {
+            "margin_ratio_use_broker_table": False,
+            "margin_ratio_by_exchange": {"SHFE": 0.07},
+        }
+        self.assertAlmostEqual(
+            resolve_margin_ratio(exchange="SHFE", product="AG2506", config=config),
+            0.07,
         )
 
 

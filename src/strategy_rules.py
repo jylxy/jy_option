@@ -30,6 +30,7 @@ DEFAULT_PARAMS = {
         "CZCE": 0.07, "GFEX": 0.07,
     },
     "margin_ratio_by_product": {},
+    "margin_ratio_use_broker_table": True,
     "equity_option_min_guarantee_ratio": 0.07,
     "enable_s1": True,
     "enable_s3": True,
@@ -60,6 +61,9 @@ DEFAULT_PARAMS = {
     "reopen_min_dte": 10,
     "expiry_dte": 1,
     "fee": 3,
+    "option_fee_use_broker_table": True,
+    "option_fee_by_product": {},
+    "option_fee_by_product_side": {},
     "execution_slippage_enabled": False,
     "execution_slippage_pct": 0.002,
     "execution_open_slippage_pct": None,
@@ -1639,6 +1643,7 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                    iv_residual_weight=0.3, min_abs_delta=0.0,
                    max_abs_delta=0.10, target_abs_delta=None,
                    carry_metric="premium_margin", fee_per_contract=0.0,
+                   roundtrip_fee_per_contract=None,
                    min_premium_fee_multiple=0.0, use_stress_score=False,
                    stress_spot_move_pct=0.03, stress_iv_up_points=5.0,
                    gamma_penalty=0.0, vega_penalty=0.0,
@@ -1671,7 +1676,12 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
         ]
     if c.empty:
         return None
-    min_premium = float(fee_per_contract or 0.0) * 2.0 * float(min_premium_fee_multiple or 0.0)
+    roundtrip_fee = (
+        float(roundtrip_fee_per_contract)
+        if roundtrip_fee_per_contract is not None
+        else float(fee_per_contract or 0.0) * 2.0
+    )
+    min_premium = roundtrip_fee * float(min_premium_fee_multiple or 0.0)
     if min_premium > 0:
         c = c[c["option_close"] * float(mult) >= min_premium]
     if c.empty:
@@ -1700,7 +1710,6 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
         return None
 
     gross_premium_cash = c["option_close"] * float(mult)
-    roundtrip_fee = float(fee_per_contract or 0.0) * 2.0
     net_premium_cash = (gross_premium_cash - roundtrip_fee).clip(lower=0.0)
     c["net_premium_cash"] = net_premium_cash
     c["eff"] = gross_premium_cash / c["margin"]

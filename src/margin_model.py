@@ -8,6 +8,8 @@ import re
 
 import numpy as np
 
+from broker_costs import broker_margin_ratio_for_product
+
 
 EXCHANGE_ALIASES = {
     "SH": "SSE",
@@ -96,15 +98,20 @@ def resolve_margin_ratio(exchange=None, product=None, config=None,
     if ratio is not None:
         return ratio
 
+    if cfg.get("margin_ratio_use_broker_table", True):
+        ratio = coerce_ratio(broker_margin_ratio_for_product(product))
+        if ratio is not None:
+            return ratio
+
     ratio = coerce_ratio(data_ratio)
     if ratio is not None:
         return ratio
 
-    ratio = lookup_ratio(cfg.get("margin_ratio_by_exchange", {}), exchange)
+    ratio = lookup_ratio(DEFAULT_MARGIN_RATIO_BY_PRODUCT, product)
     if ratio is not None:
         return ratio
 
-    ratio = lookup_ratio(DEFAULT_MARGIN_RATIO_BY_PRODUCT, product)
+    ratio = lookup_ratio(cfg.get("margin_ratio_by_exchange", {}), exchange)
     if ratio is not None:
         return ratio
 

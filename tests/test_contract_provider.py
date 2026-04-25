@@ -77,16 +77,16 @@ class ContractProviderTest(unittest.TestCase):
             self.assertEqual(etf["product_root"], "510050")
             self.assertEqual(etf["underlying_code"], "510050.SH")
 
-            # Commodity options use futures contract margin ratios when present.
+            # Broker product-level margin ratios are the primary production path.
             self.assertAlmostEqual(
                 ci.get_margin_ratio("SHFE", "CU", "CU2506.SHF", {}),
-                0.08,
+                0.10,
             )
 
-            # CFFEX should still use option config/default, not futures deposit data.
+            # Index option roots map to their index futures margin ratios.
             self.assertAlmostEqual(
                 ci.get_margin_ratio("CFFEX", "IO", "IF2506.CFE", {}),
-                0.10,
+                0.12,
             )
 
 

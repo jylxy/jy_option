@@ -73,6 +73,7 @@ from product_lifecycle import (
 )
 from position_model import Position
 from execution_model import apply_execution_slippage
+from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
@@ -135,6 +136,8 @@ class ToolkitMinuteEngine:
         'signal_ref_price', 'execution_price_drift',
         'premium_stress', 'theta_stress', 'premium_margin',
         'signal_premium_stress', 'signal_theta_stress', 'signal_premium_margin',
+        'open_fee_per_contract', 'close_fee_per_contract',
+        'roundtrip_fee_per_contract',
         'abs_delta', 'delta', 'gamma', 'vega', 'theta',
         'volume', 'open_interest', 'moneyness', 'liquidity_score',
         'vol_regime', 'selection_score', 'selection_rank',
@@ -156,6 +159,46 @@ class ToolkitMinuteEngine:
 
     def _entry_meta_from_item(self, item):
         return {key: item.get(key, np.nan) for key in self._ENTRY_META_FIELDS}
+
+    def _option_fee_per_contract(self, product, option_type=None, action='open',
+                                 default=None):
+        return resolve_option_fee(
+            self.config,
+            product=product,
+            option_type=option_type,
+            action=action,
+            default=default,
+        )
+
+    def _option_roundtrip_fee_per_contract(self, product, option_type=None):
+        return resolve_option_roundtrip_fee(
+            self.config,
+            product=product,
+            option_type=option_type,
+        )
+
+    def _position_fee_per_contract(self, pos, action='close', default=None):
+        action = str(action or 'close').lower()
+        meta = getattr(pos, 'entry_meta', {}) or {}
+        meta_key = {
+            'open': 'open_fee_per_contract',
+            'close': 'close_fee_per_contract',
+        }.get(action, f'{action}_fee_per_contract')
+        if meta_key in meta:
+            value = self._safe_float(meta.get(meta_key), np.nan)
+            if np.isfinite(value):
+                return value
+        return self._option_fee_per_contract(
+            pos.product,
+            pos.opt_type,
+            action=action,
+            default=default,
+        )
+
+    def _position_roundtrip_fee_per_side(self, pos, default=None):
+        open_fee = self._position_fee_per_contract(pos, action='open', default=default)
+        close_fee = self._position_fee_per_contract(pos, action='close', default=default)
+        return 0.5 * (open_fee + close_fee)
 
     def _load_config(self, path):
         return load_engine_config(path, DEFAULT_PARAMS, logger=logger)
@@ -1183,6 +1226,28 @@ class ToolkitMinuteEngine:
                 group_id=item.get('group_id', ''),
                 underlying_code=item.get('underlying_code', ''),
             )
+            open_fee_per_contract = self._safe_float(
+                item.get('open_fee_per_contract', np.nan),
+                self._option_fee_per_contract(
+                    item.get('product'),
+                    item.get('opt_type'),
+                    action='open',
+                    default=self.config.get('fee', 0.0),
+                ),
+            )
+            close_fee_per_contract = self._safe_float(
+                item.get('close_fee_per_contract', np.nan),
+                self._option_fee_per_contract(
+                    item.get('product'),
+                    item.get('opt_type'),
+                    action='close',
+                    default=self.config.get('fee', 0.0),
+                ),
+            )
+            roundtrip_fee_per_contract = open_fee_per_contract + close_fee_per_contract
+            item['open_fee_per_contract'] = open_fee_per_contract
+            item['close_fee_per_contract'] = close_fee_per_contract
+            item['roundtrip_fee_per_contract'] = roundtrip_fee_per_contract
             pos.entry_meta = self._entry_meta_from_item(item)
             slippage_cash = float(execution_slippage) * float(item['mult']) * float(actual_n)
             pos.entry_meta.update({
@@ -1195,7 +1260,7 @@ class ToolkitMinuteEngine:
                 pos.stress_loss = one_loss * actual_n
             self._set_open_greeks_for_attribution(pos, date_str)
             self.positions.append(pos)
-            open_fee = float(self.config.get('fee', 3) or 0.0) * actual_n
+            open_fee = open_fee_per_contract * actual_n
             self._day_realized['fee'] += open_fee
             gross_premium_cash = float(price) * float(item['mult']) * float(actual_n)
             net_premium_cash = (
@@ -1234,7 +1299,13 @@ class ToolkitMinuteEngine:
                 'raw_execution_price': round(raw_execution_price, 4),
                 'execution_slippage': round(execution_slippage, 6),
                 'execution_slippage_cash': round(slippage_cash, 2),
-                'fee': round(open_fee, 2), 'pnl': 0,
+                'fee': round(open_fee, 2),
+                'fee_per_contract': open_fee_per_contract,
+                'fee_action': 'open',
+                'open_fee_per_contract': open_fee_per_contract,
+                'close_fee_per_contract': close_fee_per_contract,
+                'roundtrip_fee_per_contract': roundtrip_fee_per_contract,
+                'pnl': 0,
                 'stress_loss': round(pos.stress_loss, 2),
                 'open_margin': round(open_margin, 2),
                 'one_contract_margin': item.get('one_contract_margin', np.nan),
@@ -1571,7 +1642,8 @@ class ToolkitMinuteEngine:
                     continue
                 if take_profit_enabled:
                     tp = cfg.get('s1_tp', 0.40) if pos.strat == 'S1' else cfg.get('s3_tp', 0.30)
-                    if pos.profit_pct(fee) >= tp and pos.dte > cfg.get('tp_min_dte', 5):
+                    tp_fee = self._position_roundtrip_fee_per_side(pos, default=fee)
+                    if pos.profit_pct(tp_fee) >= tp and pos.dte > cfg.get('tp_min_dte', 5):
                         self._close_group(pos, date_str, f'tp_{pos.strat.lower()}', fee, exec_time=exec_time)
                         if gid:
                             closed_groups.add(gid)
@@ -2178,6 +2250,7 @@ class ToolkitMinuteEngine:
             target_abs_delta=float(self.config.get('s1_target_abs_delta', 0.07)),
             carry_metric=self.config.get('s1_carry_metric', 'premium_margin'),
             fee_per_contract=float(self.config.get('fee', 0.0) or 0.0),
+            roundtrip_fee_per_contract=self._option_roundtrip_fee_per_contract(product, ot),
             min_premium_fee_multiple=float(self.config.get('s1_min_premium_fee_multiple', 0.0) or 0.0),
             use_stress_score=bool(self.config.get('s1_use_stress_score', False)),
             stress_spot_move_pct=float(self.config.get('s1_stress_spot_move_pct', 0.03) or 0.03),
@@ -2479,6 +2552,9 @@ class ToolkitMinuteEngine:
 
             new_greeks = self._candidate_cash_greeks(c, ot, mult, nn, role='sell')
             total_stress_loss = one_stress_loss * nn if one_stress_loss > 0 else 0.0
+            open_fee_per_contract = self._option_fee_per_contract(product, ot, action='open')
+            close_fee_per_contract = self._option_fee_per_contract(product, ot, action='close')
+            roundtrip_fee_per_contract = open_fee_per_contract + close_fee_per_contract
             pending_item = {
                 'strat': 'S1', 'product': product, 'code': c['option_code'],
                 'opt_type': ot, 'strike': c['strike'], 'ref_price': c['option_close'],
@@ -2497,6 +2573,9 @@ class ToolkitMinuteEngine:
                 'premium_stress': self._safe_float(c.get('premium_stress', np.nan), np.nan),
                 'theta_stress': self._safe_float(c.get('theta_stress', np.nan), np.nan),
                 'premium_margin': self._safe_float(c.get('premium_margin', np.nan), np.nan),
+                'open_fee_per_contract': open_fee_per_contract,
+                'close_fee_per_contract': close_fee_per_contract,
+                'roundtrip_fee_per_contract': roundtrip_fee_per_contract,
                 'liquidity_score': self._safe_float(c.get('liquidity_score', np.nan), np.nan),
                 'volume': self._safe_float(c.get('volume', np.nan), np.nan),
                 'open_interest': self._safe_float(c.get('open_interest', np.nan), np.nan),
@@ -2575,6 +2654,9 @@ class ToolkitMinuteEngine:
                     'role': 'buy', 'spot': pr['spot_close'], 'exchange': exchange,
                     'group_id': group_id, 'underlying_code': pr.get('underlying_code'),
                     'signal_date': date_str,
+                    'open_fee_per_contract': self._option_fee_per_contract(product, ot, action='open'),
+                    'close_fee_per_contract': self._option_fee_per_contract(product, ot, action='close'),
+                    'roundtrip_fee_per_contract': self._option_roundtrip_fee_per_contract(product, ot),
                 })
 
         if opened_any and reentry_plan:
@@ -2639,6 +2721,9 @@ class ToolkitMinuteEngine:
             'n': bq, 'mult': mult, 'expiry': exp, 'mr': mr, 'role': 'buy',
             'spot': bl['spot_close'], 'exchange': exchange, 'group_id': group_id,
             'underlying_code': bl.get('underlying_code'),
+            'open_fee_per_contract': self._option_fee_per_contract(product, ot, action='open'),
+            'close_fee_per_contract': self._option_fee_per_contract(product, ot, action='close'),
+            'roundtrip_fee_per_contract': self._option_roundtrip_fee_per_contract(product, ot),
         })
         sell_pending_item = {
             'strat': 'S3', 'product': product, 'code': sl['option_code'],
@@ -2649,6 +2734,9 @@ class ToolkitMinuteEngine:
             'margin': sm * sq,
             'cash_vega': new_greeks['cash_vega'],
             'cash_gamma': new_greeks['cash_gamma'],
+            'open_fee_per_contract': self._option_fee_per_contract(product, ot, action='open'),
+            'close_fee_per_contract': self._option_fee_per_contract(product, ot, action='close'),
+            'roundtrip_fee_per_contract': self._option_roundtrip_fee_per_contract(product, ot),
         }
         sell_pending_item.update(self._pending_budget_fields(effective_strategy_cap))
         self._pending_opens.append(sell_pending_item)
@@ -2675,6 +2763,9 @@ class ToolkitMinuteEngine:
                 'n': qty, 'mult': mult, 'expiry': exp, 'mr': mr, 'role': 'buy',
                 'spot': opt['spot_close'], 'exchange': exchange, 'group_id': group_id,
                 'underlying_code': opt.get('underlying_code'),
+                'open_fee_per_contract': self._option_fee_per_contract(product, ot, action='open'),
+                'close_fee_per_contract': self._option_fee_per_contract(product, ot, action='close'),
+                'roundtrip_fee_per_contract': self._option_roundtrip_fee_per_contract(product, ot),
             })
 
     # ── 平仓 ─────────────────────────────────────────────────────────────────
@@ -2711,7 +2802,28 @@ class ToolkitMinuteEngine:
             for k, v in pa.items():
                 if k.endswith('_pnl') and k in self._day_attr_realized:
                     self._day_attr_realized[k] += float(v)
-            fee = fee_per_hand * pos.n
+            fee_action = 'close'
+            if reason == 'expiry':
+                if float(pos.cur_price or 0.0) <= 0.0:
+                    fee_per_contract = 0.0
+                    fee_action = 'expire_otm'
+                elif pos.role in ('buy', 'protect'):
+                    fee_action = 'exercise'
+                    fee_per_contract = self._position_fee_per_contract(
+                        pos, action='exercise', default=fee_per_hand,
+                    )
+                else:
+                    fee_action = 'assign'
+                    fee_per_contract = self._position_fee_per_contract(
+                        pos, action='assign', default=fee_per_hand,
+                    )
+            else:
+                if pos.open_date == date_str:
+                    fee_action = 'close_today'
+                fee_per_contract = self._position_fee_per_contract(
+                    pos, action=fee_action, default=fee_per_hand,
+                )
+            fee = fee_per_contract * pos.n
             self._day_realized['pnl'] += pnl
             self._day_realized['fee'] += fee
             strat_key = pos.strat.lower()
@@ -2746,7 +2858,10 @@ class ToolkitMinuteEngine:
                 'raw_execution_price': round(raw_execution_price, 4),
                 'execution_slippage': round(execution_slippage, 6),
                 'execution_slippage_cash': round(slippage_cash, 2),
-                'fee': round(fee, 2), 'pnl': round(order_pnl, 2),
+                'fee': round(fee, 2),
+                'fee_per_contract': fee_per_contract,
+                'fee_action': fee_action,
+                'pnl': round(order_pnl, 2),
                 'stress_loss': round(float(pos.stress_loss or 0.0), 2),
                 'margin_at_close': round(pos.cur_margin() if pos.role == 'sell' else 0.0, 2),
                 'open_premium_cash': round(open_premium_cash, 2),
