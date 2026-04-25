@@ -122,6 +122,7 @@ class ToolkitMinuteEngine:
         self._product_first_trade_dates = {}
         self._product_like_sql_cache = {}
         self._warmup_contract_sql_cache = {}
+        self._s1_candidate_funnel = None
 
         # 策略参数（与strategy_rules.py DEFAULT_PARAMS一致，此处显式声明便于查看）
         # DTE 30-45（次月合约），止盈50%不重开
@@ -883,6 +884,58 @@ class ToolkitMinuteEngine:
             self._current_vol_regimes,
         )
 
+    def _start_s1_candidate_funnel(self, date_str, nav, product_pool):
+        if not self.config.get('s1_candidate_funnel_enabled', True):
+            self._s1_candidate_funnel = None
+            return
+        self._s1_candidate_funnel = defaultdict(float)
+        self._bump_s1_funnel('product_pool', len(product_pool or []))
+        self._s1_candidate_funnel['nav'] = float(nav or 0.0)
+        self._s1_candidate_funnel['date_marker'] = 1.0
+
+    def _bump_s1_funnel(self, key, amount=1):
+        if self._s1_candidate_funnel is None:
+            return
+        try:
+            self._s1_candidate_funnel[str(key)] += float(amount)
+        except (TypeError, ValueError):
+            self._s1_candidate_funnel[str(key)] += 1.0
+
+    def _finish_s1_candidate_funnel(self, date_str, nav):
+        counts = self._s1_candidate_funnel
+        self._s1_candidate_funnel = None
+        if not counts:
+            return
+        candidate_products = counts.get('candidate_products', 0.0)
+        product_entry_pass = counts.get('product_entry_pass', 0.0)
+        side_with_candidates = counts.get('side_with_candidates', 0.0)
+        side_selected = counts.get('side_selected', 0.0)
+        open_candidates = counts.get('open_candidates_after_ladder', 0.0)
+        open_sell_legs = counts.get('open_sell_legs', 0.0)
+        record = {
+            'date': date_str,
+            'scope': 's1_candidate_funnel',
+            'name': 'daily',
+            'portfolio_vol_regime': self._current_portfolio_regime,
+            'candidate_count': candidate_products,
+            'n_products': candidate_products,
+            'n_positions': open_sell_legs,
+            'product_entry_pass_rate': (
+                product_entry_pass / candidate_products if candidate_products > 0 else np.nan
+            ),
+            'side_select_rate': (
+                side_selected / side_with_candidates if side_with_candidates > 0 else np.nan
+            ),
+            'open_conversion_rate': (
+                open_sell_legs / open_candidates if open_candidates > 0 else np.nan
+            ),
+        }
+        for key, value in sorted(counts.items()):
+            if key in {'date_marker', 'nav'}:
+                continue
+            record[f'funnel_{key}'] = value
+        self.diagnostics_records.append(record)
+
     def _build_product_like_sql(self, product_pool):
         """构建品种的ths_code LIKE过滤SQL"""
         normalized_pool = normalize_product_pool(product_pool)
@@ -1641,11 +1694,14 @@ class ToolkitMinuteEngine:
         """收盘后生成下一交易日待开仓指令。"""
         cfg = self.config
         nav = max(self._current_nav(), 1.0)
+        self._start_s1_candidate_funnel(date_str, nav, product_pool)
         vega_warn = cfg.get('greeks_vega_warn', 0.008)
         current_vega_pct = abs(sum(p.cash_vega() for p in self.positions) / nav)
         if current_vega_pct > vega_warn:
             logger.debug("  %s Vega预警 %.3f%% > %.1f%%, 暂停新开仓",
                          date_str, current_vega_pct * 100, vega_warn * 100)
+            self._bump_s1_funnel('skip_vega_warn')
+            self._finish_s1_candidate_funnel(date_str, nav)
             return
 
         total_m = self._get_open_sell_margin_total()
@@ -1661,6 +1717,8 @@ class ToolkitMinuteEngine:
 
         filtered_daily = daily_df[daily_df['product'].isin(product_pool)].copy()
         if filtered_daily.empty:
+            self._bump_s1_funnel('skip_empty_filtered_daily')
+            self._finish_s1_candidate_funnel(date_str, nav)
             return
 
         product_frames = {
@@ -1669,7 +1727,10 @@ class ToolkitMinuteEngine:
             if not frame.empty
         }
         if not product_frames:
+            self._bump_s1_funnel('skip_no_product_frames')
+            self._finish_s1_candidate_funnel(date_str, nav)
             return
+        self._bump_s1_funnel('loaded_products', len(product_frames))
 
         prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
         prod_volume = prod_volume.sort_values(
@@ -1682,6 +1743,7 @@ class ToolkitMinuteEngine:
         sorted_products = self._prioritize_products_by_regime(sorted_products)
 
         candidate_products = sorted_products if scan_top_n <= 0 else sorted_products[:scan_top_n]
+        self._bump_s1_funnel('candidate_products', len(candidate_products))
         open_product_expiries = {(p.product, p.expiry) for p in self.positions}
         open_s1_sell_sides = {
             (p.product, p.opt_type)
@@ -1702,9 +1764,12 @@ class ToolkitMinuteEngine:
         for product in candidate_products:
             prod_df = product_frames.get(product)
             if prod_df.empty:
+                self._bump_s1_funnel('skip_empty_product_frame')
                 continue
             if not self._passes_product_entry_filters(product, date_str):
+                self._bump_s1_funnel('skip_product_observation')
                 continue
+            self._bump_s1_funnel('product_entry_pass')
 
             open_expiries = should_open_new(
                 prod_df,
@@ -1713,18 +1778,23 @@ class ToolkitMinuteEngine:
                 dte_max=cfg.get('dte_max', 90),
             )
             if not open_expiries:
+                self._bump_s1_funnel('skip_no_open_expiry')
                 continue
+            self._bump_s1_funnel('open_expiry_candidates', len(open_expiries))
 
             for exp in open_expiries:
                 expiry_has_position = (product, exp) in open_product_expiries
 
                 ef = prod_df[prod_df['expiry_date'] == exp]
                 if ef.empty:
+                    self._bump_s1_funnel('skip_empty_expiry_frame')
                     continue
+                self._bump_s1_funnel('product_expiry_frames')
 
                 iv_pct = product_iv_pcts.get(product, np.nan)
                 iv_state = self._current_iv_state.get(product, {})
                 if should_pause_open(iv_pct, iv_open_thr):
+                    self._bump_s1_funnel('skip_iv_pause')
                     continue
                 low_iv_threshold = cfg.get('iv_low_skip_threshold', 20)
                 low_iv_allowed = should_allow_open_low_iv_product(
@@ -1747,14 +1817,17 @@ class ToolkitMinuteEngine:
                 if self._is_structural_low_iv_product(product, iv_state):
                     low_iv_allowed = True
                 if pd.notna(iv_pct) and iv_pct < low_iv_threshold and not low_iv_allowed:
+                    self._bump_s1_funnel('skip_low_iv')
                     continue
                 iv_scale = get_iv_scale(iv_pct, cfg.get('iv_threshold', 75))
                 regime_mult = self._product_margin_per_multiplier(product)
                 if regime_mult <= 0:
+                    self._bump_s1_funnel('skip_regime_budget_zero')
                     continue
                 product_margin_per = margin_per * regime_mult
 
                 if total_m / nav >= margin_cap:
+                    self._bump_s1_funnel('break_total_margin_cap')
                     break
 
                 spot = ef['spot_close'].iloc[0]
@@ -1778,7 +1851,9 @@ class ToolkitMinuteEngine:
                     (not expiry_has_position or s1_can_add_expiry)
                 ):
                     if not self._passes_s1_falling_framework_entry(product, iv_state):
+                        self._bump_s1_funnel('skip_s1_falling_framework')
                         continue
+                    self._bump_s1_funnel('s1_framework_pass')
                     if cfg.get('s1_side_selection_enabled', False):
                         s1_side_items = self._select_s1_side_items(
                             ef, product, mult, mr, exchange, date_str,
@@ -1786,15 +1861,19 @@ class ToolkitMinuteEngine:
                         )
                     else:
                         s1_side_items = [(ot, None, {}) for ot in ['P', 'C']]
+                    self._bump_s1_funnel('s1_selected_side_items', len(s1_side_items))
                     for ot, preselected_candidates, side_meta in s1_side_items:
                         if (
                             not cfg.get('s1_allow_add_same_side', False) and
                             (product, ot) in open_s1_sell_sides
                         ):
+                            self._bump_s1_funnel('skip_same_side_position')
                             continue
                         if self._is_reentry_blocked('S1', product, ot, date_str):
+                            self._bump_s1_funnel('skip_reentry_blocked')
                             continue
                         s1_plan = self._get_reentry_plan('S1', product, ot, date_str)
+                        pending_before = len(self._pending_opens)
                         self._try_open_s1(ef, product, ot, mult, mr, exchange, exp,
                                           nav, product_margin_per, iv_scale, date_str,
                                           reentry_plan=s1_plan,
@@ -1802,6 +1881,10 @@ class ToolkitMinuteEngine:
                                           margin_cap=margin_cap, strategy_cap=s1_cap,
                                           preselected_candidates=preselected_candidates,
                                           side_meta=side_meta)
+                        self._bump_s1_funnel(
+                            'pending_items_added',
+                            max(0, len(self._pending_opens) - pending_before),
+                        )
 
                 if cfg.get('enable_s3', True) and s3_m / nav < s3_cap and not expiry_has_position:
                     for ot in ['P', 'C']:
@@ -1817,6 +1900,7 @@ class ToolkitMinuteEngine:
 
                 if cfg.get('enable_s4', True) and product not in open_s4_products:
                     self._try_open_s4(ef, product, mult, mr, exchange, exp, nav, date_str)
+        self._finish_s1_candidate_funnel(date_str, nav)
 
     def _process_daily_decision(self, daily_df, date_str, product_pool, run_risk_and_tp=True):
         """每日收盘后决策：补做收盘风控、到期结算、生成待开仓。"""
@@ -1958,7 +2042,9 @@ class ToolkitMinuteEngine:
         side_frames = {}
         side_meta = {}
         for ot in ['P', 'C']:
+            self._bump_s1_funnel('side_checked')
             if self._is_reentry_blocked('S1', product, ot, date_str):
+                self._bump_s1_funnel('side_reentry_blocked')
                 continue
             reentry_plan = self._get_reentry_plan('S1', product, ot, date_str)
             min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
@@ -1987,8 +2073,11 @@ class ToolkitMinuteEngine:
                 min_abs_delta, delta_cap, max_candidates,
             )
             if candidates is None or candidates.empty:
+                self._bump_s1_funnel('side_no_candidates')
                 continue
             candidates = candidates.copy()
+            self._bump_s1_funnel('side_with_candidates')
+            self._bump_s1_funnel('side_candidate_rows', len(candidates))
             score_mult = float(adjustment.get('score_mult', 1.0) or 0.0)
             if trend_enabled and score_mult != 1.0 and 'quality_score' in candidates.columns:
                 candidates['quality_score'] = pd.to_numeric(
@@ -2077,6 +2166,11 @@ class ToolkitMinuteEngine:
                     self.config.get('s1_conditional_strangle_require_momentum', True)
                 ),
             )
+        self._bump_s1_funnel('side_selected', len(selected_sides))
+        self._bump_s1_funnel(
+            'side_not_selected',
+            max(0, len(side_frames) - len([ot for ot in selected_sides if ot in side_frames])),
+        )
         return [
             (ot, side_frames.get(ot), side_meta.get(ot, {}))
             for ot in selected_sides
@@ -2099,8 +2193,10 @@ class ToolkitMinuteEngine:
         else:
             candidates = preselected_candidates.copy()
         if candidates is None or candidates.empty:
+            self._bump_s1_funnel('open_skip_no_candidates')
             return
         candidates = candidates.copy()
+        self._bump_s1_funnel('open_candidates_considered', len(candidates))
         if split_enabled and max_candidates > 1:
             if max_delta_gap > 0 and 'abs_delta' in candidates.columns:
                 center_delta = float(candidates['abs_delta'].iloc[0])
@@ -2111,7 +2207,9 @@ class ToolkitMinuteEngine:
         else:
             candidates = candidates.head(1)
         if candidates.empty:
+            self._bump_s1_funnel('open_skip_ladder_filter')
             return
+        self._bump_s1_funnel('open_candidates_after_ladder', len(candidates))
         iv_state = iv_state or {}
         side_meta = side_meta or {}
         effective_margin_cap = self.config.get('margin_cap', 0.50) if margin_cap is None else margin_cap
@@ -2167,22 +2265,27 @@ class ToolkitMinuteEngine:
                                 c['option_close'], mult, mr, 0.5,
                                 exchange=exchange, product=product)
             if not np.isfinite(m) or m <= 0:
+                self._bump_s1_funnel('open_skip_invalid_margin')
                 continue
             one_stress_loss = float(c.get('stress_loss', 0.0) or 0.0)
             if self.config.get('s1_use_stress_sizing', False):
                 if one_stress_loss <= 0 or remaining_stress_budget <= 0:
+                    self._bump_s1_funnel('open_skip_invalid_stress_budget')
                     continue
                 target_qty = int(remaining_stress_budget / one_stress_loss)
                 if max_qty > 0:
                     target_qty = min(target_qty, max_qty)
                 if target_qty < min_qty:
+                    self._bump_s1_funnel('open_skip_budget_too_small')
                     continue
             else:
                 if remaining_margin_budget <= 0:
+                    self._bump_s1_funnel('open_skip_margin_budget_empty')
                     continue
                 target_qty = max(1, int(remaining_margin_budget / m))
             nn = max_allowed_qty(c, m, target_qty, one_stress_loss)
             if nn <= 0:
+                self._bump_s1_funnel('open_skip_portfolio_constraints')
                 continue
 
             new_greeks = self._candidate_cash_greeks(c, ot, mult, nn, role='sell')
@@ -2239,6 +2342,8 @@ class ToolkitMinuteEngine:
             }
             pending_item.update(self._pending_budget_fields(effective_strategy_cap))
             self._pending_opens.append(pending_item)
+            self._bump_s1_funnel('open_sell_legs')
+            self._bump_s1_funnel('open_sell_lots', nn)
             opened_any = True
             if self.config.get('s1_use_stress_sizing', False):
                 remaining_stress_budget -= total_stress_loss
@@ -2450,11 +2555,22 @@ class ToolkitMinuteEngine:
             'open_premium': 0.0,
             'liability': 0.0,
         })
+        regime_state = defaultdict(lambda: {
+            'lots': 0.0,
+            'contracts': set(),
+            'products': set(),
+            'open_premium': 0.0,
+            'liability': 0.0,
+            'margin': 0.0,
+            'stress_loss': 0.0,
+        })
         total_lots = 0.0
         total_contracts = set()
         total_products = set()
         total_open_premium = 0.0
         total_liability = 0.0
+        total_margin = 0.0
+        total_stress_loss = 0.0
 
         for pos in self.positions:
             if pos.strat != 'S1' or pos.role != 'sell':
@@ -2464,12 +2580,17 @@ class ToolkitMinuteEngine:
             lots = float(pos.n or 0.0)
             open_premium = float(pos.open_price) * float(pos.mult) * lots
             liability = float(pos.cur_price) * float(pos.mult) * lots
+            margin = float(pos.cur_margin() or 0.0)
+            stress_loss = float(getattr(pos, 'stress_loss', 0.0) or 0.0)
+            regime = self._current_vol_regimes.get(product, 'normal_vol')
 
             total_lots += lots
             total_contracts.add(pos.code)
             total_products.add(product)
             total_open_premium += open_premium
             total_liability += liability
+            total_margin += margin
+            total_stress_loss += stress_loss
 
             state = side_state[side]
             state['lots'] += lots
@@ -2477,6 +2598,15 @@ class ToolkitMinuteEngine:
             state['products'].add(product)
             state['open_premium'] += open_premium
             state['liability'] += liability
+
+            rstate = regime_state[regime]
+            rstate['lots'] += lots
+            rstate['contracts'].add(pos.code)
+            rstate['products'].add(product)
+            rstate['open_premium'] += open_premium
+            rstate['liability'] += liability
+            rstate['margin'] += margin
+            rstate['stress_loss'] += stress_loss
 
         snapshot = {
             's1_active_sell_lots': total_lots,
@@ -2492,6 +2622,10 @@ class ToolkitMinuteEngine:
             's1_short_open_premium_pct': total_open_premium / nav,
             's1_short_liability_pct': total_liability / nav,
             's1_short_unrealized_premium_pct': (total_open_premium - total_liability) / nav,
+            's1_margin_used': total_margin,
+            's1_margin_used_pct': total_margin / nav,
+            's1_stress_loss_used': total_stress_loss,
+            's1_stress_loss_used_pct': total_stress_loss / nav,
         }
         call_lots = side_state['C']['lots']
         put_lots = side_state['P']['lots']
@@ -2511,6 +2645,48 @@ class ToolkitMinuteEngine:
             snapshot[f's1_{label}_unrealized_premium'] = open_premium - liability
             snapshot[f's1_{label}_open_premium_pct'] = open_premium / nav
             snapshot[f's1_{label}_liability_pct'] = liability / nav
+        regime_labels = {
+            'falling_vol_carry': 'falling',
+            'low_stable_vol': 'low',
+            'normal_vol': 'normal',
+            'high_rising_vol': 'high',
+            'post_stop_cooldown': 'post_stop',
+        }
+        for regime, label in regime_labels.items():
+            state = regime_state[regime]
+            open_premium = state['open_premium']
+            margin = state['margin']
+            snapshot[f's1_{label}_lots'] = state['lots']
+            snapshot[f's1_{label}_contracts'] = len(state['contracts'])
+            snapshot[f's1_{label}_products'] = len(state['products'])
+            snapshot[f's1_{label}_open_premium_pct'] = open_premium / nav
+            snapshot[f's1_{label}_margin_pct'] = margin / nav
+            snapshot[f's1_{label}_stress_loss_pct'] = state['stress_loss'] / nav
+            snapshot[f's1_{label}_open_premium_share'] = (
+                open_premium / total_open_premium if total_open_premium > 0 else 0.0
+            )
+            snapshot[f's1_{label}_margin_share'] = (
+                margin / total_margin if total_margin > 0 else 0.0
+            )
+
+        products_score = min(len(total_products) / 15.0, 1.0) if total_products else 0.0
+        contracts_score = min(len(total_contracts) / 40.0, 1.0) if total_contracts else 0.0
+        lots_per_contract = snapshot['s1_lots_per_contract']
+        granularity_score = min(20.0 / lots_per_contract, 1.0) if lots_per_contract > 0 else 0.0
+        premium_score = min((total_open_premium / nav) / 0.004, 1.0) if total_open_premium > 0 else 0.0
+        margin_score = min((total_margin / nav) / 0.12, 1.0) if total_margin > 0 else 0.0
+        snapshot['s1_ledet_similarity_score'] = 100.0 * (
+            0.25 * products_score +
+            0.25 * contracts_score +
+            0.20 * granularity_score +
+            0.15 * premium_score +
+            0.15 * margin_score
+        )
+        snapshot['s1_ledet_products_score'] = products_score
+        snapshot['s1_ledet_contracts_score'] = contracts_score
+        snapshot['s1_ledet_granularity_score'] = granularity_score
+        snapshot['s1_ledet_premium_score'] = premium_score
+        snapshot['s1_ledet_margin_score'] = margin_score
         return snapshot
 
     def _record_daily_diagnostics(self, date_str, nav):
