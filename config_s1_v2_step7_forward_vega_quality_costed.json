@@ -1,0 +1,11 @@
+{
+  "extends": "config_s1_v2_step7_forward_vega_quality.json",
+  "strategy_version": "s1_v2_step7_forward_vega_quality_costed",
+  "execution_slippage_enabled": true,
+  "execution_slippage_pct": 0.002,
+  "execution_open_slippage_pct": 0.002,
+  "execution_close_slippage_pct": 0.002,
+  "execution_stop_slippage_pct": 0.005,
+  "execution_slippage_min_abs": 0.0,
+  "execution_slippage_apply_to_expiry": false
+}

@@ -72,6 +72,7 @@ from product_lifecycle import (
     product_observation_ready,
 )
 from position_model import Position
+from execution_model import apply_execution_slippage
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
@@ -1100,7 +1101,18 @@ class ToolkitMinuteEngine:
             if price <= 0:
                 continue
 
+            raw_execution_price = price
+            open_action = 'sell_open' if item['role'] == 'sell' else 'buy_open'
+            price, execution_slippage = apply_execution_slippage(
+                raw_execution_price,
+                open_action,
+                self.config,
+            )
+
             # 成交量约束：用执行日全日成交量，匹配“全天TWAP执行”的口径
+            if price <= 0:
+                continue
+
             target_n = item['n']
             today_vol = day_volume.get(code, 0)
             max_today = max(1, int(today_vol * vol_limit_pct)) if today_vol > 0 else target_n
@@ -1172,6 +1184,12 @@ class ToolkitMinuteEngine:
                 underlying_code=item.get('underlying_code', ''),
             )
             pos.entry_meta = self._entry_meta_from_item(item)
+            slippage_cash = float(execution_slippage) * float(item['mult']) * float(actual_n)
+            pos.entry_meta.update({
+                'open_raw_execution_price': raw_execution_price,
+                'open_execution_slippage': execution_slippage,
+                'open_execution_slippage_cash': slippage_cash,
+            })
             one_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0)
             if one_loss > 0:
                 pos.stress_loss = one_loss * actual_n
@@ -1213,6 +1231,9 @@ class ToolkitMinuteEngine:
                 'code': code, 'option_type': item['opt_type'],
                 'strike': item['strike'], 'expiry': str(item['expiry'])[:10],
                 'price': round(price, 4), 'quantity': actual_n,
+                'raw_execution_price': round(raw_execution_price, 4),
+                'execution_slippage': round(execution_slippage, 6),
+                'execution_slippage_cash': round(slippage_cash, 2),
                 'fee': round(open_fee, 2), 'pnl': 0,
                 'stress_loss': round(pos.stress_loss, 2),
                 'open_margin': round(open_margin, 2),
@@ -2673,6 +2694,15 @@ class ToolkitMinuteEngine:
                     break
 
         for pos in to_close:
+            raw_execution_price = pos.cur_price
+            close_action = 'sell_close' if pos.role in ('buy', 'protect') else 'buy_close'
+            pos.cur_price, execution_slippage = apply_execution_slippage(
+                raw_execution_price,
+                close_action,
+                self.config,
+                reason=reason,
+            )
+            slippage_cash = float(execution_slippage) * float(pos.mult) * float(pos.n)
             if pos.role in ('buy', 'protect'):
                 pnl = (pos.cur_price - pos.prev_price) * pos.mult * pos.n
             else:
@@ -2713,6 +2743,9 @@ class ToolkitMinuteEngine:
                 'code': pos.code, 'option_type': pos.opt_type,
                 'strike': pos.strike, 'expiry': str(pos.expiry)[:10],
                 'price': round(pos.cur_price, 4), 'quantity': pos.n,
+                'raw_execution_price': round(raw_execution_price, 4),
+                'execution_slippage': round(execution_slippage, 6),
+                'execution_slippage_cash': round(slippage_cash, 2),
                 'fee': round(fee, 2), 'pnl': round(order_pnl, 2),
                 'stress_loss': round(float(pos.stress_loss or 0.0), 2),
                 'margin_at_close': round(pos.cur_margin() if pos.role == 'sell' else 0.0, 2),

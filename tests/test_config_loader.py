@@ -27,6 +27,21 @@ class ConfigLoaderTest(unittest.TestCase):
                 json.dump({"capital": 10}, f)
             self.assertEqual(load_engine_config(path, defaults), {"capital": 10, "fee": 2})
 
+    def test_config_extends_parent_file(self):
+        defaults = {"capital": 1, "fee": 2, "margin_cap": 0.5}
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = os.path.join(tmp, "base.json")
+            child = os.path.join(tmp, "child.json")
+            with open(parent, "w", encoding="utf-8") as f:
+                json.dump({"capital": 10, "fee": 3}, f)
+            with open(child, "w", encoding="utf-8") as f:
+                json.dump({"extends": "base.json", "fee": 5}, f)
+
+            self.assertEqual(
+                load_engine_config(child, defaults),
+                {"capital": 10, "fee": 5, "margin_cap": 0.5},
+            )
+
     def test_non_dict_config_is_ignored(self):
         defaults = {"capital": 1}
         with tempfile.TemporaryDirectory() as tmp:
