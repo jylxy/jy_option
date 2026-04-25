@@ -2002,36 +2002,49 @@ class ToolkitMinuteEngine:
             return max(1, int(self.config.get('s1_neighbor_contract_count', 3) or 1))
         return 1
 
-    def _s1_ladder_shape(self, side_meta=None):
+    def _s1_vol_regime_prefix(self, product=None):
+        regime = self._current_vol_regimes.get(product, 'normal_vol') if product else 'normal_vol'
+        return {
+            'falling_vol_carry': 'falling',
+            'low_stable_vol': 'low',
+            'high_rising_vol': 'high',
+            'post_stop_cooldown': 'high',
+        }.get(regime, 'normal')
+
+    def _s1_ladder_shape(self, side_meta=None, product=None):
         base_count = self._s1_max_selection_candidates()
         base_gap = float(self.config.get('s1_neighbor_max_delta_gap', 0.0) or 0.0)
-        if not self.config.get('s1_trend_ladder_enabled', False):
-            return base_count, base_gap
         role = str((side_meta or {}).get('trend_role', 'neutral') or 'neutral').lower()
         if role == 'strong':
             count_key = 's1_trend_ladder_strong_contract_count'
             gap_key = 's1_trend_ladder_strong_max_delta_gap'
+            role_key = 'strong'
         elif role == 'weak':
             count_key = 's1_trend_ladder_weak_contract_count'
             gap_key = 's1_trend_ladder_weak_max_delta_gap'
+            role_key = 'weak'
         else:
             count_key = 's1_trend_ladder_neutral_contract_count'
             gap_key = 's1_trend_ladder_neutral_max_delta_gap'
-        count = int(self.config.get(count_key, base_count) or base_count)
-        gap = float(self.config.get(gap_key, base_gap) or base_gap)
+            role_key = 'neutral'
+        count = base_count
+        gap = base_gap
+        if self.config.get('s1_trend_ladder_enabled', False):
+            count = int(self.config.get(count_key, count) or count)
+            gap = float(self.config.get(gap_key, gap) or gap)
+        if self.config.get('s1_regime_ladder_enabled', False):
+            prefix = self._s1_vol_regime_prefix(product)
+            regime_count_key = f'vol_regime_{prefix}_s1_ladder_{role_key}_contract_count'
+            regime_gap_key = f'vol_regime_{prefix}_s1_ladder_{role_key}_max_delta_gap'
+            count = int(self.config.get(regime_count_key, count) or count)
+            gap = float(self.config.get(regime_gap_key, gap) or gap)
         return max(1, count), max(0.0, gap)
 
     def _s1_stress_max_qty(self, product=None):
         base_qty = int(self.config.get('s1_stress_max_qty', 50) or 50)
         if not self.config.get('s1_regime_stress_max_qty_enabled', False):
             return base_qty
-        regime = self._current_vol_regimes.get(product, 'normal_vol') if product else 'normal_vol'
-        prefix = {
-            'falling_vol_carry': 'falling',
-            'low_stable_vol': 'low',
-            'high_rising_vol': 'high',
-            'post_stop_cooldown': 'high',
-        }.get(regime, 'normal')
+        prefix = self._s1_vol_regime_prefix(product)
         key = f'vol_regime_{prefix}_s1_stress_max_qty'
         return max(1, int(self.config.get(key, base_qty) or base_qty))
 
@@ -2039,13 +2052,7 @@ class ToolkitMinuteEngine:
         fallback_pct = max(0.0, float(fallback_pct or 0.0))
         if not self.config.get('s1_product_regime_stress_budget_enabled', False):
             return fallback_pct
-        regime = self._current_vol_regimes.get(product, 'normal_vol') if product else 'normal_vol'
-        prefix = {
-            'falling_vol_carry': 'falling',
-            'low_stable_vol': 'low',
-            'high_rising_vol': 'high',
-            'post_stop_cooldown': 'high',
-        }.get(regime, 'normal')
+        prefix = self._s1_vol_regime_prefix(product)
         key = f'vol_regime_{prefix}_s1_stress_loss_budget_pct'
         if key not in self.config:
             return fallback_pct
@@ -2238,7 +2245,7 @@ class ToolkitMinuteEngine:
         """S1开仓"""
         min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
         split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
-        max_candidates, max_delta_gap = self._s1_ladder_shape(side_meta)
+        max_candidates, max_delta_gap = self._s1_ladder_shape(side_meta, product=product)
         if preselected_candidates is None:
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
