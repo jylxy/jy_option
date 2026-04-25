@@ -267,6 +267,8 @@ DEFAULT_PARAMS = {
     "low_iv_structural_max_iv_std": 0.08,
     "low_iv_structural_margin_per_mult": 1.25,
     "low_iv_structural_require_low_stable": True,
+    "low_iv_structural_caution_enabled": False,
+    "low_iv_structural_s1_stress_budget_mult": 1.0,
     "portfolio_cash_vega_cap": 0.008,
     "portfolio_cash_gamma_cap": 0.0,
     "portfolio_bucket_cash_vega_cap": 0.0,

@@ -80,6 +80,34 @@ class S1LadderShapeTest(unittest.TestCase):
         self.assertAlmostEqual(normal_budget["bucket_margin_cap"], 0.18)
         self.assertAlmostEqual(normal_budget["portfolio_bucket_stress_loss_cap"], 0.004)
 
+    def test_structural_low_caution_reduces_non_falling_stress_budget(self):
+        config = {
+            "s1_product_regime_stress_budget_enabled": True,
+            "vol_regime_low_s1_stress_loss_budget_pct": 0.0015,
+            "vol_regime_falling_s1_stress_loss_budget_pct": 0.004,
+            "low_iv_structural_caution_enabled": True,
+            "low_iv_structural_s1_stress_budget_mult": 0.5,
+        }
+        engine = self.make_engine(
+            config,
+            {"CU": "low_stable_vol", "AU": "falling_vol_carry"},
+        )
+        engine._current_open_budget = {"risk_scale": 1.0}
+
+        low_budget = engine._product_s1_stress_budget_pct(
+            "CU",
+            0.0012,
+            iv_state={"is_structural_low_iv": True},
+        )
+        falling_budget = engine._product_s1_stress_budget_pct(
+            "AU",
+            0.0012,
+            iv_state={"is_structural_low_iv": True},
+        )
+
+        self.assertAlmostEqual(low_budget, 0.00075)
+        self.assertAlmostEqual(falling_budget, 0.004)
+
 
 if __name__ == "__main__":
     unittest.main()

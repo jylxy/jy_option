@@ -2051,7 +2051,7 @@ class ToolkitMinuteEngine:
         key = f'vol_regime_{prefix}_s1_stress_max_qty'
         return max(1, int(self.config.get(key, base_qty) or base_qty))
 
-    def _product_s1_stress_budget_pct(self, product, fallback_pct):
+    def _product_s1_stress_budget_pct(self, product, fallback_pct, iv_state=None):
         fallback_pct = max(0.0, float(fallback_pct or 0.0))
         if not self.config.get('s1_product_regime_stress_budget_enabled', False):
             return fallback_pct
@@ -2061,7 +2061,17 @@ class ToolkitMinuteEngine:
             return fallback_pct
         product_pct = max(0.0, float(self.config.get(key, fallback_pct) or fallback_pct))
         risk_scale = float((self._current_open_budget or {}).get('risk_scale', 1.0) or 1.0)
-        return product_pct * max(0.0, risk_scale)
+        product_pct *= max(0.0, risk_scale)
+        if (
+            self.config.get('low_iv_structural_caution_enabled', False) and
+            prefix != 'falling' and
+            bool((iv_state or {}).get('is_structural_low_iv', False))
+        ):
+            product_pct *= max(
+                0.0,
+                float(self.config.get('low_iv_structural_s1_stress_budget_mult', 1.0) or 0.0),
+            )
+        return product_pct
 
     def _product_regime_open_budget(self, product, budget):
         budget = normalize_open_budget(budget or {})
@@ -2315,7 +2325,11 @@ class ToolkitMinuteEngine:
             stress_budget_pct = float(open_budget.get('s1_stress_loss_budget_pct') or 0.0)
         else:
             stress_budget_pct = float(self.config.get('s1_stress_loss_budget_pct', 0.0010) or 0.0) * regime_scale
-        stress_budget_pct = self._product_s1_stress_budget_pct(product, stress_budget_pct)
+        stress_budget_pct = self._product_s1_stress_budget_pct(
+            product,
+            stress_budget_pct,
+            iv_state=iv_state,
+        )
         side_budget_mult = max(0.0, float(side_meta.get('budget_mult', 1.0) or 0.0))
         remaining_stress_budget = nav * stress_budget_pct * float(iv_scale or 1.0) * side_budget_mult
         remaining_margin_budget = nav * float(margin_per or 0.0) / 2.0 * float(iv_scale or 1.0) * side_budget_mult
