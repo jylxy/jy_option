@@ -91,6 +91,63 @@ falling_vol_carry 分层 vega_pnl > 0
 
 只有当 theta 为正、vega 为正、gamma/delta 尾损受控时，S1 才能被视为真正的卖波 carry 策略。
 
+### 3.3 乐得画像目标
+
+除收益、回撤和 vega 归因外，S1 v2 还需要逐步接近乐得的持仓画像。这里的“像乐得”不是复制具体合约或简单提高保证金，而是学习其卖权组合的结构特征：
+
+```text
+多品种
+多执行价
+小单腿
+低 Delta
+P/C 随环境动态倾斜
+不盘中机械控 Delta/Gamma
+用权利金止损和降波重建处理风险
+冲击后在降波期能重新铺仓
+```
+
+当前 F4c 与乐得画像的主要差距：
+
+- 乐得持仓覆盖约数十个产品，我们当前平均活跃产品只有约 `6-7` 个。
+- 乐得有上百条卖权明细，我们当前平均活跃合约只有约 `13` 个。
+- 乐得单条腿颗粒度更细，我们之前单合约手数偏粗，`F4b` 的 `20` 手上限是正确方向。
+- P/C 总比例不是最大矛盾。关键是 P/C 应随趋势、波动状态和权利金质量自然倾斜。
+- 冲击后进入降波环境时，乐得修复速度更快；我们当前降波期铺仓不足。
+
+S1 v2 需要引入 `Ledet Similarity` 诊断，用以下指标衡量画像接近度：
+
+```text
+active_products
+active_contracts
+contracts_per_product
+lots_per_contract
+call_lot_share
+put_call_lot_ratio
+open_premium_pct
+short_liability_pct
+margin_used_pct
+stress_loss_used_pct
+post_shock_rebuild_speed
+falling_vol_budget_usage
+```
+
+阶段目标：
+
+```text
+active_products：先从 6-7 提升到 10-15，长期目标靠近 25-35。
+active_contracts：先从 13 左右提升到 25-40，长期目标靠近 80-150。
+lots_per_contract：继续下降，优先多腿少手，而不是单腿放大。
+margin_used_pct：不能长期只有 6%-8%，但必须由 stress budget 和情景压力约束。
+post_shock_rebuild_speed：冲击后进入高质量降波期时，仓位和权利金负债应能明显恢复。
+```
+
+约束：
+
+- 不为“像乐得”而牺牲最大回撤目标。
+- 不为“像乐得”而把 `low_stable_vol` 当作降波机会放大。
+- 不为“像乐得”而提高单腿集中度。
+- 乐得画像是结构目标，不是风险复制目标；我们仍要用 scenario stress、vega 归因和 stop cluster 控制尾部。
+
 ## 4. 状态定义
 
 S1 v2 不再把所有低波或降波都视为同一种安全状态。至少分为四类：
@@ -402,6 +459,7 @@ DTE 临近且 gamma 风险上升
 - 按 action 的 PnL：止损、换月、到期、资本效率退出。
 - Greek 归因：delta、gamma、theta、vega、residual。
 - vega_pnl 是否为正，尤其是主收益分层是否为正。
+- Ledet Similarity 画像指标：活跃品种数、活跃合约数、每合约手数、每品种合约数、P/C、权利金负债、保证金和降波期重建速度。
 - 候选漏斗：每天每一层过滤掉多少候选。
 - 异常报价触发、跳价确认和执行偏离。
 
@@ -412,6 +470,8 @@ DTE 临近且 gamma 风险上升
 vega_pnl > 0。
 theta_pnl > 0。
 gamma/delta 尾损不吞噬大部分 theta/vega。
+Ledet Similarity 改善，尤其是多品种、多合约、小单腿和降波重建速度改善。
+画像改善不能以放大回撤或让 vega_pnl 转负为代价。
 最大单日亏损不吃掉数月 carry。
 样本外表现不显著劣化。
 参数变化不导致结果剧烈翻转。
@@ -424,6 +484,9 @@ gamma/delta 尾损不吞噬大部分 theta/vega。
 建议按以下顺序推进，不一次性混改：
 
 ```text
+Step 0: Ledet Similarity 与候选漏斗诊断
+    先输出持仓画像、候选漏斗和降波期重建速度，不改变交易。
+
 Step 1: 候选漏斗与四类评分诊断
     先输出 Richness、Regime、Greek Safety、Liquidity、VCOS，不改变交易。
 
