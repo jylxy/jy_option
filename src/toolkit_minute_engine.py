@@ -148,8 +148,12 @@ class ToolkitMinuteEngine:
         'contract_iv_skew_to_atm', 'contract_skew_change_for_vega',
         'contract_price_change_1d',
         'effective_margin_cap', 'effective_strategy_margin_cap',
-        'effective_product_margin_cap', 'effective_bucket_margin_cap',
+        'effective_product_margin_cap', 'effective_product_side_margin_cap',
+        'effective_bucket_margin_cap', 'effective_corr_group_margin_cap',
         'effective_stress_loss_cap', 'effective_bucket_stress_loss_cap',
+        'effective_product_side_stress_loss_cap',
+        'effective_corr_group_stress_loss_cap',
+        'effective_contract_stress_loss_cap',
         'open_budget_risk_scale', 'open_budget_brake_reason',
         'trend_state', 'trend_score', 'trend_confidence',
         'trend_range_position', 'trend_range_pressure',
@@ -960,7 +964,8 @@ class ToolkitMinuteEngine:
     def _passes_portfolio_construction(self, product, nav, new_margin, date_str=None,
                                        new_cash_vega=0.0, new_cash_gamma=0.0,
                                        new_stress_loss=0.0, budget=None,
-                                       include_pending=True):
+                                       include_pending=True, option_type=None,
+                                       code=None, new_lots=0.0):
         budget = budget or self._current_open_budget or self._get_effective_open_budget()
         return port_risk.passes_portfolio_construction(
             self.config,
@@ -979,6 +984,9 @@ class ToolkitMinuteEngine:
             new_stress_loss=new_stress_loss,
             budget=budget,
             include_pending=include_pending,
+            option_type=option_type,
+            code=code,
+            new_lots=new_lots,
         )
 
     def _diversify_product_order(self, products):
@@ -1215,6 +1223,9 @@ class ToolkitMinuteEngine:
                     new_stress_loss=new_stress_loss,
                     budget=exec_budget,
                     include_pending=False,
+                    option_type=item.get('opt_type'),
+                    code=code,
+                    new_lots=actual_n,
                 ):
                     continue
 
@@ -2510,6 +2521,9 @@ class ToolkitMinuteEngine:
                     new_cash_gamma=new_greeks['cash_gamma'],
                     new_stress_loss=total_stress_loss,
                     budget=product_budget,
+                    option_type=ot,
+                    code=row.get('option_code', ''),
+                    new_lots=qty,
                 )
 
             lo, hi = 0, target_qty
@@ -2712,6 +2726,9 @@ class ToolkitMinuteEngine:
             product, nav, sm * sq, date_str=date_str,
             new_cash_vega=new_greeks['cash_vega'],
             new_cash_gamma=new_greeks['cash_gamma'],
+            option_type=ot,
+            code=sl['option_code'],
+            new_lots=sq,
         ):
             return
         group_id = f"S3_{product}_{ot}_{exp}_{date_str}"
@@ -3026,8 +3043,17 @@ class ToolkitMinuteEngine:
         if not self.config.get('portfolio_diagnostics_enabled', True):
             return
         nav = max(float(nav), 1.0)
+        budget = self._current_open_budget or self._get_effective_open_budget()
         bucket_max_active = int(self.config.get('portfolio_bucket_max_active_products', 3) or 0)
         corr_max_active = int(self.config.get('portfolio_corr_group_max_active_products', 2) or 0)
+        bucket_margin_cap = float(budget.get('bucket_margin_cap', 0.0) or 0.0)
+        bucket_stress_cap = float(budget.get('portfolio_bucket_stress_loss_cap', 0.0) or 0.0)
+        corr_group_margin_cap = float(budget.get('corr_group_margin_cap', 0.0) or 0.0)
+        corr_group_stress_cap = float(budget.get('corr_group_stress_loss_cap', 0.0) or 0.0)
+        product_side_margin_cap = float(budget.get('product_side_margin_cap', 0.0) or 0.0)
+        product_side_stress_cap = float(budget.get('product_side_stress_loss_cap', 0.0) or 0.0)
+        contract_lot_cap = int(self.config.get('portfolio_contract_lot_cap', 0) or 0)
+        contract_stress_cap = float(budget.get('contract_stress_loss_cap', 0.0) or 0.0)
         bucket_state = defaultdict(lambda: {
             'margin': 0.0,
             'cash_vega': 0.0,
@@ -3051,6 +3077,8 @@ class ToolkitMinuteEngine:
             'cash_theta': 0.0,
             'stress_loss': 0.0,
             'contracts': set(),
+            'contract_lots': defaultdict(float),
+            'contract_stress_loss': defaultdict(float),
             'lots': 0.0,
             'open_premium': 0.0,
             'liability': 0.0,
@@ -3079,7 +3107,10 @@ class ToolkitMinuteEngine:
                 data['cash_theta'] += pos.cash_theta()
                 data['stress_loss'] += stress_loss
                 data['contracts'].add(pos.code)
-                data['lots'] += float(pos.n or 0.0)
+                lots = float(pos.n or 0.0)
+                data['lots'] += lots
+                data['contract_lots'][pos.code] += lots
+                data['contract_stress_loss'][pos.code] += stress_loss
                 data['open_premium'] += float(pos.open_price) * float(pos.mult) * float(pos.n or 0.0)
                 data['liability'] += float(pos.cur_price) * float(pos.mult) * float(pos.n or 0.0)
         for bucket, data in bucket_state.items():
@@ -3091,6 +3122,14 @@ class ToolkitMinuteEngine:
                 'cash_vega_pct': data['cash_vega'] / nav,
                 'cash_gamma_pct': data['cash_gamma'] / nav,
                 'stress_loss_pct': data['stress_loss'] / nav,
+                'margin_cap': bucket_margin_cap,
+                'stress_loss_cap': bucket_stress_cap,
+                'margin_cap_used': (
+                    data['margin'] / nav / bucket_margin_cap if bucket_margin_cap > 0 else np.nan
+                ),
+                'stress_cap_used': (
+                    data['stress_loss'] / nav / bucket_stress_cap if bucket_stress_cap > 0 else np.nan
+                ),
                 'n_products': len(data['products']),
                 'n_positions': data['positions'],
                 'max_active_products': bucket_max_active,
@@ -3103,6 +3142,11 @@ class ToolkitMinuteEngine:
             bucket = self._get_product_bucket(product)
             corr_group = self._get_product_corr_group(product)
             unrealized_premium = data['open_premium'] - data['liability']
+            max_contract_lots = max(data['contract_lots'].values()) if data['contract_lots'] else 0.0
+            max_contract_stress = (
+                max(data['contract_stress_loss'].values())
+                if data['contract_stress_loss'] else 0.0
+            )
             self.diagnostics_records.append({
                 'date': date_str,
                 'scope': 's1_product_side',
@@ -3114,11 +3158,32 @@ class ToolkitMinuteEngine:
                 'product_vol_regime': self._current_vol_regimes.get(product, ''),
                 'lots': data['lots'],
                 'n_contracts': len(data['contracts']),
+                'max_contract_lots': max_contract_lots,
                 'margin_pct': data['margin'] / nav,
                 'cash_vega_pct': data['cash_vega'] / nav,
                 'cash_gamma_pct': data['cash_gamma'] / nav,
                 'cash_theta_pct': data['cash_theta'] / nav,
                 'stress_loss_pct': data['stress_loss'] / nav,
+                'max_contract_stress_loss_pct': max_contract_stress / nav,
+                'margin_cap': product_side_margin_cap,
+                'stress_loss_cap': product_side_stress_cap,
+                'contract_lot_cap': contract_lot_cap,
+                'contract_stress_loss_cap': contract_stress_cap,
+                'margin_cap_used': (
+                    data['margin'] / nav / product_side_margin_cap
+                    if product_side_margin_cap > 0 else np.nan
+                ),
+                'stress_cap_used': (
+                    data['stress_loss'] / nav / product_side_stress_cap
+                    if product_side_stress_cap > 0 else np.nan
+                ),
+                'max_contract_lot_cap_used': (
+                    max_contract_lots / contract_lot_cap if contract_lot_cap > 0 else np.nan
+                ),
+                'max_contract_stress_cap_used': (
+                    max_contract_stress / nav / contract_stress_cap
+                    if contract_stress_cap > 0 else np.nan
+                ),
                 'open_premium': data['open_premium'],
                 'current_liability': data['liability'],
                 'unrealized_premium': unrealized_premium,
@@ -3136,6 +3201,16 @@ class ToolkitMinuteEngine:
                 'cash_vega_pct': data['cash_vega'] / nav,
                 'cash_gamma_pct': data['cash_gamma'] / nav,
                 'stress_loss_pct': data['stress_loss'] / nav,
+                'margin_cap': corr_group_margin_cap,
+                'stress_loss_cap': corr_group_stress_cap,
+                'margin_cap_used': (
+                    data['margin'] / nav / corr_group_margin_cap
+                    if corr_group_margin_cap > 0 else np.nan
+                ),
+                'stress_cap_used': (
+                    data['stress_loss'] / nav / corr_group_stress_cap
+                    if corr_group_stress_cap > 0 else np.nan
+                ),
                 'n_products': len(data['products']),
                 'n_positions': data['positions'],
                 'max_active_products': corr_max_active,
@@ -3194,7 +3269,9 @@ class ToolkitMinuteEngine:
             'effective_s1_margin_cap': budget.get('s1_margin_cap', np.nan),
             'effective_s3_margin_cap': budget.get('s3_margin_cap', np.nan),
             'effective_product_margin_cap': budget.get('product_margin_cap', np.nan),
+            'effective_product_side_margin_cap': budget.get('product_side_margin_cap', np.nan),
             'effective_bucket_margin_cap': budget.get('bucket_margin_cap', np.nan),
+            'effective_corr_group_margin_cap': budget.get('corr_group_margin_cap', np.nan),
             'effective_bucket_max_active_products': int(
                 self.config.get('portfolio_bucket_max_active_products', 3) or 0
             ),
@@ -3203,6 +3280,10 @@ class ToolkitMinuteEngine:
             ),
             'effective_stress_loss_cap': budget.get('portfolio_stress_loss_cap', np.nan),
             'effective_bucket_stress_loss_cap': budget.get('portfolio_bucket_stress_loss_cap', np.nan),
+            'effective_product_side_stress_loss_cap': budget.get('product_side_stress_loss_cap', np.nan),
+            'effective_corr_group_stress_loss_cap': budget.get('corr_group_stress_loss_cap', np.nan),
+            'effective_contract_stress_loss_cap': budget.get('contract_stress_loss_cap', np.nan),
+            'effective_contract_lot_cap': int(self.config.get('portfolio_contract_lot_cap', 0) or 0),
             'effective_s1_stress_budget_pct': budget.get('s1_stress_loss_budget_pct', np.nan),
             'open_budget_risk_scale': budget.get('risk_scale', np.nan),
             'open_budget_brake_reason': budget.get('brake_reason', ''),

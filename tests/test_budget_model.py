@@ -21,15 +21,25 @@ class BudgetModelTest(unittest.TestCase):
             "s3_margin_cap": 0.40,
             "margin_per": 0.02,
             "product_margin_cap": 0.25,
+            "product_side_margin_cap": 0.22,
             "bucket_margin_cap": 0.18,
+            "corr_group_margin_cap": 0.20,
             "portfolio_stress_loss_cap": 0.03,
             "portfolio_bucket_stress_loss_cap": 0.05,
+            "product_side_stress_loss_cap": 0.04,
+            "corr_group_stress_loss_cap": 0.05,
+            "contract_stress_loss_cap": 0.04,
             "s1_stress_loss_budget_pct": 0.04,
         })
         self.assertEqual(budget["s1_margin_cap"], 0.30)
         self.assertEqual(budget["s3_margin_cap"], 0.30)
         self.assertEqual(budget["product_margin_cap"], 0.18)
+        self.assertEqual(budget["product_side_margin_cap"], 0.18)
+        self.assertEqual(budget["corr_group_margin_cap"], 0.20)
         self.assertEqual(budget["portfolio_bucket_stress_loss_cap"], 0.03)
+        self.assertEqual(budget["product_side_stress_loss_cap"], 0.03)
+        self.assertEqual(budget["corr_group_stress_loss_cap"], 0.03)
+        self.assertEqual(budget["contract_stress_loss_cap"], 0.03)
         self.assertEqual(budget["s1_stress_loss_budget_pct"], 0.03)
 
     def test_regime_budget_and_brake(self):
@@ -39,8 +49,13 @@ class BudgetModelTest(unittest.TestCase):
             "s1_margin_cap": 0.25,
             "s3_margin_cap": 0.25,
             "portfolio_product_margin_cap": 0.08,
+            "portfolio_product_side_margin_cap": 0.05,
             "portfolio_bucket_margin_cap": 0.18,
+            "portfolio_corr_group_margin_cap": 0.12,
             "portfolio_stress_loss_cap": 0.03,
+            "portfolio_product_side_stress_loss_cap": 0.004,
+            "portfolio_corr_group_stress_loss_cap": 0.006,
+            "portfolio_contract_stress_loss_cap": 0.002,
             "s1_stress_loss_budget_pct": 0.001,
             "vol_regime_falling_margin_cap": 0.40,
             "vol_regime_falling_s1_margin_cap": 0.35,
@@ -71,9 +86,14 @@ class BudgetModelTest(unittest.TestCase):
             "s3_margin_cap": 0.20,
             "margin_per": 0.02,
             "product_margin_cap": 0.10,
+            "product_side_margin_cap": 0.06,
             "bucket_margin_cap": 0.20,
+            "corr_group_margin_cap": 0.15,
             "portfolio_stress_loss_cap": 0.03,
             "portfolio_bucket_stress_loss_cap": 0.02,
+            "product_side_stress_loss_cap": 0.015,
+            "corr_group_stress_loss_cap": 0.018,
+            "contract_stress_loss_cap": 0.012,
             "s1_stress_loss_budget_pct": 0.001,
         })
         item = {
@@ -81,9 +101,14 @@ class BudgetModelTest(unittest.TestCase):
             "effective_margin_cap": 0.35,
             "effective_strategy_margin_cap": 0.25,
             "effective_product_margin_cap": 0.12,
+            "effective_product_side_margin_cap": 0.05,
             "effective_bucket_margin_cap": 0.15,
+            "effective_corr_group_margin_cap": 0.20,
             "effective_stress_loss_cap": 0.02,
             "effective_bucket_stress_loss_cap": 0.03,
+            "effective_product_side_stress_loss_cap": 0.010,
+            "effective_corr_group_stress_loss_cap": 0.016,
+            "effective_contract_stress_loss_cap": 0.008,
             "effective_s1_stress_budget_pct": 0.0008,
         }
         budget = execution_budget_for_item(
@@ -94,9 +119,14 @@ class BudgetModelTest(unittest.TestCase):
         self.assertAlmostEqual(budget["margin_cap"], 0.35)
         self.assertAlmostEqual(budget["s1_margin_cap"], 0.25)
         self.assertAlmostEqual(budget["product_margin_cap"], 0.10)
+        self.assertAlmostEqual(budget["product_side_margin_cap"], 0.05)
         self.assertAlmostEqual(budget["bucket_margin_cap"], 0.15)
+        self.assertAlmostEqual(budget["corr_group_margin_cap"], 0.15)
         self.assertAlmostEqual(budget["portfolio_stress_loss_cap"], 0.02)
         self.assertAlmostEqual(budget["portfolio_bucket_stress_loss_cap"], 0.02)
+        self.assertAlmostEqual(budget["product_side_stress_loss_cap"], 0.010)
+        self.assertAlmostEqual(budget["corr_group_stress_loss_cap"], 0.016)
+        self.assertAlmostEqual(budget["contract_stress_loss_cap"], 0.008)
         self.assertAlmostEqual(budget["s1_stress_loss_budget_pct"], 0.0008)
 
     def test_execution_budget_can_preserve_signal_product_overrides(self):
@@ -105,9 +135,14 @@ class BudgetModelTest(unittest.TestCase):
             "s1_margin_cap": 0.25,
             "margin_per": 0.02,
             "product_margin_cap": 0.08,
+            "product_side_margin_cap": 0.04,
             "bucket_margin_cap": 0.18,
+            "corr_group_margin_cap": 0.10,
             "portfolio_stress_loss_cap": 0.03,
             "portfolio_bucket_stress_loss_cap": 0.004,
+            "product_side_stress_loss_cap": 0.002,
+            "corr_group_stress_loss_cap": 0.003,
+            "contract_stress_loss_cap": 0.0015,
             "s1_stress_loss_budget_pct": 0.001,
         })
         item = {
@@ -115,9 +150,14 @@ class BudgetModelTest(unittest.TestCase):
             "effective_margin_cap": 0.40,
             "effective_strategy_margin_cap": 0.25,
             "effective_product_margin_cap": 0.12,
+            "effective_product_side_margin_cap": 0.07,
             "effective_bucket_margin_cap": 0.24,
+            "effective_corr_group_margin_cap": 0.16,
             "effective_stress_loss_cap": 0.02,
             "effective_bucket_stress_loss_cap": 0.006,
+            "effective_product_side_stress_loss_cap": 0.005,
+            "effective_corr_group_stress_loss_cap": 0.006,
+            "effective_contract_stress_loss_cap": 0.004,
             "effective_s1_stress_budget_pct": 0.0008,
         }
         budget = execution_budget_for_item(
@@ -132,19 +172,38 @@ class BudgetModelTest(unittest.TestCase):
         self.assertAlmostEqual(budget["margin_cap"], 0.40)
         self.assertAlmostEqual(budget["s1_margin_cap"], 0.25)
         self.assertAlmostEqual(budget["product_margin_cap"], 0.12)
+        self.assertAlmostEqual(budget["product_side_margin_cap"], 0.07)
         self.assertAlmostEqual(budget["bucket_margin_cap"], 0.24)
+        self.assertAlmostEqual(budget["corr_group_margin_cap"], 0.16)
         self.assertAlmostEqual(budget["portfolio_stress_loss_cap"], 0.02)
         self.assertAlmostEqual(budget["portfolio_bucket_stress_loss_cap"], 0.006)
+        self.assertAlmostEqual(budget["product_side_stress_loss_cap"], 0.005)
+        self.assertAlmostEqual(budget["corr_group_stress_loss_cap"], 0.006)
+        self.assertAlmostEqual(budget["contract_stress_loss_cap"], 0.004)
         self.assertAlmostEqual(budget["s1_stress_loss_budget_pct"], 0.0008)
 
     def test_pending_budget_fields(self):
         fields = pending_budget_fields(
-            {"margin_cap": 0.4, "product_margin_cap": 0.1, "risk_scale": 0.5},
+            {
+                "margin_cap": 0.4,
+                "product_margin_cap": 0.1,
+                "product_side_margin_cap": 0.05,
+                "corr_group_margin_cap": 0.12,
+                "product_side_stress_loss_cap": 0.004,
+                "corr_group_stress_loss_cap": 0.006,
+                "contract_stress_loss_cap": 0.002,
+                "risk_scale": 0.5,
+            },
             strategy_cap=0.25,
         )
         self.assertEqual(fields["effective_margin_cap"], 0.4)
         self.assertEqual(fields["effective_strategy_margin_cap"], 0.25)
         self.assertEqual(fields["effective_product_margin_cap"], 0.1)
+        self.assertEqual(fields["effective_product_side_margin_cap"], 0.05)
+        self.assertEqual(fields["effective_corr_group_margin_cap"], 0.12)
+        self.assertEqual(fields["effective_product_side_stress_loss_cap"], 0.004)
+        self.assertEqual(fields["effective_corr_group_stress_loss_cap"], 0.006)
+        self.assertEqual(fields["effective_contract_stress_loss_cap"], 0.002)
         self.assertEqual(fields["open_budget_risk_scale"], 0.5)
 
 

@@ -239,41 +239,115 @@ def get_open_concentration_state(positions, pending_opens, normalize_product_key
                                  include_pending=True):
     state = {
         "product_margin": defaultdict(float),
+        "product_side_margin": defaultdict(float),
+        "product_side_stress_loss": defaultdict(float),
         "bucket_margin": defaultdict(float),
         "bucket_products": defaultdict(set),
+        "corr_group_margin": defaultdict(float),
+        "corr_group_stress_loss": defaultdict(float),
         "corr_products": defaultdict(set),
+        "contract_lots": defaultdict(float),
+        "contract_margin": defaultdict(float),
+        "contract_stress_loss": defaultdict(float),
     }
-    for product, margin in iter_open_sell_exposures(
-        positions,
-        pending_opens,
-        normalize_product_key,
-        include_pending=include_pending,
-    ):
+
+    def add_exposure(product, option_type, code, margin, lots, stress_loss):
+        product = normalize_product_key(product)
         if not product:
-            continue
+            return
+        margin = float(margin or 0.0)
+        lots = float(lots or 0.0)
+        stress_loss = float(stress_loss or 0.0)
+        side = str(option_type or "").upper()[:1]
+        code = str(code or "")
         bucket = get_product_bucket(product)
         corr_group = get_product_corr_group(product)
         state["product_margin"][product] += margin
+        if side:
+            product_side = (product, side)
+            state["product_side_margin"][product_side] += margin
+            state["product_side_stress_loss"][product_side] += stress_loss
         state["bucket_margin"][bucket] += margin
         state["bucket_products"][bucket].add(product)
+        state["corr_group_margin"][corr_group] += margin
+        state["corr_group_stress_loss"][corr_group] += stress_loss
         state["corr_products"][corr_group].add(product)
+        if code:
+            state["contract_lots"][code] += lots
+            state["contract_margin"][code] += margin
+            state["contract_stress_loss"][code] += stress_loss
+
+    for pos in positions:
+        if pos.role != "sell":
+            continue
+        add_exposure(
+            pos.product,
+            getattr(pos, "opt_type", ""),
+            getattr(pos, "code", ""),
+            pos.cur_margin(),
+            getattr(pos, "n", 0.0),
+            getattr(pos, "stress_loss", 0.0),
+        )
+    if include_pending:
+        for item in pending_opens:
+            if item.get("role") != "sell":
+                continue
+            one_loss = float(item.get("one_contract_stress_loss", 0.0) or 0.0)
+            lots = float(item.get("n", 0.0) or 0.0)
+            add_exposure(
+                item.get("product", ""),
+                item.get("opt_type", ""),
+                item.get("code", ""),
+                item.get("margin", 0.0),
+                lots,
+                item.get("stress_loss", one_loss * lots),
+            )
     return state
 
 
 def passes_concentration_limits(config, *, product, nav, new_margin, date_str,
                                 budget, concentration_state, spot_history,
                                 normalize_product_key, get_product_bucket,
-                                get_product_corr_group):
+                                get_product_corr_group, option_type=None,
+                                code=None, new_lots=0.0,
+                                new_stress_loss=0.0):
     product = normalize_product_key(product)
     product_cap = float(
         budget.get("product_margin_cap", config.get("portfolio_product_margin_cap", 0.08)) or 0.0
     )
+    product_side_cap = float(
+        budget.get(
+            "product_side_margin_cap",
+            config.get("portfolio_product_side_margin_cap", 0.0),
+        ) or 0.0
+    )
+    product_side_stress_cap = float(
+        budget.get(
+            "product_side_stress_loss_cap",
+            config.get("portfolio_product_side_stress_loss_cap", 0.0),
+        ) or 0.0
+    )
     bucket = get_product_bucket(product)
     corr_group = get_product_corr_group(product)
+    side = str(option_type or "").upper()[:1]
+    code = str(code or "")
+    new_margin = float(new_margin or 0.0)
+    new_lots = float(new_lots or 0.0)
+    new_stress_loss = float(new_stress_loss or 0.0)
 
     if product_cap > 0:
         if (concentration_state["product_margin"].get(product, 0.0) + new_margin) / nav > product_cap:
             return False
+    if side:
+        product_side = (product, side)
+        if product_side_cap > 0:
+            used = concentration_state["product_side_margin"].get(product_side, 0.0)
+            if (used + new_margin) / nav > product_side_cap:
+                return False
+        if product_side_stress_cap > 0 and new_stress_loss > 0:
+            used = concentration_state["product_side_stress_loss"].get(product_side, 0.0)
+            if (used + new_stress_loss) / nav > product_side_stress_cap:
+                return False
 
     if config.get("portfolio_bucket_control_enabled", True):
         bucket_cap = float(
@@ -289,9 +363,29 @@ def passes_concentration_limits(config, *, product, nav, new_margin, date_str,
 
     if config.get("portfolio_corr_control_enabled", True):
         corr_max_active = int(config.get("portfolio_corr_group_max_active_products", 2) or 0)
+        corr_group_cap = float(
+            budget.get(
+                "corr_group_margin_cap",
+                config.get("portfolio_corr_group_margin_cap", 0.0),
+            ) or 0.0
+        )
+        corr_group_stress_cap = float(
+            budget.get(
+                "corr_group_stress_loss_cap",
+                config.get("portfolio_corr_group_stress_loss_cap", 0.0),
+            ) or 0.0
+        )
         corr_products = concentration_state["corr_products"].get(corr_group, set())
         if corr_max_active > 0 and product not in corr_products and len(corr_products) >= corr_max_active:
             return False
+        if corr_group_cap > 0:
+            used = concentration_state["corr_group_margin"].get(corr_group, 0.0)
+            if (used + new_margin) / nav > corr_group_cap:
+                return False
+        if corr_group_stress_cap > 0 and new_stress_loss > 0:
+            used = concentration_state["corr_group_stress_loss"].get(corr_group, 0.0)
+            if (used + new_stress_loss) / nav > corr_group_stress_cap:
+                return False
         if config.get("portfolio_dynamic_corr_control_enabled", True) and date_str is not None:
             corr_threshold = float(config.get("portfolio_corr_threshold", 0.70) or 0.0)
             max_high_corr_peers = int(config.get("portfolio_corr_max_high_corr_peers", 1) or 0)
@@ -313,6 +407,23 @@ def passes_concentration_limits(config, *, product, nav, new_margin, date_str,
                 if high_corr_peers > max_high_corr_peers:
                     return False
 
+    if code:
+        contract_lot_cap = int(config.get("portfolio_contract_lot_cap", 0) or 0)
+        contract_stress_cap = float(
+            budget.get(
+                "contract_stress_loss_cap",
+                config.get("portfolio_contract_stress_loss_cap", 0.0),
+            ) or 0.0
+        )
+        if contract_lot_cap > 0:
+            used_lots = concentration_state["contract_lots"].get(code, 0.0)
+            if used_lots + new_lots > contract_lot_cap:
+                return False
+        if contract_stress_cap > 0 and new_stress_loss > 0:
+            used_stress = concentration_state["contract_stress_loss"].get(code, 0.0)
+            if (used_stress + new_stress_loss) / nav > contract_stress_cap:
+                return False
+
     return True
 
 
@@ -322,7 +433,8 @@ def passes_portfolio_construction(config, *, product, nav, new_margin,
                                   get_product_corr_group, date_str=None,
                                   new_cash_vega=0.0, new_cash_gamma=0.0,
                                   new_stress_loss=0.0, budget=None,
-                                  include_pending=True):
+                                  include_pending=True, option_type=None,
+                                  code=None, new_lots=0.0):
     budget = budget or {}
     greek_state = get_open_greek_state(
         positions,
@@ -383,6 +495,10 @@ def passes_portfolio_construction(config, *, product, nav, new_margin,
         normalize_product_key=normalize_product_key,
         get_product_bucket=get_product_bucket,
         get_product_corr_group=get_product_corr_group,
+        option_type=option_type,
+        code=code,
+        new_lots=new_lots,
+        new_stress_loss=new_stress_loss,
     ):
         return False
 

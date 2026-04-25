@@ -36,10 +36,14 @@ def corr_group(product):
 class FakePosition:
     def __init__(self, product, margin=0.0, strat="S1", role="sell",
                  cash_delta=0.0, cash_vega=0.0, cash_gamma=0.0,
-                 stress_loss=0.0):
+                 stress_loss=0.0, opt_type="P", code="TESTP",
+                 n=1):
         self.product = product
         self.strat = strat
         self.role = role
+        self.opt_type = opt_type
+        self.code = code
+        self.n = n
         self._margin = margin
         self._cash_delta = cash_delta
         self._cash_vega = cash_vega
@@ -112,6 +116,108 @@ class PortfolioRiskTest(unittest.TestCase):
             get_product_bucket=bucket,
             get_product_corr_group=corr_group,
             budget={},
+        )
+
+        self.assertFalse(ok)
+
+    def test_passes_portfolio_construction_rejects_product_side_stress_cap(self):
+        cfg = {
+            "portfolio_construction_enabled": True,
+            "portfolio_product_margin_cap": 0.50,
+            "portfolio_product_side_margin_cap": 0.50,
+            "portfolio_product_side_stress_loss_cap": 0.02,
+            "portfolio_bucket_control_enabled": False,
+            "portfolio_corr_control_enabled": False,
+            "portfolio_stress_gate_enabled": False,
+        }
+        positions = [
+            FakePosition("CU", margin=50.0, stress_loss=15.0, opt_type="P", code="CUP1", n=5)
+        ]
+
+        ok = pr.passes_portfolio_construction(
+            cfg,
+            product="CU",
+            nav=1000.0,
+            new_margin=10.0,
+            positions=positions,
+            pending_opens=[],
+            spot_history={},
+            normalize_product_key=norm,
+            get_product_bucket=bucket,
+            get_product_corr_group=corr_group,
+            budget={},
+            option_type="P",
+            code="CUP2",
+            new_lots=2,
+            new_stress_loss=10.0,
+        )
+
+        self.assertFalse(ok)
+
+    def test_passes_portfolio_construction_rejects_corr_group_stress_cap(self):
+        cfg = {
+            "portfolio_construction_enabled": True,
+            "portfolio_product_margin_cap": 0.50,
+            "portfolio_bucket_control_enabled": False,
+            "portfolio_corr_control_enabled": True,
+            "portfolio_corr_group_max_active_products": 5,
+            "portfolio_corr_group_stress_loss_cap": 0.02,
+            "portfolio_dynamic_corr_control_enabled": False,
+            "portfolio_stress_gate_enabled": False,
+        }
+        positions = [
+            FakePosition("CU", margin=50.0, stress_loss=15.0, opt_type="P", code="CUP1", n=5)
+        ]
+
+        ok = pr.passes_portfolio_construction(
+            cfg,
+            product="AL",
+            nav=1000.0,
+            new_margin=10.0,
+            positions=positions,
+            pending_opens=[],
+            spot_history={},
+            normalize_product_key=norm,
+            get_product_bucket=bucket,
+            get_product_corr_group=corr_group,
+            budget={},
+            option_type="P",
+            code="ALP1",
+            new_lots=2,
+            new_stress_loss=10.0,
+        )
+
+        self.assertFalse(ok)
+
+    def test_passes_portfolio_construction_rejects_contract_lot_cap(self):
+        cfg = {
+            "portfolio_construction_enabled": True,
+            "portfolio_product_margin_cap": 0.50,
+            "portfolio_bucket_control_enabled": False,
+            "portfolio_corr_control_enabled": False,
+            "portfolio_contract_lot_cap": 20,
+            "portfolio_stress_gate_enabled": False,
+        }
+        positions = [
+            FakePosition("CU", margin=50.0, opt_type="P", code="CUP1", n=18)
+        ]
+
+        ok = pr.passes_portfolio_construction(
+            cfg,
+            product="CU",
+            nav=1000.0,
+            new_margin=10.0,
+            positions=positions,
+            pending_opens=[],
+            spot_history={},
+            normalize_product_key=norm,
+            get_product_bucket=bucket,
+            get_product_corr_group=corr_group,
+            budget={},
+            option_type="P",
+            code="CUP1",
+            new_lots=5,
+            new_stress_loss=0.0,
         )
 
         self.assertFalse(ok)

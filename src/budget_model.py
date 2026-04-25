@@ -52,26 +52,50 @@ def normalize_open_budget(budget):
     budget["margin_per"] = safe_pct(budget.get("margin_per"), 0.02)
 
     product_cap = safe_pct(budget.get("product_margin_cap"), 0.0)
+    product_side_cap = safe_pct(budget.get("product_side_margin_cap"), 0.0)
     bucket_cap = safe_pct(budget.get("bucket_margin_cap"), 0.0)
+    corr_group_cap = safe_pct(budget.get("corr_group_margin_cap"), 0.0)
     if bucket_cap > 0:
         bucket_cap = min(bucket_cap, budget["margin_cap"])
+    if corr_group_cap > 0:
+        corr_group_cap = min(corr_group_cap, budget["margin_cap"])
     if product_cap > 0:
         product_cap = min(product_cap, budget["margin_cap"])
         if bucket_cap > 0:
             product_cap = min(product_cap, bucket_cap)
+        if corr_group_cap > 0:
+            product_cap = min(product_cap, corr_group_cap)
+    if product_side_cap > 0:
+        product_side_cap = min(product_side_cap, budget["margin_cap"])
+        if product_cap > 0:
+            product_side_cap = min(product_side_cap, product_cap)
     budget["product_margin_cap"] = product_cap
+    budget["product_side_margin_cap"] = product_side_cap
     budget["bucket_margin_cap"] = bucket_cap
+    budget["corr_group_margin_cap"] = corr_group_cap
 
     stress_cap = safe_pct(budget.get("portfolio_stress_loss_cap"), 0.0)
     bucket_stress_cap = safe_pct(budget.get("portfolio_bucket_stress_loss_cap"), 0.0)
+    product_side_stress_cap = safe_pct(budget.get("product_side_stress_loss_cap"), 0.0)
+    corr_group_stress_cap = safe_pct(budget.get("corr_group_stress_loss_cap"), 0.0)
+    contract_stress_cap = safe_pct(budget.get("contract_stress_loss_cap"), 0.0)
     s1_stress_budget = safe_pct(budget.get("s1_stress_loss_budget_pct"), 0.0)
     if stress_cap > 0:
         if bucket_stress_cap > 0:
             bucket_stress_cap = min(bucket_stress_cap, stress_cap)
+        if product_side_stress_cap > 0:
+            product_side_stress_cap = min(product_side_stress_cap, stress_cap)
+        if corr_group_stress_cap > 0:
+            corr_group_stress_cap = min(corr_group_stress_cap, stress_cap)
+        if contract_stress_cap > 0:
+            contract_stress_cap = min(contract_stress_cap, stress_cap)
         if s1_stress_budget > 0:
             s1_stress_budget = min(s1_stress_budget, stress_cap)
     budget["portfolio_stress_loss_cap"] = stress_cap
     budget["portfolio_bucket_stress_loss_cap"] = bucket_stress_cap
+    budget["product_side_stress_loss_cap"] = product_side_stress_cap
+    budget["corr_group_stress_loss_cap"] = corr_group_stress_cap
+    budget["contract_stress_loss_cap"] = contract_stress_cap
     budget["s1_stress_loss_budget_pct"] = s1_stress_budget
     return budget
 
@@ -85,10 +109,25 @@ def build_base_open_budget(config):
         "s3_margin_cap": float_or_default(cfg.get("s3_margin_cap", 0.25), 0.25),
         "margin_per": float_or_default(cfg.get("margin_per", 0.02), 0.02),
         "product_margin_cap": safe_float(cfg.get("portfolio_product_margin_cap", 0.08), 0.0),
+        "product_side_margin_cap": safe_float(
+            cfg.get("portfolio_product_side_margin_cap", 0.0), 0.0
+        ),
         "bucket_margin_cap": safe_float(cfg.get("portfolio_bucket_margin_cap", 0.18), 0.0),
+        "corr_group_margin_cap": safe_float(
+            cfg.get("portfolio_corr_group_margin_cap", 0.0), 0.0
+        ),
         "portfolio_stress_loss_cap": safe_float(cfg.get("portfolio_stress_loss_cap", 0.03), 0.0),
         "portfolio_bucket_stress_loss_cap": safe_float(
             cfg.get("portfolio_bucket_stress_loss_cap", 0.0), 0.0
+        ),
+        "product_side_stress_loss_cap": safe_float(
+            cfg.get("portfolio_product_side_stress_loss_cap", 0.0), 0.0
+        ),
+        "corr_group_stress_loss_cap": safe_float(
+            cfg.get("portfolio_corr_group_stress_loss_cap", 0.0), 0.0
+        ),
+        "contract_stress_loss_cap": safe_float(
+            cfg.get("portfolio_contract_stress_loss_cap", 0.0), 0.0
         ),
         "s1_stress_loss_budget_pct": safe_float(cfg.get("s1_stress_loss_budget_pct", 0.0010), 0.0),
     })
@@ -116,9 +155,23 @@ def apply_regime_overrides(base_budget, config, portfolio_regime):
         cfg.get(f"vol_regime_{prefix}_product_margin_cap", base_budget["product_margin_cap"]),
         base_budget["product_margin_cap"],
     )
+    budget["product_side_margin_cap"] = float_or_default(
+        cfg.get(
+            f"vol_regime_{prefix}_product_side_margin_cap",
+            base_budget["product_side_margin_cap"],
+        ),
+        base_budget["product_side_margin_cap"],
+    )
     budget["bucket_margin_cap"] = float_or_default(
         cfg.get(f"vol_regime_{prefix}_bucket_margin_cap", base_budget["bucket_margin_cap"]),
         base_budget["bucket_margin_cap"],
+    )
+    budget["corr_group_margin_cap"] = float_or_default(
+        cfg.get(
+            f"vol_regime_{prefix}_corr_group_margin_cap",
+            base_budget["corr_group_margin_cap"],
+        ),
+        base_budget["corr_group_margin_cap"],
     )
     budget["portfolio_stress_loss_cap"] = float_or_default(
         cfg.get(f"vol_regime_{prefix}_stress_loss_cap", base_budget["portfolio_stress_loss_cap"]),
@@ -130,6 +183,27 @@ def apply_regime_overrides(base_budget, config, portfolio_regime):
             base_budget["portfolio_bucket_stress_loss_cap"],
         ),
         base_budget["portfolio_bucket_stress_loss_cap"],
+    )
+    budget["product_side_stress_loss_cap"] = float_or_default(
+        cfg.get(
+            f"vol_regime_{prefix}_product_side_stress_loss_cap",
+            base_budget["product_side_stress_loss_cap"],
+        ),
+        base_budget["product_side_stress_loss_cap"],
+    )
+    budget["corr_group_stress_loss_cap"] = float_or_default(
+        cfg.get(
+            f"vol_regime_{prefix}_corr_group_stress_loss_cap",
+            base_budget["corr_group_stress_loss_cap"],
+        ),
+        base_budget["corr_group_stress_loss_cap"],
+    )
+    budget["contract_stress_loss_cap"] = float_or_default(
+        cfg.get(
+            f"vol_regime_{prefix}_contract_stress_loss_cap",
+            base_budget["contract_stress_loss_cap"],
+        ),
+        base_budget["contract_stress_loss_cap"],
     )
     budget["s1_stress_loss_budget_pct"] = float_or_default(
         cfg.get(
@@ -161,9 +235,14 @@ def apply_open_budget_brakes(budget, config, drawdown=0.0, recent_stop_count=0):
             "s1_margin_cap",
             "s3_margin_cap",
             "product_margin_cap",
+            "product_side_margin_cap",
             "bucket_margin_cap",
+            "corr_group_margin_cap",
             "portfolio_stress_loss_cap",
             "portfolio_bucket_stress_loss_cap",
+            "product_side_stress_loss_cap",
+            "corr_group_stress_loss_cap",
+            "contract_stress_loss_cap",
             "s1_stress_loss_budget_pct",
         ):
             normal_key = f"vol_regime_normal_{key}"
@@ -201,10 +280,15 @@ def apply_open_budget_brakes(budget, config, drawdown=0.0, recent_stop_count=0):
             "s1_margin_cap",
             "s3_margin_cap",
             "product_margin_cap",
+            "product_side_margin_cap",
             "bucket_margin_cap",
+            "corr_group_margin_cap",
             "margin_per",
             "portfolio_stress_loss_cap",
             "portfolio_bucket_stress_loss_cap",
+            "product_side_stress_loss_cap",
+            "corr_group_stress_loss_cap",
+            "contract_stress_loss_cap",
             "s1_stress_loss_budget_pct",
         ):
             if key in budget:
@@ -242,9 +326,14 @@ def pending_budget_fields(budget, strategy_cap):
         "effective_margin_cap": budget.get("margin_cap", NAN),
         "effective_strategy_margin_cap": strategy_cap,
         "effective_product_margin_cap": budget.get("product_margin_cap", NAN),
+        "effective_product_side_margin_cap": budget.get("product_side_margin_cap", NAN),
         "effective_bucket_margin_cap": budget.get("bucket_margin_cap", NAN),
+        "effective_corr_group_margin_cap": budget.get("corr_group_margin_cap", NAN),
         "effective_stress_loss_cap": budget.get("portfolio_stress_loss_cap", NAN),
         "effective_bucket_stress_loss_cap": budget.get("portfolio_bucket_stress_loss_cap", NAN),
+        "effective_product_side_stress_loss_cap": budget.get("product_side_stress_loss_cap", NAN),
+        "effective_corr_group_stress_loss_cap": budget.get("corr_group_stress_loss_cap", NAN),
+        "effective_contract_stress_loss_cap": budget.get("contract_stress_loss_cap", NAN),
         "effective_s1_stress_budget_pct": budget.get("s1_stress_loss_budget_pct", NAN),
         "open_budget_risk_scale": budget.get("risk_scale", NAN),
         "open_budget_brake_reason": budget.get("brake_reason", ""),
@@ -275,6 +364,14 @@ def execution_budget_for_item(item, current_budget, config):
         item.get("effective_bucket_margin_cap", current.get("bucket_margin_cap", 0.0)),
         current.get("bucket_margin_cap", 0.0),
     )
+    signal["product_side_margin_cap"] = safe_pct(
+        item.get("effective_product_side_margin_cap", current.get("product_side_margin_cap", 0.0)),
+        current.get("product_side_margin_cap", 0.0),
+    )
+    signal["corr_group_margin_cap"] = safe_pct(
+        item.get("effective_corr_group_margin_cap", current.get("corr_group_margin_cap", 0.0)),
+        current.get("corr_group_margin_cap", 0.0),
+    )
     signal["portfolio_stress_loss_cap"] = safe_pct(
         item.get("effective_stress_loss_cap", current.get("portfolio_stress_loss_cap", 0.0)),
         current.get("portfolio_stress_loss_cap", 0.0),
@@ -285,6 +382,27 @@ def execution_budget_for_item(item, current_budget, config):
             current.get("portfolio_bucket_stress_loss_cap", 0.0),
         ),
         current.get("portfolio_bucket_stress_loss_cap", 0.0),
+    )
+    signal["product_side_stress_loss_cap"] = safe_pct(
+        item.get(
+            "effective_product_side_stress_loss_cap",
+            current.get("product_side_stress_loss_cap", 0.0),
+        ),
+        current.get("product_side_stress_loss_cap", 0.0),
+    )
+    signal["corr_group_stress_loss_cap"] = safe_pct(
+        item.get(
+            "effective_corr_group_stress_loss_cap",
+            current.get("corr_group_stress_loss_cap", 0.0),
+        ),
+        current.get("corr_group_stress_loss_cap", 0.0),
+    )
+    signal["contract_stress_loss_cap"] = safe_pct(
+        item.get(
+            "effective_contract_stress_loss_cap",
+            current.get("contract_stress_loss_cap", 0.0),
+        ),
+        current.get("contract_stress_loss_cap", 0.0),
     )
     signal["s1_stress_loss_budget_pct"] = safe_pct(
         item.get("effective_s1_stress_budget_pct", current.get("s1_stress_loss_budget_pct", 0.0)),
@@ -303,9 +421,14 @@ def execution_budget_for_item(item, current_budget, config):
         "margin_cap",
         strategy_key,
         "product_margin_cap",
+        "product_side_margin_cap",
         "bucket_margin_cap",
+        "corr_group_margin_cap",
         "portfolio_stress_loss_cap",
         "portfolio_bucket_stress_loss_cap",
+        "product_side_stress_loss_cap",
+        "corr_group_stress_loss_cap",
+        "contract_stress_loss_cap",
         "s1_stress_loss_budget_pct",
     ):
         budget[key] = min(
@@ -315,8 +438,13 @@ def execution_budget_for_item(item, current_budget, config):
     if (config or {}).get("portfolio_execution_allow_signal_product_overrides", False):
         for key in (
             "product_margin_cap",
+            "product_side_margin_cap",
             "bucket_margin_cap",
+            "corr_group_margin_cap",
             "portfolio_bucket_stress_loss_cap",
+            "product_side_stress_loss_cap",
+            "corr_group_stress_loss_cap",
+            "contract_stress_loss_cap",
         ):
             budget[key] = max(
                 safe_pct(budget.get(key, 0.0), 0.0),
