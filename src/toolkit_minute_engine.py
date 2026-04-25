@@ -2035,6 +2035,24 @@ class ToolkitMinuteEngine:
         key = f'vol_regime_{prefix}_s1_stress_max_qty'
         return max(1, int(self.config.get(key, base_qty) or base_qty))
 
+    def _product_s1_stress_budget_pct(self, product, fallback_pct):
+        fallback_pct = max(0.0, float(fallback_pct or 0.0))
+        if not self.config.get('s1_product_regime_stress_budget_enabled', False):
+            return fallback_pct
+        regime = self._current_vol_regimes.get(product, 'normal_vol') if product else 'normal_vol'
+        prefix = {
+            'falling_vol_carry': 'falling',
+            'low_stable_vol': 'low',
+            'high_rising_vol': 'high',
+            'post_stop_cooldown': 'high',
+        }.get(regime, 'normal')
+        key = f'vol_regime_{prefix}_s1_stress_loss_budget_pct'
+        if key not in self.config:
+            return fallback_pct
+        product_pct = max(0.0, float(self.config.get(key, fallback_pct) or fallback_pct))
+        risk_scale = float((self._current_open_budget or {}).get('risk_scale', 1.0) or 1.0)
+        return product_pct * max(0.0, risk_scale)
+
     def _select_s1_sell_candidates(self, ef, product, ot, mult, mr, exchange,
                                    min_abs_delta, delta_cap, max_candidates):
         s1_frame = self._prepare_s1_selection_frame(ef, ot)
@@ -2257,6 +2275,7 @@ class ToolkitMinuteEngine:
             stress_budget_pct = float(open_budget.get('s1_stress_loss_budget_pct') or 0.0)
         else:
             stress_budget_pct = float(self.config.get('s1_stress_loss_budget_pct', 0.0010) or 0.0) * regime_scale
+        stress_budget_pct = self._product_s1_stress_budget_pct(product, stress_budget_pct)
         side_budget_mult = max(0.0, float(side_meta.get('budget_mult', 1.0) or 0.0))
         remaining_stress_budget = nav * stress_budget_pct * float(iv_scale or 1.0) * side_budget_mult
         remaining_margin_budget = nav * float(margin_per or 0.0) / 2.0 * float(iv_scale or 1.0) * side_budget_mult
@@ -2385,6 +2404,7 @@ class ToolkitMinuteEngine:
                 'effective_s1_stress_max_qty': max_qty,
             }
             pending_item.update(self._pending_budget_fields(effective_strategy_cap))
+            pending_item['effective_s1_stress_budget_pct'] = stress_budget_pct
             self._pending_opens.append(pending_item)
             self._bump_s1_funnel('open_sell_legs')
             self._bump_s1_funnel('open_sell_lots', nn)
