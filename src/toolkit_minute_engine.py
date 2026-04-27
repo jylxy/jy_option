@@ -1927,6 +1927,113 @@ class ToolkitMinuteEngine:
 
         return True
 
+    def _baseline_product_order(self, product_frames):
+        mode = str(self.config.get('s1_baseline_product_ranking_mode', 'code') or 'code').lower()
+        if mode not in {'liquidity', 'liquidity_oi', 'volume_oi'}:
+            return sorted(product_frames)
+
+        rows = []
+        for product, frame in product_frames.items():
+            volume, open_interest = self._baseline_product_liquidity_stats(product, frame)
+            rows.append({
+                'product': product,
+                'volume': volume,
+                'open_interest': open_interest,
+            })
+        if not rows:
+            return sorted(product_frames)
+
+        ranked = pd.DataFrame(rows)
+        volume_rank_source = np.log1p(
+            pd.to_numeric(ranked['volume'], errors='coerce').fillna(0).clip(lower=0)
+        )
+        oi_rank_source = np.log1p(
+            pd.to_numeric(ranked['open_interest'], errors='coerce').fillna(0).clip(lower=0)
+        )
+        if len(ranked) > 1:
+            ranked['liquidity_score'] = (
+                0.5 * volume_rank_source.rank(pct=True) +
+                0.5 * oi_rank_source.rank(pct=True)
+            )
+        else:
+            ranked['liquidity_score'] = 0.0
+        ranked = ranked.sort_values(
+            ['liquidity_score', 'open_interest', 'volume', 'product'],
+            ascending=[False, False, False, True],
+            kind='mergesort',
+        )
+        return ranked['product'].tolist()
+
+    def _baseline_product_liquidity_stats(self, product, prod_df):
+        open_expiries = should_open_new(
+            prod_df,
+            dte_target=self.config.get('dte_target', 35),
+            dte_min=self.config.get('dte_min', 15),
+            dte_max=self.config.get('dte_max', 90),
+            mode=self.config.get('s1_expiry_mode', 'dte'),
+            expiry_rank=self.config.get('s1_expiry_rank', 2),
+        )
+        if not open_expiries:
+            return 0.0, 0.0
+
+        total_volume = 0.0
+        total_oi = 0.0
+        for exp in open_expiries:
+            ef = prod_df[prod_df['expiry_date'] == exp]
+            if ef.empty:
+                continue
+            mult = float(ef['multiplier'].iloc[0] or 0.0)
+            if mult <= 0:
+                continue
+            min_abs_delta, delta_cap = self._s1_delta_bounds(None)
+            for option_type in ('P', 'C'):
+                eligible = self._baseline_product_liquidity_eligible_frame(
+                    ef, product, option_type, mult, min_abs_delta, delta_cap,
+                )
+                if eligible.empty:
+                    continue
+                volume = pd.to_numeric(eligible['volume'], errors='coerce').fillna(0).clip(lower=0)
+                oi = pd.to_numeric(eligible['open_interest'], errors='coerce').fillna(0).clip(lower=0)
+                total_volume += float(volume.sum())
+                total_oi += float(oi.sum())
+        return total_volume, total_oi
+
+    def _baseline_product_liquidity_eligible_frame(self, ef, product, option_type, mult,
+                                                   min_abs_delta, delta_cap):
+        if option_type == 'P':
+            mask = (
+                (ef['option_type'] == 'P') &
+                (ef['moneyness'] < 1.0) &
+                (ef['delta'] < 0) &
+                (ef['delta'].abs() >= min_abs_delta) &
+                (ef['delta'].abs() <= delta_cap) &
+                (ef['option_close'] >= 0.5)
+            )
+        else:
+            mask = (
+                (ef['option_type'] == 'C') &
+                (ef['moneyness'] > 1.0) &
+                (ef['delta'] > 0) &
+                (ef['delta'] >= min_abs_delta) &
+                (ef['delta'] <= delta_cap) &
+                (ef['option_close'] >= 0.5)
+            )
+        eligible = ef[mask].copy()
+        if eligible.empty:
+            return eligible
+
+        roundtrip_fee = self._option_roundtrip_fee_per_contract(product, option_type)
+        min_premium = roundtrip_fee * float(self.config.get('s1_min_premium_fee_multiple', 0.0) or 0.0)
+        if min_premium > 0:
+            eligible = eligible[eligible['option_close'] * float(mult) >= min_premium]
+        min_volume = int(self.config.get('s1_min_volume', 0) or 0)
+        min_oi = int(self.config.get('s1_min_oi', 0) or 0)
+        if min_volume > 0 and 'volume' in eligible.columns:
+            eligible = eligible[pd.to_numeric(eligible['volume'], errors='coerce').fillna(0) >= min_volume]
+        if min_oi > 0 and 'open_interest' in eligible.columns:
+            eligible = eligible[pd.to_numeric(eligible['open_interest'], errors='coerce').fillna(0) >= min_oi]
+        return eligible
+
     def _queue_new_opens(self, daily_df, date_str, product_pool, product_iv_pcts):
         """收盘后生成下一交易日待开仓指令。"""
         cfg = self.config
@@ -1972,7 +2079,7 @@ class ToolkitMinuteEngine:
 
         self._update_product_first_trade_dates(list(product_frames), date_str)
         if baseline_mode:
-            sorted_products = sorted(product_frames)
+            sorted_products = self._baseline_product_order(product_frames)
         else:
             prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
             prod_volume = prod_volume.sort_values(

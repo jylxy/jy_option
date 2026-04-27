@@ -1830,6 +1830,19 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             return ranked if max_n <= 0 else ranked.head(max_n)
         return None if ranked is None or ranked.empty else ranked.iloc[0]
 
+    if str(ranking_mode or "").lower() in {"liquidity", "liquidity_oi", "volume_oi"}:
+        ranked = _stable_rank(
+            c,
+            ["liquidity_score", "open_interest", "volume", "delta_dist"],
+            [False, False, False, True],
+        )
+        if return_candidates:
+            if ranked is None:
+                return ranked
+            max_n = int(max_candidates or 0)
+            return ranked if max_n <= 0 else ranked.head(max_n)
+        return None if ranked is None or ranked.empty else ranked.iloc[0]
+
     if use_stress_score:
         gamma_abs = c["gamma"].abs().fillna(0) if "gamma" in c.columns else 0.0
         vega_abs = c["vega"].abs().fillna(0) if "vega" in c.columns else 0.0

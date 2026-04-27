@@ -138,6 +138,66 @@ class StrategyRulesTest(unittest.TestCase):
         self.assertEqual(target_delta["option_code"], "TARGET")
         self.assertEqual(risk_reward["option_code"], "RICH")
 
+    def test_s1_liquidity_ranking_can_override_target_delta(self):
+        rows = pd.DataFrame([
+            {
+                "option_code": "TARGET",
+                "option_type": "P",
+                "moneyness": 0.94,
+                "delta": -0.070,
+                "option_close": 0.80,
+                "spot_close": 100.0,
+                "strike": 94.0,
+                "volume": 1,
+                "open_interest": 1,
+                "gamma": 0.0010,
+                "vega": 0.020,
+                "theta": -0.010,
+                "exchange": "SHFE",
+                "product": "CU",
+            },
+            {
+                "option_code": "LIQUID",
+                "option_type": "P",
+                "moneyness": 0.92,
+                "delta": -0.040,
+                "option_close": 0.80,
+                "spot_close": 100.0,
+                "strike": 92.0,
+                "volume": 1000,
+                "open_interest": 2000,
+                "gamma": 0.0010,
+                "vega": 0.020,
+                "theta": -0.010,
+                "exchange": "SHFE",
+                "product": "CU",
+            },
+        ])
+
+        target_delta = select_s1_sell(
+            rows,
+            "P",
+            mult=10,
+            mr=0.07,
+            target_abs_delta=0.07,
+            ranking_mode="target_delta",
+            exchange="SHFE",
+            product="CU",
+        )
+        liquidity_ranked = select_s1_sell(
+            rows,
+            "P",
+            mult=10,
+            mr=0.07,
+            target_abs_delta=0.07,
+            ranking_mode="liquidity_oi",
+            exchange="SHFE",
+            product="CU",
+        )
+
+        self.assertEqual(target_delta["option_code"], "TARGET")
+        self.assertEqual(liquidity_ranked["option_code"], "LIQUID")
+
     def test_s1_side_selection_prefers_better_adjusted_side(self):
         side_candidates = {
             "P": {"quality_score": 0.60},

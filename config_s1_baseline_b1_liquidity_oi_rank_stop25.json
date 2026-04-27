@@ -1,0 +1,6 @@
+{
+  "extends": "config_s1_baseline_b0_all_products_stop25.json",
+  "strategy_version": "s1_baseline_b1_liquidity_oi_rank_stop25",
+  "s1_baseline_product_ranking_mode": "liquidity_oi",
+  "s1_ranking_mode": "liquidity_oi"
+}
