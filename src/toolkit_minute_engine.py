@@ -1747,7 +1747,6 @@ class ToolkitMinuteEngine:
             positions_by_group[gid].append(pos)
 
         keep_codes = set()
-        skipped_codes = 0
         for positions in positions_by_group.values():
             group_codes = {pos.code for pos in positions if getattr(pos, 'code', None)}
             group_may_stop = False
@@ -1767,13 +1766,12 @@ class ToolkitMinuteEngine:
                     break
             if group_may_stop:
                 keep_codes.update(group_codes)
-            else:
-                skipped_codes += len(group_codes)
 
+        skipped_codes = code_set - keep_codes
         if skipped_codes:
             logger.debug(
                 "  %s 日内止损预筛跳过 %d/%d 个持仓合约",
-                date_str, skipped_codes, len(code_set),
+                date_str, len(skipped_codes), len(code_set),
             )
         return keep_codes
 
