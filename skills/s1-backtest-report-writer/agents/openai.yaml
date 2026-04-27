@@ -1,6 +1,6 @@
 interface:
   display_name: "S1 回测报告写手"
-  short_description: "生成带图表解读的 S1 回测复盘报告"
-  default_prompt: "Use $s1-backtest-report-writer to write a Feishu-ready S1 backtest attribution report with embedded charts."
+  short_description: "用期权专家视角生成带深度图表解读的 S1 回测报告"
+  default_prompt: "Use $s1-backtest-report-writer to write a Feishu-ready S1 options backtest attribution report with embedded charts, expert Greek/tail-risk interpretation, and concrete next experiments."
 policy:
   allow_implicit_invocation: true
