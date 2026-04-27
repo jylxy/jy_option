@@ -107,6 +107,13 @@ DEFAULT_PARAMS = {
     "s1_sell_delta_cap": 0.10,
     "s1_sell_delta_floor": 0.00,
     "s1_target_abs_delta": 0.07,
+    "s1_baseline_mode": False,
+    "s1_expiry_mode": "dte",
+    "s1_expiry_rank": 2,
+    "s1_baseline_equal_weight_products": True,
+    "s1_baseline_equal_weight_contracts": True,
+    "s1_baseline_max_contracts_per_side": 0,
+    "reentry_plan_enabled": True,
     "s1_min_volume": 50,
     "s1_min_oi": 200,
     "s1_carry_metric": "premium_margin",
@@ -1255,7 +1262,8 @@ def extract_atm_iv_series(product_df):
 
 # ── 信号判断 ──────────────────────────────────────────────────────────────────
 
-def should_open_new(product_df_today, dte_target=35, dte_min=15, dte_max=90):
+def should_open_new(product_df_today, dte_target=35, dte_min=15, dte_max=90,
+                    mode="dte", expiry_rank=2):
     """
     检查今日是否应该触发开仓。
 
@@ -1264,6 +1272,25 @@ def should_open_new(product_df_today, dte_target=35, dte_min=15, dte_max=90):
     """
     if product_df_today.empty:
         return []
+
+    mode = str(mode or "dte").strip().lower()
+    if mode in {"next_month", "nth_expiry", "rank"}:
+        expiries = []
+        for exp in product_df_today["expiry_date"].dropna().unique():
+            exp_data = product_df_today[product_df_today["expiry_date"] == exp]
+            if exp_data.empty:
+                continue
+            dte = exp_data["dte"].iloc[0]
+            if pd.isna(dte) or dte <= 0:
+                continue
+            expiries.append((str(exp), float(dte)))
+        expiries.sort(key=lambda x: (x[1], x[0]))
+        if not expiries:
+            return []
+        rank = max(1, int(expiry_rank or 1))
+        if rank > len(expiries):
+            return []
+        return [expiries[rank - 1][0]]
 
     candidates = []
     for exp in product_df_today["expiry_date"].unique():
@@ -1796,7 +1823,10 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             [False, False, False, False, False, False],
         )
         if return_candidates:
-            return ranked.head(max(1, int(max_candidates or 1))) if ranked is not None else ranked
+            if ranked is None:
+                return ranked
+            max_n = int(max_candidates or 0)
+            return ranked if max_n <= 0 else ranked.head(max_n)
         return None if ranked is None or ranked.empty else ranked.iloc[0]
 
     if use_stress_score:
@@ -1810,7 +1840,10 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             [False, False, False, True, False],
         )
         if return_candidates:
-            return ranked.head(max(1, int(max_candidates or 1))) if ranked is not None else ranked
+            if ranked is None:
+                return ranked
+            max_n = int(max_candidates or 0)
+            return ranked if max_n <= 0 else ranked.head(max_n)
         return None if ranked is None or ranked.empty else ranked.iloc[0]
 
     ranked = _stable_rank(
@@ -1819,5 +1852,8 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
         [True, False, False, False, False],
     )
     if return_candidates:
-        return ranked.head(max(1, int(max_candidates or 1))) if ranked is not None else ranked
+        if ranked is None:
+            return ranked
+        max_n = int(max_candidates or 0)
+        return ranked if max_n <= 0 else ranked.head(max_n)
     return None if ranked is None or ranked.empty else ranked.iloc[0]

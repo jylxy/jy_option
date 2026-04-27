@@ -17,6 +17,7 @@ from strategy_rules import (  # noqa: E402
     s1_trend_side_adjustment,
     s1_forward_vega_quality_filter,
     select_s1_sell,
+    should_open_new,
 )
 
 
@@ -38,6 +39,30 @@ class StrategyRulesTest(unittest.TestCase):
         )
 
         self.assertEqual(loss, 1000.0)
+
+    def test_should_open_new_next_month_uses_second_live_expiry(self):
+        rows = pd.DataFrame({
+            "expiry_date": [
+                "2025-03-26",
+                "2025-04-25",
+                "2025-05-23",
+            ],
+            "dte": [5, 35, 63],
+        })
+
+        selected = should_open_new(rows, mode="next_month", expiry_rank=2)
+
+        self.assertEqual(selected, ["2025-04-25"])
+
+    def test_should_open_new_next_month_skips_when_rank_missing(self):
+        rows = pd.DataFrame({
+            "expiry_date": ["2025-03-26"],
+            "dte": [5],
+        })
+
+        selected = should_open_new(rows, mode="next_month", expiry_rank=2)
+
+        self.assertEqual(selected, [])
 
     def test_s1_risk_reward_ranking_can_override_target_delta(self):
         rows = pd.DataFrame([

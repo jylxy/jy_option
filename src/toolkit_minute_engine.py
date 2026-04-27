@@ -649,10 +649,10 @@ class ToolkitMinuteEngine:
         logger.info("品种过滤SQL: %s", like_sql[:200] if like_sql else "无")
 
         # IV预热（先检查缓存，缺失品种补跑）
-        warmup_days = self.config.get('iv_window', 252)
+        warmup_days = int(self.config.get('iv_window', 252) or 0)
         all_dates = self.loader.get_trading_dates()
         warmup_dates = [d for d in all_dates if d < dates[0]][-warmup_days:]
-        if warmup_dates:
+        if self.config.get('iv_warmup_enabled', True) and warmup_days > 0 and warmup_dates:
             cache_path = warmup_cache_path(OUTPUT_DIR)
             cached_products, skipped_warmup_products = load_iv_warmup_cache(
                 cache_path,
@@ -1879,9 +1879,10 @@ class ToolkitMinuteEngine:
         cfg = self.config
         nav = max(self._current_nav(), 1.0)
         self._start_s1_candidate_funnel(date_str, nav, product_pool)
+        baseline_mode = bool(cfg.get('s1_baseline_mode', False))
         vega_warn = cfg.get('greeks_vega_warn', 0.008)
         current_vega_pct = abs(sum(p.cash_vega() for p in self.positions) / nav)
-        if current_vega_pct > vega_warn:
+        if not baseline_mode and current_vega_pct > vega_warn:
             logger.debug("  %s Vega预警 %.3f%% > %.1f%%, 暂停新开仓",
                          date_str, current_vega_pct * 100, vega_warn * 100)
             self._bump_s1_funnel('skip_vega_warn')
@@ -1916,17 +1917,25 @@ class ToolkitMinuteEngine:
             return
         self._bump_s1_funnel('loaded_products', len(product_frames))
 
-        prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
-        prod_volume = prod_volume.sort_values(
-            ['volume', 'product'],
-            ascending=[False, True],
-            kind='mergesort',
-        )
         self._update_product_first_trade_dates(list(product_frames), date_str)
-        sorted_products = self._diversify_product_order(prod_volume['product'].tolist())
-        sorted_products = self._prioritize_products_by_regime(sorted_products)
+        if baseline_mode:
+            sorted_products = sorted(product_frames)
+        else:
+            prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
+            prod_volume = prod_volume.sort_values(
+                ['volume', 'product'],
+                ascending=[False, True],
+                kind='mergesort',
+            )
+            sorted_products = self._diversify_product_order(prod_volume['product'].tolist())
+            sorted_products = self._prioritize_products_by_regime(sorted_products)
 
         candidate_products = sorted_products if scan_top_n <= 0 else sorted_products[:scan_top_n]
+        baseline_product_margin_per = (
+            float(s1_cap or margin_cap or 0.0) / max(len(candidate_products), 1)
+            if baseline_mode and cfg.get('s1_baseline_equal_weight_products', True)
+            else None
+        )
         self._bump_s1_funnel('candidate_products', len(candidate_products))
         open_product_expiries = {(p.product, p.expiry) for p in self.positions}
         open_s1_sell_sides = {
@@ -1960,6 +1969,8 @@ class ToolkitMinuteEngine:
                 dte_target=cfg.get('dte_target', 35),
                 dte_min=cfg.get('dte_min', 15),
                 dte_max=cfg.get('dte_max', 90),
+                mode=cfg.get('s1_expiry_mode', 'dte'),
+                expiry_rank=cfg.get('s1_expiry_rank', 2),
             )
             if not open_expiries:
                 self._bump_s1_funnel('skip_no_open_expiry')
@@ -1977,7 +1988,7 @@ class ToolkitMinuteEngine:
 
                 iv_pct = product_iv_pcts.get(product, np.nan)
                 iv_state = self._current_iv_state.get(product, {})
-                if should_pause_open(iv_pct, iv_open_thr):
+                if not baseline_mode and should_pause_open(iv_pct, iv_open_thr):
                     self._bump_s1_funnel('skip_iv_pause')
                     continue
                 low_iv_threshold = cfg.get('iv_low_skip_threshold', 20)
@@ -2000,15 +2011,19 @@ class ToolkitMinuteEngine:
                     low_iv_allowed = True
                 if self._is_structural_low_iv_product(product, iv_state):
                     low_iv_allowed = True
-                if pd.notna(iv_pct) and iv_pct < low_iv_threshold and not low_iv_allowed:
+                if not baseline_mode and pd.notna(iv_pct) and iv_pct < low_iv_threshold and not low_iv_allowed:
                     self._bump_s1_funnel('skip_low_iv')
                     continue
-                iv_scale = get_iv_scale(iv_pct, cfg.get('iv_threshold', 75))
-                regime_mult = self._product_margin_per_multiplier(product)
+                iv_scale = 1.0 if baseline_mode else get_iv_scale(iv_pct, cfg.get('iv_threshold', 75))
+                regime_mult = 1.0 if baseline_mode else self._product_margin_per_multiplier(product)
                 if regime_mult <= 0:
                     self._bump_s1_funnel('skip_regime_budget_zero')
                     continue
-                product_margin_per = margin_per * regime_mult
+                product_margin_per = (
+                    baseline_product_margin_per
+                    if baseline_product_margin_per is not None
+                    else margin_per * regime_mult
+                )
 
                 if total_m / nav >= margin_cap:
                     self._bump_s1_funnel('break_total_margin_cap')
@@ -2034,7 +2049,7 @@ class ToolkitMinuteEngine:
                     s1_m / nav < s1_cap and
                     (not expiry_has_position or s1_can_add_expiry)
                 ):
-                    if not self._passes_s1_falling_framework_entry(product, iv_state):
+                    if not baseline_mode and not self._passes_s1_falling_framework_entry(product, iv_state):
                         self._bump_s1_funnel('skip_s1_falling_framework')
                         continue
                     self._bump_s1_funnel('s1_framework_pass')
@@ -2466,9 +2481,14 @@ class ToolkitMinuteEngine:
                      iv_state=None, margin_cap=None, strategy_cap=None,
                      preselected_candidates=None, side_meta=None):
         """S1开仓"""
+        baseline_mode = bool(self.config.get('s1_baseline_mode', False))
         min_abs_delta, delta_cap = self._s1_delta_bounds(reentry_plan)
         split_enabled = bool(self.config.get('s1_split_across_neighbor_contracts', False))
-        max_candidates, max_delta_gap = self._s1_ladder_shape(side_meta, product=product)
+        if baseline_mode:
+            max_candidates = int(self.config.get('s1_baseline_max_contracts_per_side', 0) or 0)
+            max_delta_gap = 0.0
+        else:
+            max_candidates, max_delta_gap = self._s1_ladder_shape(side_meta, product=product)
         if preselected_candidates is None:
             candidates = self._select_s1_sell_candidates(
                 ef, product, ot, mult, mr, exchange,
@@ -2488,7 +2508,10 @@ class ToolkitMinuteEngine:
             return
         candidates = candidates.copy()
         self._bump_s1_funnel('open_candidates_considered', len(candidates))
-        if split_enabled and max_candidates > 1:
+        if baseline_mode:
+            if max_candidates > 0:
+                candidates = candidates.head(max_candidates)
+        elif split_enabled and max_candidates > 1:
             if max_delta_gap > 0 and 'abs_delta' in candidates.columns:
                 center_delta = float(candidates['abs_delta'].iloc[0])
                 candidates = candidates[
@@ -2583,7 +2606,12 @@ class ToolkitMinuteEngine:
                 if remaining_margin_budget <= 0:
                     self._bump_s1_funnel('open_skip_margin_budget_empty')
                     continue
-                target_qty = max(1, int(remaining_margin_budget / m))
+                if baseline_mode and self.config.get('s1_baseline_equal_weight_contracts', True):
+                    contracts_left = max(1, len(candidates) - rank + 1)
+                    contract_budget = remaining_margin_budget / contracts_left
+                    target_qty = max(1, int(contract_budget / m))
+                else:
+                    target_qty = max(1, int(remaining_margin_budget / m))
             nn = max_allowed_qty(c, m, target_qty, one_stress_loss)
             if nn <= 0:
                 self._bump_s1_funnel('open_skip_portfolio_constraints')
@@ -2820,7 +2848,7 @@ class ToolkitMinuteEngine:
             to_close = [p for p in to_close if p.open_date != date_str]
             if not to_close:
                 return
-        if reason.startswith('sl_'):
+        if reason.startswith('sl_') and self.config.get('reentry_plan_enabled', True):
             for pos in to_close:
                 if pos.role == 'sell':
                     self._register_reentry_plan(pos, date_str)
