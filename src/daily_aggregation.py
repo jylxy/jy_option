@@ -50,6 +50,7 @@ def normalize_preloaded_daily_agg(raw_df, date_str, contract_info):
     return df.rename(columns={
         "ths_code": "option_code",
         "last_close": "option_close",
+        "day_high": "option_high",
         "total_volume": "volume",
         "last_oi": "open_interest",
     })
@@ -91,6 +92,7 @@ def aggregate_minute_daily(minute_df, date_str, contract_info):
             "strike": info["strike"],
             "option_type": info["option_type"],
             "option_close": opt_close,
+            "option_high": float(grp_sorted["high"].max()) if "high" in grp_sorted else opt_close,
             "dte": dte,
             "volume": volume,
             "open_interest": oi,

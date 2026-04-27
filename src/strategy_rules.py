@@ -96,6 +96,7 @@ DEFAULT_PARAMS = {
     "intraday_stop_confirmation_revert_ratio": 0.98,
     "intraday_stop_confirmation_max_minutes": 30,
     "intraday_stop_confirmation_use_cumulative_volume": True,
+    "intraday_stop_daily_high_prefilter_enabled": True,
     "take_profit_enabled": False,
     "premium_stop_multiple": 2.50,
     "premium_stop_requires_daily_iv_non_decrease": True,

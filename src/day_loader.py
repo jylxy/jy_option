@@ -299,6 +299,7 @@ class ToolkitDayLoader:
                 toString(date) as trade_date,
                 ths_code,
                 argMax(toFloat64OrZero(close), time) as last_close,
+                max(toFloat64OrZero(high)) as day_high,
                 sum(toInt64OrZero(volume)) as total_volume,
                 argMax(toInt64OrZero(open_interest), time) as last_oi
             FROM {OPTION_MINUTE_TABLE}
@@ -317,6 +318,7 @@ class ToolkitDayLoader:
             return
 
         df["last_close"] = pd.to_numeric(df["last_close"], errors="coerce").fillna(0)
+        df["day_high"] = pd.to_numeric(df["day_high"], errors="coerce").fillna(0)
         df["total_volume"] = pd.to_numeric(df["total_volume"], errors="coerce").fillna(0)
         df["last_oi"] = pd.to_numeric(df["last_oi"], errors="coerce").fillna(0)
         df = attach_contract_columns(df, contract_info)
@@ -355,6 +357,20 @@ class ToolkitDayLoader:
             [code for code in df["underlying_code"].dropna().tolist() if code],
         )
         return enrich_daily_with_spot_iv_delta(df, spot_map=spot_map, risk_free_rate=RISK_FREE_RATE)
+
+    def get_daily_option_high_map(self, date_str):
+        """Return option-code -> daily high from the preloaded day aggregate."""
+        raw = self._daily_agg_cache.get(date_str)
+        if raw is None or raw.empty or "day_high" not in raw.columns:
+            return {}
+
+        df = raw[["ths_code", "day_high"]].copy()
+        df["day_high"] = pd.to_numeric(df["day_high"], errors="coerce").fillna(0)
+        df = df[df["day_high"] > 0]
+        return {
+            str(row.ths_code): float(row.day_high)
+            for row in df.itertuples(index=False)
+        }
 
     def aggregate_daily(self, minute_df, date_str):
         """Aggregate minute bars into strategy-rule compatible day rows."""

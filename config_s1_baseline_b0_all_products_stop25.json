@@ -91,6 +91,7 @@
   "intraday_stop_confirmation_revert_ratio": 0.98,
   "intraday_stop_confirmation_max_minutes": 30,
   "intraday_stop_confirmation_use_cumulative_volume": true,
+  "intraday_stop_daily_high_prefilter_enabled": true,
   "daily_agg_batch_size": 10,
   "skip_same_day_exit_for_vwap_opens": true
 }

@@ -729,6 +729,7 @@ class ToolkitMinuteEngine:
             exit_codes = set(pre_open_held_codes)
             if not self.config.get('skip_same_day_exit_for_vwap_opens', True):
                 exit_codes |= pending_codes
+            exit_codes = self._prefilter_intraday_exit_codes_by_daily_high(date_str, exit_codes)
             needed_minute_codes = pending_codes | exit_codes
             if needed_minute_codes:
                 minute_df = self.loader.load_day_minute(date_str, code_list=needed_minute_codes)
@@ -1721,6 +1722,60 @@ class ToolkitMinuteEngine:
         volume_ratio = float(self.config.get('intraday_stop_min_group_volume_ratio', 0.10) or 0.0)
         group_qty = float(qty_by_code.get(code, 0) or 0.0)
         return max(min_volume, np.ceil(group_qty * volume_ratio))
+
+    def _prefilter_intraday_exit_codes_by_daily_high(self, date_str, exit_codes):
+        """Skip minute stop scans when the daily high cannot reach any stop line."""
+        if not exit_codes or not self.config.get('intraday_stop_daily_high_prefilter_enabled', True):
+            return set(exit_codes or [])
+        if self.config.get('take_profit_enabled', False):
+            return set(exit_codes)
+
+        multiple = float(self.config.get('premium_stop_multiple', 0.0) or 0.0)
+        if multiple <= 0:
+            return set()
+
+        high_map = self.loader.get_daily_option_high_map(date_str)
+        if not high_map:
+            return set(exit_codes)
+
+        code_set = set(exit_codes)
+        positions_by_group = defaultdict(list)
+        for pos in self.positions:
+            if not getattr(pos, 'code', None) or pos.code not in code_set:
+                continue
+            gid = getattr(pos, 'group_id', None) or pos.code
+            positions_by_group[gid].append(pos)
+
+        keep_codes = set()
+        skipped_codes = 0
+        for positions in positions_by_group.values():
+            group_codes = {pos.code for pos in positions if getattr(pos, 'code', None)}
+            group_may_stop = False
+            for pos in positions:
+                if pos.role != 'sell':
+                    continue
+                open_price = float(getattr(pos, 'open_price', 0.0) or 0.0)
+                if open_price <= 0:
+                    group_may_stop = True
+                    break
+                day_high = high_map.get(pos.code)
+                if day_high is None or day_high <= 0:
+                    group_may_stop = True
+                    break
+                if float(day_high) >= open_price * multiple:
+                    group_may_stop = True
+                    break
+            if group_may_stop:
+                keep_codes.update(group_codes)
+            else:
+                skipped_codes += len(group_codes)
+
+        if skipped_codes:
+            logger.debug(
+                "  %s 日内止损预筛跳过 %d/%d 个持仓合约",
+                date_str, skipped_codes, len(code_set),
+            )
+        return keep_codes
 
     def _confirm_intraday_stop_price(self, code, price, volume, tm, stop_pending, pos_by_code, qty_by_code):
         threshold = self._intraday_stop_threshold(code, pos_by_code)
