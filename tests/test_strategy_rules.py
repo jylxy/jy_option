@@ -64,6 +64,20 @@ class StrategyRulesTest(unittest.TestCase):
 
         self.assertEqual(selected, [])
 
+    def test_should_open_new_nth_expiry_matches_second_live_expiry(self):
+        rows = pd.DataFrame({
+            "expiry_date": [
+                "2025-03-26",
+                "2025-04-25",
+                "2025-05-23",
+            ],
+            "dte": [5, 35, 63],
+        })
+
+        selected = should_open_new(rows, mode="nth_expiry", expiry_rank=2)
+
+        self.assertEqual(selected, ["2025-04-25"])
+
     def test_s1_risk_reward_ranking_can_override_target_delta(self):
         rows = pd.DataFrame([
             {
