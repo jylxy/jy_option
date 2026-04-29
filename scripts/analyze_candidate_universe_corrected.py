@@ -34,24 +34,48 @@ class FactorSpec:
 
 
 FACTORS: tuple[FactorSpec, ...] = (
+    # Representative corrected-audit set. The raw layer script covers the full
+    # B5 factor universe; corrected audit deliberately keeps one or two
+    # interpretable representatives per factor family to avoid spending most of
+    # the run time on highly collinear fields.
     FactorSpec("friction_ratio", "low"),
-    FactorSpec("fee_ratio", "low"),
-    FactorSpec("premium_yield_notional", "high"),
     FactorSpec("premium_yield_margin", "high"),
     FactorSpec("premium_to_iv10_loss", "high"),
     FactorSpec("premium_to_stress_loss", "high"),
     FactorSpec("b3_vomma_loss_ratio", "low"),
     FactorSpec("b3_vol_of_vol_proxy", "low"),
-    FactorSpec("b3_forward_variance_pressure", "low"),
-    FactorSpec("b3_joint_stress_coverage", "high"),
-    FactorSpec("b3_iv_shock_coverage", "high"),
     FactorSpec("gamma_rent_penalty", "low"),
     FactorSpec("variance_carry", "high"),
-    FactorSpec("iv_rv_spread_candidate", "high"),
-    FactorSpec("iv_rv_ratio_candidate", "high"),
     FactorSpec("breakeven_cushion_score", "high"),
     FactorSpec("premium_quality_score", "high"),
     FactorSpec("cost_liquidity_score", "high"),
+    FactorSpec("b4_contract_score", "high"),
+    FactorSpec("b4_gamma_rent_score", "high"),
+    FactorSpec("b4_vol_of_vol_score", "high"),
+    FactorSpec("b5_delta_ratio_to_cap", "low"),
+    FactorSpec("b5_theta_per_gamma", "high"),
+    FactorSpec("b5_theta_per_vega", "high"),
+    FactorSpec("b5_premium_per_vega", "high"),
+    FactorSpec("b5_premium_to_expected_move_loss", "high"),
+    FactorSpec("b5_premium_to_mae20_loss", "high"),
+    FactorSpec("b5_premium_to_tail_move_loss", "high"),
+    FactorSpec("b5_mom_20d", "high"),
+    FactorSpec("b5_trend_z_20d", "high"),
+    FactorSpec("b5_breakout_distance_up_60d", "high"),
+    FactorSpec("b5_breakout_distance_down_60d", "high"),
+    FactorSpec("b5_range_expansion_proxy_20d", "low"),
+    FactorSpec("b5_atm_iv_mom_5d", "low"),
+    FactorSpec("b5_atm_iv_accel", "low"),
+    FactorSpec("b5_iv_reversion_score", "high"),
+    FactorSpec("b5_product_stop_count_20d", "low"),
+    FactorSpec("b5_product_side_stop_count_20d", "low"),
+    FactorSpec("b5_cooldown_penalty_score", "low"),
+    FactorSpec("b5_cooldown_release_score", "high"),
+    FactorSpec("b5_tick_value_ratio", "low"),
+    FactorSpec("b5_low_price_flag", "low"),
+    FactorSpec("b5_variance_carry_forward", "high"),
+    FactorSpec("b5_capital_lockup_days", "low"),
+    FactorSpec("b5_premium_per_capital_day", "high"),
 )
 
 
@@ -159,6 +183,51 @@ def candidate_columns() -> list[str]:
         "abs_delta",
         "volume",
         "open_interest",
+        "b4_contract_score",
+        "b4_premium_to_iv10_score",
+        "b4_premium_to_stress_score",
+        "b4_premium_yield_margin_score",
+        "b4_gamma_rent_score",
+        "b4_vomma_score",
+        "b4_breakeven_cushion_score",
+        "b4_vol_of_vol_score",
+        "b5_delta_to_cap",
+        "b5_delta_ratio_to_cap",
+        "b5_premium_share_delta_bucket",
+        "b5_stress_share_delta_bucket",
+        "b5_theta_per_gamma",
+        "b5_gamma_theta_ratio",
+        "b5_theta_per_vega",
+        "b5_premium_per_vega",
+        "b5_premium_to_expected_move_loss",
+        "b5_premium_to_mae20_loss",
+        "b5_premium_to_tail_move_loss",
+        "b5_mom_5d",
+        "b5_mom_20d",
+        "b5_mom_60d",
+        "b5_trend_z_20d",
+        "b5_breakout_distance_up_60d",
+        "b5_breakout_distance_down_60d",
+        "b5_up_day_ratio_20d",
+        "b5_down_day_ratio_20d",
+        "b5_range_expansion_proxy_20d",
+        "b5_atm_iv_mom_5d",
+        "b5_atm_iv_mom_20d",
+        "b5_atm_iv_accel",
+        "b5_iv_zscore_60d",
+        "b5_iv_reversion_score",
+        "b5_days_since_product_stop",
+        "b5_product_stop_count_20d",
+        "b5_days_since_product_side_stop",
+        "b5_product_side_stop_count_20d",
+        "b5_cooldown_blocked",
+        "b5_cooldown_penalty_score",
+        "b5_cooldown_release_score",
+        "b5_tick_value_ratio",
+        "b5_low_price_flag",
+        "b5_variance_carry_forward",
+        "b5_capital_lockup_days",
+        "b5_premium_per_capital_day",
     ]
 
 
@@ -1141,12 +1210,27 @@ def main() -> None:
     price_bins.to_csv(out_dir / "corrected_price_bin_summary.csv", index=False)
     plot_price_bins(price_bins, out_dir / "00_low_price_distortion.png")
 
+    # Keep the sample-decay check focused. Running every label across every
+    # sample is expensive for the B5 full-shadow universe and duplicates the
+    # primary-sample corrected audit below. The summary CSV still covers all
+    # samples; this IC panel contrasts the broad universe with the tradable
+    # primary sample on the labels that matter most for adoption decisions.
+    sample_decay_names = ("all", PRIMARY_SAMPLE, "completed_premium_ge_100_low_fee")
+    sample_decay_labels = (
+        "pnl_per_premium_raw",
+        "cash_pnl",
+        "pnl_per_margin",
+        "stop_avoidance",
+    )
     all_ic = []
-    for sample_name, mask in masks.items():
+    for sample_name in sample_decay_names:
+        mask = masks.get(sample_name)
+        if mask is None:
+            continue
         data = df[mask].copy()
         if len(data) < args.min_cross_section:
             continue
-        ic = daily_rank_ic(data, factors, LABELS, args.min_cross_section)
+        ic = daily_rank_ic(data, factors, sample_decay_labels, args.min_cross_section)
         ic["sample"] = sample_name
         ic["level"] = "contract"
         all_ic.append(ic)
