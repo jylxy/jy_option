@@ -35,6 +35,26 @@ ATTRIBUTION_COLS = [
     "vega_pnl",
     "residual_pnl",
 ]
+B2_QUALITY_FIELDS = [
+    "variance_carry",
+    "breakeven_cushion_iv",
+    "breakeven_cushion_rv",
+    "premium_to_iv5_loss",
+    "premium_to_iv10_loss",
+    "premium_to_stress_loss",
+    "theta_vega_efficiency",
+    "gamma_rent_penalty",
+    "friction_ratio",
+]
+B2_SCORE_FIELDS = [
+    "premium_quality_score",
+    "iv_rv_carry_score",
+    "breakeven_cushion_score",
+    "premium_to_iv_shock_score",
+    "premium_to_stress_loss_score",
+    "theta_vega_efficiency_score",
+    "cost_liquidity_score",
+]
 CLOSE_PREFIXES = (
     "sl_",
     "tp_",
@@ -69,6 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", help="Analysis output directory")
     parser.add_argument("--top-n", type=int, default=10, help="Top N products for share chart")
     parser.add_argument("--rolling-window", type=int, default=20, help="Rolling window in days")
+    parser.add_argument("--baseline-tag", help="Baseline tag for comparison charts, e.g. s1_b0_standard_stop25_allprod_2022_latest")
+    parser.add_argument("--baseline-nav", help="Explicit baseline NAV CSV path")
+    parser.add_argument("--baseline-orders", help="Explicit baseline orders CSV path")
+    parser.add_argument("--baseline-label", default="B0", help="Baseline label used in comparison charts")
+    parser.add_argument("--candidate-label", help="Candidate label used in comparison charts. Default: --tag")
     return parser.parse_args()
 
 
@@ -194,6 +219,60 @@ def calc_metrics(nav: pd.DataFrame) -> Dict[str, float]:
         "cum_vega_pnl": float(numeric_series(nav, "vega_pnl").sum()),
         "cum_residual_pnl": float(numeric_series(nav, "residual_pnl").sum()),
     }
+
+
+def premium_quality_metrics(nav: pd.DataFrame, orders: Optional[pd.DataFrame]) -> Dict[str, float]:
+    if orders is None or orders.empty:
+        return {}
+    daily = build_daily_open_premium(nav, orders)
+    if daily is None or daily.empty:
+        return {}
+
+    total_gross = float(daily["open_gross_premium"].sum())
+    total_net = float(daily["open_net_premium"].sum())
+    nonzero = daily[daily["open_gross_premium"] > 0].copy()
+    cum_vega = float(numeric_series(nav, "vega_pnl").sum())
+    cum_gamma = float(numeric_series(nav, "gamma_pnl").sum())
+    cum_theta = float(numeric_series(nav, "theta_pnl").sum())
+    cum_s1 = float(numeric_series(nav, "s1_pnl").sum())
+    vega_loss = max(-cum_vega, 0.0)
+    gamma_loss = max(-cum_gamma, 0.0)
+
+    result = {
+        "open_days": float(len(nonzero)),
+        "total_open_gross_premium": total_gross,
+        "total_open_net_premium": total_net,
+        "avg_daily_open_gross_premium": float(daily["open_gross_premium"].mean()),
+        "avg_open_day_gross_premium": float(nonzero["open_gross_premium"].mean()) if len(nonzero) else np.nan,
+        "avg_daily_open_gross_premium_pct_nav": float(daily["open_gross_premium_pct_nav"].mean()),
+        "avg_open_day_gross_premium_pct_nav": float(nonzero["open_gross_premium_pct_nav"].mean()) if len(nonzero) else np.nan,
+        "max_daily_open_gross_premium": float(daily["open_gross_premium"].max()),
+        "put_gross_premium_share": (
+            float(daily["open_put_gross_premium"].sum() / total_gross) if total_gross > 0 else np.nan
+        ),
+        "vega_pnl_to_gross_premium": cum_vega / total_gross if total_gross > 0 else np.nan,
+        "vega_loss_to_gross_premium": vega_loss / total_gross if total_gross > 0 else np.nan,
+        "gamma_loss_to_gross_premium": gamma_loss / total_gross if total_gross > 0 else np.nan,
+        "theta_to_gross_premium": cum_theta / total_gross if total_gross > 0 else np.nan,
+        "s1_pnl_to_gross_premium": cum_s1 / total_gross if total_gross > 0 else np.nan,
+    }
+
+    close_events = (
+        orders[orders["action"].astype(str).str.lower().map(is_close_action)].copy()
+        if "action" in orders.columns
+        else pd.DataFrame()
+    )
+    if not close_events.empty and {"open_premium_cash", "premium_retained_cash"}.issubset(close_events.columns):
+        open_premium = pd.to_numeric(close_events["open_premium_cash"], errors="coerce").fillna(0.0)
+        retained = pd.to_numeric(close_events["premium_retained_cash"], errors="coerce").fillna(0.0)
+        closed_open_premium = float(open_premium[open_premium > 0].sum())
+        closed_retained = float(retained[open_premium > 0].sum())
+        result["closed_open_premium"] = closed_open_premium
+        result["closed_premium_retained"] = closed_retained
+        result["closed_premium_retained_ratio"] = (
+            closed_retained / closed_open_premium if closed_open_premium > 0 else np.nan
+        )
+    return result
 
 
 def fmt_pct(x: float) -> str:
@@ -372,6 +451,543 @@ def plot_premium_pc(nav: pd.DataFrame, out_dir: Path) -> None:
     axes[1].set_xlabel("Date")
     axes[1].legend(loc="upper left")
     save_fig(fig, out_dir, "06_premium_pc_structure.png")
+
+
+def build_daily_open_premium(nav: pd.DataFrame, orders: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if orders is None or orders.empty:
+        return None
+    if "date" not in orders.columns or "action" not in orders.columns:
+        return None
+    orders = orders.copy()
+    orders["date"] = pd.to_datetime(orders["date"])
+    open_sell = orders[orders["action"].astype(str).str.lower().map(is_open_sell_action)].copy()
+    if "strategy" in open_sell.columns:
+        open_sell = open_sell[open_sell["strategy"].astype(str).str.upper() == "S1"].copy()
+
+    base = nav[["date", "nav"]].copy()
+    if open_sell.empty:
+        daily = base.copy()
+        for col in [
+            "open_gross_premium",
+            "open_net_premium",
+            "open_fee",
+            "open_lots",
+            "open_contracts",
+            "open_products",
+            "open_orders",
+            "open_call_gross_premium",
+            "open_put_gross_premium",
+        ]:
+            daily[col] = 0.0
+    else:
+        for col in ["gross_premium_cash", "net_premium_cash", "fee", "quantity"]:
+            if col not in open_sell.columns:
+                open_sell[col] = 0.0
+            open_sell[col] = pd.to_numeric(open_sell[col], errors="coerce").fillna(0.0)
+        if "code" not in open_sell.columns:
+            open_sell["code"] = ""
+        if "product" not in open_sell.columns:
+            open_sell["product"] = ""
+        if "option_type" not in open_sell.columns:
+            open_sell["option_type"] = ""
+        open_sell["option_type"] = open_sell["option_type"].astype(str).str.upper().str[:1]
+
+        daily = open_sell.groupby("date").agg(
+            open_gross_premium=("gross_premium_cash", "sum"),
+            open_net_premium=("net_premium_cash", "sum"),
+            open_fee=("fee", "sum"),
+            open_lots=("quantity", "sum"),
+            open_contracts=("code", "nunique"),
+            open_products=("product", "nunique"),
+            open_orders=("code", "size"),
+        ).reset_index()
+        side = open_sell.pivot_table(
+            index="date",
+            columns="option_type",
+            values="gross_premium_cash",
+            aggfunc="sum",
+            fill_value=0.0,
+        ).reset_index()
+        side = side.rename(columns={"C": "open_call_gross_premium", "P": "open_put_gross_premium"})
+        for col in ["open_call_gross_premium", "open_put_gross_premium"]:
+            if col not in side.columns:
+                side[col] = 0.0
+        daily = daily.merge(side[["date", "open_call_gross_premium", "open_put_gross_premium"]], on="date", how="left")
+        daily = base.merge(daily, on="date", how="left")
+        fill_cols = [c for c in daily.columns if c not in ("date", "nav")]
+        daily[fill_cols] = daily[fill_cols].fillna(0.0)
+
+    daily["open_gross_premium_pct_nav"] = daily["open_gross_premium"] / daily["nav"].replace(0.0, np.nan)
+    daily["open_net_premium_pct_nav"] = daily["open_net_premium"] / daily["nav"].replace(0.0, np.nan)
+    daily["open_fee_pct_gross"] = np.where(
+        daily["open_gross_premium"] > 0,
+        daily["open_fee"] / daily["open_gross_premium"],
+        np.nan,
+    )
+    daily["open_gross_premium_20d_avg"] = daily["open_gross_premium"].rolling(20, min_periods=1).mean()
+    daily["open_gross_premium_pct_nav_20d_avg"] = (
+        daily["open_gross_premium_pct_nav"].rolling(20, min_periods=1).mean()
+    )
+    daily["open_net_premium_pct_nav_20d_avg"] = daily["open_net_premium_pct_nav"].rolling(20, min_periods=1).mean()
+    daily["cum_open_gross_premium"] = daily["open_gross_premium"].cumsum()
+    daily["cum_open_net_premium"] = daily["open_net_premium"].cumsum()
+    return daily
+
+
+def plot_premium_vega_quality(nav: pd.DataFrame, orders: Optional[pd.DataFrame], out_dir: Path) -> Optional[pd.DataFrame]:
+    daily = build_daily_open_premium(nav, orders)
+    if daily is None or daily.empty:
+        return None
+    daily.to_csv(out_dir / "daily_open_premium.csv", index=False)
+
+    summary = premium_quality_metrics(nav, orders)
+    if summary:
+        pd.DataFrame([summary]).to_csv(out_dir / "premium_quality_summary.csv", index=False)
+
+    fig, axes = plt.subplots(
+        4,
+        1,
+        figsize=(15, 13),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.0, 1.4, 1.7, 1.4]},
+    )
+    axes[0].bar(daily["date"], daily["open_put_gross_premium"] / 1e4, label="Put gross premium", color="#4C78A8", width=1.0)
+    axes[0].bar(
+        daily["date"],
+        daily["open_call_gross_premium"] / 1e4,
+        bottom=daily["open_put_gross_premium"] / 1e4,
+        label="Call gross premium",
+        color="#F58518",
+        width=1.0,
+    )
+    axes[0].plot(daily["date"], daily["open_gross_premium_20d_avg"] / 1e4, label="20D avg gross premium", color="#111111", linewidth=1.3)
+    axes[0].set_title("Daily new opening premium and vega quality")
+    axes[0].set_ylabel("Premium (10k)")
+    axes[0].legend(loc="upper left", ncol=3)
+
+    axes[1].plot(daily["date"], daily["open_gross_premium_pct_nav"] * 100.0, label="Gross premium / NAV", color="#54A24B", linewidth=0.9, alpha=0.7)
+    axes[1].plot(daily["date"], daily["open_gross_premium_pct_nav_20d_avg"] * 100.0, label="20D gross / NAV", color="#006400", linewidth=1.5)
+    axes[1].plot(daily["date"], daily["open_net_premium_pct_nav_20d_avg"] * 100.0, label="20D net / NAV", color="#B279A2", linewidth=1.2)
+    axes[1].set_ylabel("New premium / NAV (%)")
+    axes[1].legend(loc="upper left", ncol=3)
+
+    axes[2].plot(daily["date"], daily["cum_open_gross_premium"] / 1e4, label="Cum gross premium", color="#54A24B", linewidth=1.3)
+    if "theta_pnl" in nav.columns:
+        axes[2].plot(nav["date"], numeric_series(nav, "theta_pnl").cumsum() / 1e4, label="Cum theta", color="#2CA02C", linewidth=1.1)
+    if "vega_pnl" in nav.columns:
+        axes[2].plot(nav["date"], -numeric_series(nav, "vega_pnl").cumsum() / 1e4, label="- Cum vega PnL", color="#D62728", linewidth=1.1)
+    if "gamma_pnl" in nav.columns:
+        axes[2].plot(nav["date"], -numeric_series(nav, "gamma_pnl").cumsum() / 1e4, label="- Cum gamma PnL", color="#9467BD", linewidth=1.1)
+    if "s1_pnl" in nav.columns:
+        axes[2].plot(nav["date"], numeric_series(nav, "s1_pnl").cumsum() / 1e4, label="Cum S1 PnL", color="#111111", linewidth=1.3)
+    axes[2].set_ylabel("Cumulative cash (10k)")
+    axes[2].legend(loc="upper left", ncol=3)
+
+    if "s1_short_liability_pct" in nav.columns:
+        axes[3].plot(nav["date"], pct_or_ratio(numeric_series(nav, "s1_short_liability_pct")) * 100.0, label="Open liability / NAV", color="#E45756", linewidth=1.0)
+    if "s1_short_unrealized_premium_pct" in nav.columns:
+        axes[3].plot(nav["date"], pct_or_ratio(numeric_series(nav, "s1_short_unrealized_premium_pct")) * 100.0, label="Retained open premium / NAV", color="#72B7B2", linewidth=1.0)
+    if "s1_short_open_premium_pct" in nav.columns:
+        axes[3].plot(nav["date"], pct_or_ratio(numeric_series(nav, "s1_short_open_premium_pct")) * 100.0, label="Open premium / NAV", color="#4C78A8", linewidth=1.0)
+    axes[3].set_ylabel("Open stock premium (%)")
+    axes[3].set_xlabel("Date")
+    axes[3].legend(loc="upper left", ncol=3)
+
+    save_fig(fig, out_dir, "12_daily_open_premium_vega_quality.png")
+    return daily
+
+
+def s1_open_orders(orders: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if orders is None or orders.empty or "action" not in orders.columns:
+        return pd.DataFrame()
+    frame = orders.copy()
+    if "date" in frame.columns:
+        frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame[frame["action"].astype(str).str.lower().map(is_open_sell_action)].copy()
+    if "strategy" in frame.columns:
+        frame = frame[frame["strategy"].astype(str).str.upper() == "S1"].copy()
+    return frame
+
+
+def s1_close_orders(orders: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if orders is None or orders.empty or "action" not in orders.columns:
+        return pd.DataFrame()
+    frame = orders.copy()
+    if "date" in frame.columns:
+        frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame[frame["action"].astype(str).str.lower().map(is_close_action)].copy()
+    if "strategy" in frame.columns:
+        frame = frame[frame["strategy"].astype(str).str.upper() == "S1"].copy()
+    return frame
+
+
+def normalize_side(frame: pd.DataFrame) -> pd.Series:
+    if "option_type" not in frame.columns:
+        return pd.Series("UNKNOWN", index=frame.index)
+    side = frame["option_type"].astype(str).str.upper().str[:1]
+    return side.where(side.isin(["C", "P"]), "UNKNOWN")
+
+
+def plot_tail_product_side_contribution(nav: pd.DataFrame, orders: Optional[pd.DataFrame], out_dir: Path, tail_n: int = 20) -> Optional[pd.DataFrame]:
+    close_events = s1_close_orders(orders)
+    if close_events.empty or "date" not in close_events.columns or "pnl" not in close_events.columns:
+        return None
+    worst_dates = set(pd.to_datetime(nav.sort_values("daily_return", kind="mergesort").head(tail_n)["date"]))
+    close_events = close_events[close_events["date"].isin(worst_dates)].copy()
+    if close_events.empty:
+        return None
+    close_events["side"] = normalize_side(close_events)
+    close_events["pnl"] = numeric_series(close_events, "pnl")
+    close_events["quantity"] = numeric_series(close_events, "quantity")
+    close_events["open_premium_cash"] = numeric_series(close_events, "open_premium_cash")
+    group = close_events.groupby(["product", "side"], dropna=False).agg(
+        close_orders=("action", "size"),
+        lots=("quantity", "sum"),
+        realized_pnl=("pnl", "sum"),
+        open_premium_cash=("open_premium_cash", "sum"),
+    ).reset_index()
+    group["pnl_per_open_premium"] = np.where(
+        group["open_premium_cash"].abs() > 0,
+        group["realized_pnl"] / group["open_premium_cash"].abs(),
+        np.nan,
+    )
+    group = group.sort_values("realized_pnl", kind="mergesort")
+    group.to_csv(out_dir / "tail_product_side_contribution.csv", index=False)
+
+    top = group.head(20).copy()
+    if top.empty:
+        return group
+    labels = top["product"].astype(str) + "-" + top["side"].astype(str)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={"height_ratios": [2.1, 1.4]})
+    colors = np.where(top["realized_pnl"] >= 0, "#2ca02c", "#d62728")
+    axes[0].barh(labels, top["realized_pnl"] / 1e4, color=colors, alpha=0.8)
+    axes[0].axvline(0.0, color="#777777", linewidth=0.8)
+    axes[0].set_title(f"Tail product-side contribution on worst {tail_n} NAV days")
+    axes[0].set_xlabel("Realized close PnL (10k)")
+    axes[0].invert_yaxis()
+
+    daily_side = close_events.groupby(["date", "side"])["pnl"].sum().unstack(fill_value=0.0).sort_index()
+    daily_side.to_csv(out_dir / "tail_daily_side_contribution.csv")
+    for side in ["P", "C", "UNKNOWN"]:
+        if side in daily_side.columns:
+            axes[1].bar(daily_side.index, daily_side[side] / 1e4, label=side, alpha=0.75, width=1.0)
+    axes[1].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[1].set_ylabel("Tail-day close PnL (10k)")
+    axes[1].set_xlabel("Date")
+    axes[1].legend(loc="upper left", ncol=3)
+    save_fig(fig, out_dir, "13_tail_product_side_contribution.png")
+    return group
+
+
+def plot_vega_quality_by_bucket(orders: Optional[pd.DataFrame], out_dir: Path) -> Optional[pd.DataFrame]:
+    close_events = s1_close_orders(orders)
+    if close_events.empty or "open_premium_cash" not in close_events.columns:
+        return None
+    close_events = close_events.copy()
+    close_events["side"] = normalize_side(close_events)
+    if "vol_regime" in close_events.columns:
+        close_events["bucket"] = close_events["vol_regime"].fillna("unknown").astype(str)
+    else:
+        close_events["bucket"] = "unknown"
+    close_events["open_premium_cash"] = numeric_series(close_events, "open_premium_cash")
+    close_events["premium_retained_cash"] = numeric_series(close_events, "premium_retained_cash")
+    close_events["pnl"] = numeric_series(close_events, "pnl")
+    close_events["quantity"] = numeric_series(close_events, "quantity")
+    close_events["abs_vega_proxy"] = numeric_series(close_events, "vega").abs() * close_events["quantity"].abs()
+    close_events["iv_change_for_vega"] = numeric_series(close_events, "contract_iv_change_for_vega", np.nan)
+    close_events = close_events[close_events["open_premium_cash"] > 0].copy()
+    if close_events.empty:
+        return None
+    group = close_events.groupby(["bucket", "side"], dropna=False).agg(
+        close_orders=("action", "size"),
+        lots=("quantity", "sum"),
+        open_premium_cash=("open_premium_cash", "sum"),
+        retained_cash=("premium_retained_cash", "sum"),
+        pnl=("pnl", "sum"),
+        abs_vega_proxy=("abs_vega_proxy", "sum"),
+        avg_iv_change_for_vega=("iv_change_for_vega", "mean"),
+    ).reset_index()
+    group["retained_ratio"] = group["retained_cash"] / group["open_premium_cash"].replace(0.0, np.nan)
+    group["pnl_to_open_premium"] = group["pnl"] / group["open_premium_cash"].replace(0.0, np.nan)
+    group["premium_per_vega_proxy"] = group["open_premium_cash"] / group["abs_vega_proxy"].replace(0.0, np.nan)
+    group = group.sort_values(["bucket", "side"], kind="mergesort")
+    group.to_csv(out_dir / "vega_quality_by_bucket.csv", index=False)
+
+    labels = group["bucket"].astype(str) + "-" + group["side"].astype(str)
+    x = np.arange(len(group))
+    fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=True)
+    axes[0].bar(x, group["retained_ratio"] * 100.0, color="#4C78A8", alpha=0.8)
+    axes[0].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[0].set_title("Vega quality by vol bucket and side")
+    axes[0].set_ylabel("Retained ratio (%)")
+
+    axes[1].bar(x, group["premium_per_vega_proxy"], color="#F58518", alpha=0.8)
+    axes[1].set_ylabel("Premium / abs vega proxy")
+
+    axes[2].bar(x, group["open_premium_cash"] / 1e4, color="#54A24B", alpha=0.75, label="open premium")
+    ax2 = axes[2].twinx()
+    ax2.plot(x, group["abs_vega_proxy"], color="#D62728", marker="o", linewidth=1.0, label="abs vega proxy")
+    axes[2].set_ylabel("Open premium (10k)")
+    ax2.set_ylabel("Abs vega proxy")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=35, ha="right")
+    axes[2].set_xlabel("Vol bucket - side")
+    legend_if_any(axes[2], loc="upper left")
+    legend_if_any(ax2, loc="upper right")
+    save_fig(fig, out_dir, "14_vega_quality_by_bucket.png")
+    return group
+
+
+def plot_stop_slippage_distribution(orders: Optional[pd.DataFrame], out_dir: Path) -> Optional[pd.DataFrame]:
+    close_events = s1_close_orders(orders)
+    if close_events.empty:
+        return None
+    stops = close_events[close_events["action"].astype(str).str.lower().str.startswith("sl_")].copy()
+    if stops.empty:
+        return None
+    stops["side"] = normalize_side(stops)
+    stops["execution_slippage_cash"] = numeric_series(stops, "execution_slippage_cash", np.nan)
+    stops["open_execution_slippage_cash"] = numeric_series(stops, "open_execution_slippage_cash", np.nan)
+    stops["open_premium_cash"] = numeric_series(stops, "open_premium_cash", np.nan)
+    stops["pnl"] = numeric_series(stops, "pnl")
+    stops["close_slippage_pct_open_premium"] = stops["execution_slippage_cash"] / stops["open_premium_cash"].replace(0.0, np.nan)
+    stops.to_csv(out_dir / "stop_slippage_distribution.csv", index=False)
+
+    product = stops.groupby("product", dropna=False).agg(
+        stop_orders=("action", "size"),
+        pnl=("pnl", "sum"),
+        close_slippage_cash=("execution_slippage_cash", "sum"),
+        open_slippage_cash=("open_execution_slippage_cash", "sum"),
+    ).sort_values("close_slippage_cash", ascending=False)
+    product.reset_index().to_csv(out_dir / "stop_slippage_product_summary.csv", index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 11))
+    values = stops["execution_slippage_cash"].replace([np.inf, -np.inf], np.nan).dropna()
+    axes[0].hist(values, bins=60, color="#4C78A8", alpha=0.75)
+    axes[0].axvline(values.median() if len(values) else 0.0, color="#111111", linestyle="--", label="median")
+    axes[0].set_title("Stop close slippage distribution")
+    axes[0].set_xlabel("Close slippage cash per order")
+    axes[0].set_ylabel("Count")
+    axes[0].legend(loc="upper right")
+
+    pct = stops["close_slippage_pct_open_premium"].replace([np.inf, -np.inf], np.nan).dropna()
+    axes[1].hist(pct * 100.0, bins=60, color="#F58518", alpha=0.75)
+    axes[1].set_xlabel("Close slippage / open premium (%)")
+    axes[1].set_ylabel("Count")
+
+    top = product.head(15).sort_values("close_slippage_cash")
+    axes[2].barh(top.index.astype(str), top["close_slippage_cash"], color="#D62728", alpha=0.75)
+    axes[2].set_xlabel("Total close slippage cash")
+    axes[2].set_title("Top products by stop close slippage")
+    save_fig(fig, out_dir, "15_stop_slippage_distribution.png")
+    return stops
+
+
+def plot_pc_funnel(orders: Optional[pd.DataFrame], out_dir: Path) -> Optional[pd.DataFrame]:
+    opens = s1_open_orders(orders)
+    closes = s1_close_orders(orders)
+    if opens.empty and closes.empty:
+        return None
+    rows = []
+    for side in ["P", "C"]:
+        open_side = opens[normalize_side(opens) == side].copy() if not opens.empty else pd.DataFrame()
+        close_side = closes[normalize_side(closes) == side].copy() if not closes.empty else pd.DataFrame()
+        stop_side = close_side[close_side["action"].astype(str).str.lower().str.startswith("sl_")].copy() if not close_side.empty else pd.DataFrame()
+        open_gross = float(numeric_series(open_side, "gross_premium_cash").sum()) if not open_side.empty else 0.0
+        open_net = float(numeric_series(open_side, "net_premium_cash").sum()) if not open_side.empty else 0.0
+        closed_open_premium = float(numeric_series(close_side, "open_premium_cash").sum()) if not close_side.empty else 0.0
+        retained = float(numeric_series(close_side, "premium_retained_cash").sum()) if not close_side.empty else 0.0
+        pnl = float(numeric_series(close_side, "pnl").sum()) if not close_side.empty else 0.0
+        rows.append(
+            {
+                "side": side,
+                "open_orders": float(len(open_side)),
+                "open_lots": float(numeric_series(open_side, "quantity").sum()) if not open_side.empty else 0.0,
+                "open_gross_premium": open_gross,
+                "open_net_premium": open_net,
+                "close_orders": float(len(close_side)),
+                "stop_orders": float(len(stop_side)),
+                "closed_open_premium": closed_open_premium,
+                "premium_retained_cash": retained,
+                "close_pnl": pnl,
+                "retained_ratio": retained / closed_open_premium if closed_open_premium > 0 else np.nan,
+                "stop_order_share": len(stop_side) / len(close_side) if len(close_side) else np.nan,
+            }
+        )
+    funnel = pd.DataFrame(rows)
+    funnel.to_csv(out_dir / "pc_funnel.csv", index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    x = np.arange(len(funnel))
+    axes[0].bar(x - 0.2, funnel["open_gross_premium"] / 1e4, width=0.4, label="open gross premium", color="#4C78A8")
+    axes[0].bar(x + 0.2, funnel["premium_retained_cash"] / 1e4, width=0.4, label="retained premium", color="#54A24B")
+    axes[0].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[0].set_title("Put/Call premium funnel")
+    axes[0].set_ylabel("Cash (10k)")
+    axes[0].legend(loc="upper left")
+
+    axes[1].bar(x - 0.2, funnel["retained_ratio"] * 100.0, width=0.4, label="retained ratio", color="#72B7B2")
+    axes[1].bar(x + 0.2, funnel["stop_order_share"] * 100.0, width=0.4, label="stop order share", color="#E45756")
+    axes[1].set_ylabel("Ratio (%)")
+    axes[1].legend(loc="upper left")
+
+    axes[2].bar(x - 0.2, funnel["open_lots"], width=0.4, label="open lots", color="#F58518")
+    axes[2].bar(x + 0.2, funnel["open_orders"], width=0.4, label="open orders", color="#9467BD")
+    axes[2].set_ylabel("Count")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(funnel["side"])
+    axes[2].set_xlabel("Side")
+    axes[2].legend(loc="upper left")
+    save_fig(fig, out_dir, "16_pc_funnel.png")
+    return funnel
+
+
+def metric_quantile_bucket(frame: pd.DataFrame, col: str, buckets: int = 5) -> Optional[pd.Series]:
+    if frame.empty or col not in frame.columns:
+        return None
+    values = pd.to_numeric(frame[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    valid = values.notna()
+    if valid.sum() < 2:
+        return None
+    q = int(min(max(buckets, 2), valid.sum()))
+    labels = [f"Q{i}" for i in range(1, q + 1)]
+    ranked = values[valid].rank(method="first")
+    bucket = pd.Series(np.nan, index=frame.index, dtype=object)
+    try:
+        bucket.loc[valid] = pd.qcut(ranked, q=q, labels=labels).astype(str)
+    except ValueError:
+        return None
+    return bucket
+
+
+def b2_close_bucket_summary(frame: pd.DataFrame, group_cols: List[str], metric_col: Optional[str] = None) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    work = frame.copy()
+    work["side"] = normalize_side(work)
+    work["quantity"] = numeric_series(work, "quantity")
+    work["open_premium_cash"] = numeric_series(work, "open_premium_cash")
+    work["premium_retained_cash"] = numeric_series(work, "premium_retained_cash")
+    work["pnl"] = numeric_series(work, "pnl")
+    work["is_stop"] = work["action"].astype(str).str.lower().str.startswith("sl_")
+    agg = {
+        "close_orders": ("action", "size"),
+        "lots": ("quantity", "sum"),
+        "open_premium_cash": ("open_premium_cash", "sum"),
+        "retained_cash": ("premium_retained_cash", "sum"),
+        "pnl": ("pnl", "sum"),
+        "stop_orders": ("is_stop", "sum"),
+    }
+    if metric_col and metric_col in work.columns:
+        work[metric_col] = numeric_series(work, metric_col, np.nan)
+        agg["avg_metric"] = (metric_col, "mean")
+        agg["median_metric"] = (metric_col, "median")
+    for col in B2_QUALITY_FIELDS + B2_SCORE_FIELDS:
+        if col in work.columns and col != metric_col:
+            work[col] = numeric_series(work, col, np.nan)
+            agg[f"avg_{col}"] = (col, "mean")
+    group = work.groupby(group_cols, dropna=False).agg(**agg).reset_index()
+    group["retained_ratio"] = group["retained_cash"] / group["open_premium_cash"].replace(0.0, np.nan)
+    group["pnl_to_open_premium"] = group["pnl"] / group["open_premium_cash"].replace(0.0, np.nan)
+    group["stop_order_share"] = group["stop_orders"] / group["close_orders"].replace(0.0, np.nan)
+    return group
+
+
+def plot_b2_premium_quality_diagnostics(orders: Optional[pd.DataFrame], out_dir: Path) -> Optional[pd.DataFrame]:
+    opens = s1_open_orders(orders)
+    closes = s1_close_orders(orders)
+    available = [col for col in (B2_QUALITY_FIELDS + B2_SCORE_FIELDS) if col in opens.columns or col in closes.columns]
+    if not available:
+        return None
+
+    if not opens.empty:
+        open_work = opens.copy()
+        open_work["side"] = normalize_side(open_work)
+        open_work["quantity"] = numeric_series(open_work, "quantity")
+        open_work["gross_premium_cash"] = numeric_series(open_work, "gross_premium_cash")
+        open_work["net_premium_cash"] = numeric_series(open_work, "net_premium_cash")
+        open_agg = {
+            "open_orders": ("action", "size"),
+            "lots": ("quantity", "sum"),
+            "gross_premium_cash": ("gross_premium_cash", "sum"),
+            "net_premium_cash": ("net_premium_cash", "sum"),
+        }
+        for col in available:
+            if col in open_work.columns:
+                open_work[col] = numeric_series(open_work, col, np.nan)
+                open_agg[f"avg_{col}"] = (col, "mean")
+                open_agg[f"median_{col}"] = (col, "median")
+        open_summary = open_work.groupby("side", dropna=False).agg(**open_agg).reset_index()
+        open_summary["net_to_gross_premium"] = (
+            open_summary["net_premium_cash"] / open_summary["gross_premium_cash"].replace(0.0, np.nan)
+        )
+        open_summary.to_csv(out_dir / "b2_open_quality_field_summary.csv", index=False)
+
+    score_summary = pd.DataFrame()
+    if not closes.empty and "premium_quality_score" in closes.columns:
+        close_work = closes.copy()
+        score_bucket = metric_quantile_bucket(close_work, "premium_quality_score")
+        if score_bucket is not None:
+            close_work["premium_quality_score_bucket"] = score_bucket
+            close_work = close_work[close_work["premium_quality_score_bucket"].notna()].copy()
+            score_summary = b2_close_bucket_summary(
+                close_work,
+                ["premium_quality_score_bucket", "side"],
+                metric_col="premium_quality_score",
+            )
+            score_summary = score_summary.sort_values(["premium_quality_score_bucket", "side"], kind="mergesort")
+            score_summary.to_csv(out_dir / "b2_quality_score_quintiles.csv", index=False)
+
+    metric_rows = []
+    if not closes.empty:
+        for metric in B2_QUALITY_FIELDS:
+            if metric not in closes.columns:
+                continue
+            close_work = closes.copy()
+            bucket = metric_quantile_bucket(close_work, metric)
+            if bucket is None:
+                continue
+            close_work["metric"] = metric
+            close_work["metric_bucket"] = bucket
+            close_work = close_work[close_work["metric_bucket"].notna()].copy()
+            metric_summary = b2_close_bucket_summary(
+                close_work,
+                ["metric", "metric_bucket", "side"],
+                metric_col=metric,
+            )
+            metric_rows.append(metric_summary)
+    if metric_rows:
+        metric_table = pd.concat(metric_rows, ignore_index=True)
+        metric_table = metric_table.sort_values(["metric", "metric_bucket", "side"], kind="mergesort")
+        metric_table.to_csv(out_dir / "b2_metric_quintiles.csv", index=False)
+
+    if score_summary.empty:
+        return score_summary
+
+    labels = score_summary["premium_quality_score_bucket"].astype(str) + "-" + score_summary["side"].astype(str)
+    x = np.arange(len(score_summary))
+    fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=True)
+    axes[0].bar(x, score_summary["retained_ratio"] * 100.0, color="#4C78A8", alpha=0.8)
+    axes[0].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[0].set_title("B2 premium quality score quintiles")
+    axes[0].set_ylabel("Retained ratio (%)")
+
+    axes[1].bar(x, score_summary["pnl_to_open_premium"] * 100.0, color="#54A24B", alpha=0.8)
+    axes[1].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[1].set_ylabel("PnL / open premium (%)")
+
+    axes[2].bar(x, score_summary["open_premium_cash"] / 1e4, color="#F58518", alpha=0.75, label="open premium")
+    ax2 = axes[2].twinx()
+    ax2.plot(x, score_summary["stop_order_share"] * 100.0, color="#D62728", marker="o", linewidth=1.0, label="stop share")
+    axes[2].set_ylabel("Closed open premium (10k)")
+    ax2.set_ylabel("Stop order share (%)")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=35, ha="right")
+    axes[2].set_xlabel("Premium quality quintile - side")
+    legend_if_any(axes[2], loc="upper left")
+    legend_if_any(ax2, loc="upper right")
+    save_fig(fig, out_dir, "17_b2_premium_quality_score.png")
+    return score_summary
 
 
 def plot_regime_exposure(nav: pd.DataFrame, out_dir: Path) -> None:
@@ -652,6 +1268,11 @@ def write_report(
         f"| Cum S1 PnL | {fmt_num(metrics['cum_s1_pnl'])} |",
         f"| Cum theta PnL | {fmt_num(metrics['cum_theta_pnl'])} |",
         f"| Cum vega PnL | {fmt_num(metrics['cum_vega_pnl'])} |",
+        f"| Total open gross premium | {fmt_num(metrics.get('total_open_gross_premium', np.nan))} |",
+        f"| Avg daily open gross premium / NAV | {fmt_pct(metrics.get('avg_daily_open_gross_premium_pct_nav', np.nan))} |",
+        f"| Vega PnL / gross premium | {fmt_pct(metrics.get('vega_pnl_to_gross_premium', np.nan))} |",
+        f"| Vega loss / gross premium | {fmt_pct(metrics.get('vega_loss_to_gross_premium', np.nan))} |",
+        f"| Closed premium retained ratio | {fmt_pct(metrics.get('closed_premium_retained_ratio', np.nan))} |",
         "",
         "## Worst Days",
         "",
@@ -674,6 +1295,364 @@ def write_report(
     (out_dir / "analysis_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_baseline_inputs(
+    args: argparse.Namespace,
+) -> Optional[Tuple[pd.DataFrame, Path, Optional[pd.DataFrame], Optional[Path], str]]:
+    if not args.baseline_tag and not args.baseline_nav:
+        return None
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    nav_path = resolve_path(args.baseline_nav) or find_by_tag(output_dir, "nav", args.baseline_tag)
+    if nav_path is None or not nav_path.exists():
+        raise FileNotFoundError("Baseline NAV CSV not found. Provide --baseline-tag or --baseline-nav.")
+    tag = args.baseline_tag or infer_tag(nav_path)
+    orders_path = resolve_path(args.baseline_orders) or find_by_tag(output_dir, "orders", tag)
+    nav = pd.read_csv(nav_path)
+    orders = read_csv_optional(orders_path)
+    return nav, nav_path, orders, orders_path, tag
+
+
+def clip_to_common_dates(left: pd.DataFrame, right: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[pd.Timestamp]]:
+    left_dates = set(pd.to_datetime(left["date"]))
+    right_dates = set(pd.to_datetime(right["date"]))
+    common_dates = sorted(left_dates.intersection(right_dates))
+    if not common_dates:
+        raise ValueError("No common dates between candidate and baseline NAV.")
+    common_index = pd.DatetimeIndex(common_dates)
+    left_clip = enrich_nav(left[pd.to_datetime(left["date"]).isin(common_index)].copy())
+    right_clip = enrich_nav(right[pd.to_datetime(right["date"]).isin(common_index)].copy())
+    return left_clip, right_clip, common_dates
+
+
+def comparison_metric_rows(
+    candidate: pd.DataFrame,
+    baseline: pd.DataFrame,
+    candidate_orders: Optional[pd.DataFrame] = None,
+    baseline_orders: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    cand_metrics = calc_metrics(candidate)
+    base_metrics = calc_metrics(baseline)
+    cand_metrics.update(premium_quality_metrics(candidate, candidate_orders))
+    base_metrics.update(premium_quality_metrics(baseline, baseline_orders))
+    rows = []
+    keys = [
+        "start_nav",
+        "final_nav",
+        "total_return",
+        "cagr",
+        "ann_vol",
+        "sharpe",
+        "sortino",
+        "calmar",
+        "max_drawdown",
+        "current_drawdown",
+        "worst_day_return",
+        "avg_margin_pct",
+        "max_margin_pct",
+        "cum_fee",
+        "cum_s1_pnl",
+        "cum_delta_pnl",
+        "cum_gamma_pnl",
+        "cum_theta_pnl",
+        "cum_vega_pnl",
+        "cum_residual_pnl",
+        "total_open_gross_premium",
+        "total_open_net_premium",
+        "avg_daily_open_gross_premium_pct_nav",
+        "avg_open_day_gross_premium_pct_nav",
+        "vega_pnl_to_gross_premium",
+        "vega_loss_to_gross_premium",
+        "gamma_loss_to_gross_premium",
+        "theta_to_gross_premium",
+        "s1_pnl_to_gross_premium",
+        "closed_premium_retained_ratio",
+    ]
+    for key in keys:
+        cand_value = cand_metrics.get(key, np.nan)
+        base_value = base_metrics.get(key, np.nan)
+        rows.append(
+            {
+                "metric": key,
+                "candidate": cand_value,
+                "baseline": base_value,
+                "diff": cand_value - base_value if pd.notna(cand_value) and pd.notna(base_value) else np.nan,
+            }
+        )
+    extra_cols = [
+        "n_positions",
+        "s1_active_sell_lots",
+        "s1_active_sell_contracts",
+        "s1_active_sell_products",
+        "s1_put_call_lot_ratio",
+        "s1_call_lot_share",
+        "s1_stress_loss_used_pct",
+        "s1_short_open_premium_pct",
+    ]
+    for col in extra_cols:
+        if col in candidate.columns or col in baseline.columns:
+            cand_value = float(numeric_series(candidate, col, np.nan).mean())
+            base_value = float(numeric_series(baseline, col, np.nan).mean())
+            rows.append(
+                {
+                    "metric": f"avg_{col}",
+                    "candidate": cand_value,
+                    "baseline": base_value,
+                    "diff": cand_value - base_value if pd.notna(cand_value) and pd.notna(base_value) else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_compare_nav(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    cand_norm = candidate["nav"] / candidate["nav"].iloc[0]
+    base_norm = baseline["nav"] / baseline["nav"].iloc[0]
+    excess = cand_norm / base_norm - 1.0
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    axes[0].plot(candidate["date"], cand_norm, label=candidate_label, linewidth=1.5, color="#1f77b4")
+    axes[0].plot(baseline["date"], base_norm, label=baseline_label, linewidth=1.5, color="#7f7f7f")
+    axes[0].set_title("NAV relative to baseline")
+    axes[0].set_ylabel("Normalized NAV")
+    axes[0].legend(loc="upper left")
+    axes[1].plot(candidate["date"], excess * 100.0, label=f"{candidate_label} excess vs {baseline_label}", color="#2ca02c")
+    axes[1].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[1].set_ylabel("Excess (%)")
+    axes[1].set_xlabel("Date")
+    axes[1].legend(loc="upper left")
+    save_fig(fig, out_dir, "compare_01_nav_relative_to_b0.png")
+
+
+def plot_compare_drawdown(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.fill_between(candidate["date"], candidate["drawdown"] * 100.0, 0.0, alpha=0.25, color="#1f77b4", label=candidate_label)
+    ax.fill_between(baseline["date"], baseline["drawdown"] * 100.0, 0.0, alpha=0.25, color="#d62728", label=baseline_label)
+    cand_min = candidate.loc[candidate["drawdown"].idxmin()]
+    base_min = baseline.loc[baseline["drawdown"].idxmin()]
+    ax.scatter([cand_min["date"]], [cand_min["drawdown"] * 100.0], color="#1f77b4", zorder=3)
+    ax.scatter([base_min["date"]], [base_min["drawdown"] * 100.0], color="#d62728", zorder=3)
+    ax.set_title("Drawdown relative to baseline")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_xlabel("Date")
+    ax.legend(loc="lower left")
+    save_fig(fig, out_dir, "compare_02_drawdown_relative_to_b0.png")
+
+
+def plot_compare_margin_position(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    specs = [
+        ("margin_pct", "Margin (%)", True),
+        ("s1_active_sell_products", "Active products", False),
+        ("s1_active_sell_contracts", "Active contracts", False),
+        ("s1_active_sell_lots", "Active lots", False),
+    ]
+    fig, axes = plt.subplots(len(specs), 1, figsize=(14, 11), sharex=True)
+    for ax, (col, label, is_pct) in zip(axes, specs):
+        if col in candidate.columns:
+            cand = numeric_series(candidate, col, np.nan)
+            if is_pct:
+                cand = pct_or_ratio(cand) * 100.0
+            ax.plot(candidate["date"], cand, label=candidate_label, color="#1f77b4", linewidth=1.1)
+        if col in baseline.columns:
+            base = numeric_series(baseline, col, np.nan)
+            if is_pct:
+                base = pct_or_ratio(base) * 100.0
+            ax.plot(baseline["date"], base, label=baseline_label, color="#7f7f7f", linewidth=1.1)
+        ax.set_ylabel(label)
+        legend_if_any(ax, loc="upper left")
+    axes[0].set_title("Margin and position load relative to baseline")
+    axes[-1].set_xlabel("Date")
+    save_fig(fig, out_dir, "compare_03_margin_position_relative_to_b0.png")
+
+
+def plot_compare_greek_attribution(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    cols = [c for c in ATTRIBUTION_COLS if c in candidate.columns or c in baseline.columns]
+    if not cols:
+        return
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    for col in cols:
+        axes[0].plot(candidate["date"], numeric_series(candidate, col).cumsum() / 1e4, label=f"{candidate_label} {col.replace('_pnl', '')}", linewidth=1.0)
+        axes[0].plot(baseline["date"], numeric_series(baseline, col).cumsum() / 1e4, label=f"{baseline_label} {col.replace('_pnl', '')}", linestyle="--", linewidth=0.9)
+        diff = numeric_series(candidate, col).cumsum() - numeric_series(baseline, col).cumsum()
+        axes[1].plot(candidate["date"], diff / 1e4, label=col.replace("_pnl", ""), linewidth=1.1)
+    axes[0].set_title("Greek attribution relative to baseline")
+    axes[0].set_ylabel("Cumulative PnL (10k)")
+    axes[0].legend(loc="upper left", ncol=3, fontsize=8)
+    axes[1].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[1].set_ylabel("Candidate - baseline (10k)")
+    axes[1].set_xlabel("Date")
+    axes[1].legend(loc="upper left", ncol=3)
+    save_fig(fig, out_dir, "compare_04_greek_attribution_relative_to_b0.png")
+
+
+def plot_compare_daily_tail(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+    axes[0].plot(candidate["date"], candidate["daily_return"] * 100.0, label=candidate_label, linewidth=0.9, alpha=0.8)
+    axes[0].plot(baseline["date"], baseline["daily_return"] * 100.0, label=baseline_label, linewidth=0.9, alpha=0.8)
+    axes[0].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[0].set_title("Daily PnL tail relative to baseline")
+    axes[0].set_ylabel("Daily return (%)")
+    axes[0].legend(loc="upper left")
+    axes[1].hist(candidate["daily_return"] * 100.0, bins=60, alpha=0.55, label=candidate_label, color="#1f77b4")
+    axes[1].hist(baseline["daily_return"] * 100.0, bins=60, alpha=0.55, label=baseline_label, color="#7f7f7f")
+    for frame, color, label in [(candidate, "#1f77b4", candidate_label), (baseline, "#7f7f7f", baseline_label)]:
+        axes[1].axvline(frame["daily_return"].quantile(0.01) * 100.0, color=color, linestyle="--", label=f"{label} 1%")
+    axes[1].set_xlabel("Daily return (%)")
+    axes[1].set_ylabel("Frequency")
+    axes[1].legend(loc="upper left")
+    save_fig(fig, out_dir, "compare_05_daily_pnl_tail_relative_to_b0.png")
+
+
+def plot_compare_pc_structure(candidate: pd.DataFrame, baseline: pd.DataFrame, out_dir: Path, candidate_label: str, baseline_label: str) -> None:
+    if not any(c in candidate.columns or c in baseline.columns for c in ["s1_put_call_lot_ratio", "s1_call_lot_share", "s1_call_open_premium_pct", "s1_put_open_premium_pct"]):
+        return
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    for frame, label, color in [(candidate, candidate_label, "#1f77b4"), (baseline, baseline_label, "#7f7f7f")]:
+        if "s1_put_call_lot_ratio" in frame.columns:
+            axes[0].plot(frame["date"], numeric_series(frame, "s1_put_call_lot_ratio", np.nan), label=label, color=color, linewidth=1.0)
+        if "s1_call_lot_share" in frame.columns:
+            axes[1].plot(frame["date"], pct_or_ratio(numeric_series(frame, "s1_call_lot_share", np.nan)) * 100.0, label=label, color=color, linewidth=1.0)
+        for col, linestyle in [("s1_call_open_premium_pct", "-"), ("s1_put_open_premium_pct", "--")]:
+            if col in frame.columns:
+                axes[2].plot(frame["date"], pct_or_ratio(numeric_series(frame, col, np.nan)) * 100.0, label=f"{label} {col.replace('s1_', '').replace('_pct', '')}", color=color, linestyle=linestyle, linewidth=1.0)
+    axes[0].set_title("P/C structure relative to baseline")
+    axes[0].set_ylabel("P/C ratio")
+    axes[1].axhline(50.0, color="#777777", linewidth=0.8, linestyle="--")
+    axes[1].set_ylabel("Call lot share (%)")
+    axes[2].set_ylabel("Premium (% NAV)")
+    axes[2].set_xlabel("Date")
+    for ax in axes:
+        legend_if_any(ax, loc="upper left", ncol=2, fontsize=8)
+    save_fig(fig, out_dir, "compare_06_pc_structure_relative_to_b0.png")
+
+
+def average_product_share(nav: pd.DataFrame, orders: Optional[pd.DataFrame]) -> pd.Series:
+    if orders is None or orders.empty:
+        return pd.Series(dtype=float)
+    lots = reconstruct_product_lots(nav, orders)
+    if lots.empty or len(lots.columns) <= 1:
+        return pd.Series(dtype=float)
+    product_cols = [c for c in lots.columns if c != "date"]
+    total = lots[product_cols].sum(axis=1).replace(0.0, np.nan)
+    shares = lots[product_cols].div(total, axis=0)
+    return shares.mean().sort_values(ascending=False)
+
+
+def plot_compare_product_exposure(
+    candidate: pd.DataFrame,
+    baseline: pd.DataFrame,
+    candidate_orders: Optional[pd.DataFrame],
+    baseline_orders: Optional[pd.DataFrame],
+    out_dir: Path,
+    candidate_label: str,
+    baseline_label: str,
+    top_n: int,
+) -> None:
+    cand_share = average_product_share(candidate, candidate_orders)
+    base_share = average_product_share(baseline, baseline_orders)
+    if cand_share.empty and base_share.empty:
+        return
+    top_products = pd.concat([cand_share, base_share], axis=1).fillna(0.0).sum(axis=1).sort_values(ascending=False).head(top_n).index
+    data = pd.DataFrame({candidate_label: cand_share.reindex(top_products).fillna(0.0), baseline_label: base_share.reindex(top_products).fillna(0.0)})
+    data.to_csv(out_dir / "compare_product_average_share.csv")
+    fig, ax = plt.subplots(figsize=(14, 6))
+    x = np.arange(len(top_products))
+    width = 0.38
+    ax.bar(x - width / 2, data[candidate_label] * 100.0, width=width, label=candidate_label, color="#1f77b4")
+    ax.bar(x + width / 2, data[baseline_label] * 100.0, width=width, label=baseline_label, color="#7f7f7f")
+    ax.set_xticks(x)
+    ax.set_xticklabels(top_products, rotation=45, ha="right")
+    ax.set_ylabel("Average active lot share (%)")
+    ax.set_title("Product exposure relative to baseline")
+    ax.legend(loc="upper right")
+    save_fig(fig, out_dir, "compare_07_product_exposure_relative_to_b0.png")
+
+
+def daily_stop_summary(nav: pd.DataFrame, orders: Optional[pd.DataFrame]) -> pd.DataFrame:
+    dates = pd.DataFrame({"date": pd.to_datetime(nav["date"])})
+    if orders is None or orders.empty or "date" not in orders.columns or "action" not in orders.columns:
+        dates["stop_count"] = 0
+        dates["stop_pnl"] = 0.0
+        return dates
+    frame = orders.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    action = frame["action"].astype(str).str.lower()
+    stops = frame[action.str.startswith("sl_")].copy()
+    if stops.empty:
+        dates["stop_count"] = 0
+        dates["stop_pnl"] = 0.0
+        return dates
+    grouped = stops.groupby("date").agg(
+        stop_count=("action", "size"),
+        stop_pnl=("pnl", "sum") if "pnl" in stops.columns else ("action", "size"),
+    ).reset_index()
+    return dates.merge(grouped, on="date", how="left").fillna({"stop_count": 0, "stop_pnl": 0.0})
+
+
+def plot_compare_stop_cluster(
+    candidate: pd.DataFrame,
+    baseline: pd.DataFrame,
+    candidate_orders: Optional[pd.DataFrame],
+    baseline_orders: Optional[pd.DataFrame],
+    out_dir: Path,
+    candidate_label: str,
+    baseline_label: str,
+) -> None:
+    cand = daily_stop_summary(candidate, candidate_orders)
+    base = daily_stop_summary(baseline, baseline_orders)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    axes[0].bar(cand["date"], cand["stop_count"], label=candidate_label, color="#1f77b4", alpha=0.55, width=1.0)
+    axes[0].bar(base["date"], base["stop_count"], label=baseline_label, color="#7f7f7f", alpha=0.45, width=1.0)
+    axes[0].set_title("Stop cluster relative to baseline")
+    axes[0].set_ylabel("Stop count")
+    axes[0].legend(loc="upper left")
+    axes[1].bar(cand["date"], cand["stop_pnl"], label=candidate_label, color="#1f77b4", alpha=0.55, width=1.0)
+    axes[1].bar(base["date"], base["stop_pnl"], label=baseline_label, color="#7f7f7f", alpha=0.45, width=1.0)
+    axes[1].axhline(0.0, color="#777777", linewidth=0.8)
+    axes[1].set_ylabel("Stop PnL")
+    axes[1].set_xlabel("Date")
+    axes[1].legend(loc="upper left")
+    save_fig(fig, out_dir, "compare_08_stop_cluster_relative_to_b0.png")
+
+
+def generate_baseline_comparison(
+    candidate_nav: pd.DataFrame,
+    candidate_orders: Optional[pd.DataFrame],
+    baseline_nav_raw: pd.DataFrame,
+    baseline_orders: Optional[pd.DataFrame],
+    out_dir: Path,
+    candidate_label: str,
+    baseline_label: str,
+    top_n: int,
+) -> None:
+    candidate_common, baseline_common, _ = clip_to_common_dates(candidate_nav, baseline_nav_raw)
+    comparison_metric_rows(candidate_common, baseline_common, candidate_orders, baseline_orders).to_csv(
+        out_dir / "comparison_summary.csv",
+        index=False,
+    )
+    plot_compare_nav(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_drawdown(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_margin_position(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_greek_attribution(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_daily_tail(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_pc_structure(candidate_common, baseline_common, out_dir, candidate_label, baseline_label)
+    plot_compare_product_exposure(
+        candidate_common,
+        baseline_common,
+        candidate_orders,
+        baseline_orders,
+        out_dir,
+        candidate_label,
+        baseline_label,
+        top_n,
+    )
+    plot_compare_stop_cluster(
+        candidate_common,
+        baseline_common,
+        candidate_orders,
+        baseline_orders,
+        out_dir,
+        candidate_label,
+        baseline_label,
+    )
+
+
 def main() -> None:
     configure_plot_style()
     args = parse_args()
@@ -685,6 +1664,7 @@ def main() -> None:
         diagnostics.to_csv(out_dir / "diagnostics_copy.csv", index=False)
 
     metrics = calc_metrics(nav)
+    metrics.update(premium_quality_metrics(nav, orders))
     worst, monthly, yearly = table_outputs(nav, metrics, out_dir)
 
     plot_nav_drawdown(nav, metrics, out_dir)
@@ -693,13 +1673,38 @@ def main() -> None:
     plot_pnl_attribution(nav, out_dir, args.rolling_window)
     plot_daily_tail(nav, out_dir)
     plot_premium_pc(nav, out_dir)
+    plot_premium_vega_quality(nav, orders, out_dir)
     plot_regime_exposure(nav, out_dir)
     plot_calendar_returns(monthly, yearly, out_dir)
     plot_product_share(nav, orders, out_dir, args.top_n)
     order_summaries(orders, out_dir)
+    plot_tail_product_side_contribution(nav, orders, out_dir)
+    plot_vega_quality_by_bucket(orders, out_dir)
+    plot_stop_slippage_distribution(orders, out_dir)
+    plot_pc_funnel(orders, out_dir)
+    plot_b2_premium_quality_diagnostics(orders, out_dir)
+    baseline_inputs = load_baseline_inputs(args)
+    if baseline_inputs is not None:
+        baseline_nav, baseline_nav_path, baseline_orders, baseline_orders_path, baseline_tag = baseline_inputs
+        candidate_label = args.candidate_label or tag
+        baseline_label = args.baseline_label or baseline_tag
+        generate_baseline_comparison(
+            nav,
+            orders,
+            baseline_nav,
+            baseline_orders,
+            out_dir,
+            candidate_label,
+            baseline_label,
+            args.top_n,
+        )
     write_report(tag, nav_path, orders_path, diagnostics_path, nav, metrics, worst, out_dir)
 
     print(f"Analysis pack written to: {out_dir}")
+    if baseline_inputs is not None:
+        print(f"Baseline comparison written against: {baseline_nav_path}")
+        if baseline_orders_path is not None:
+            print(f"Baseline orders: {baseline_orders_path}")
     print(f"Total return: {fmt_pct(metrics['total_return'])}")
     print(f"Max drawdown: {fmt_pct(metrics['max_drawdown'])}")
     print(f"Sharpe: {fmt_num(metrics['sharpe'])}")

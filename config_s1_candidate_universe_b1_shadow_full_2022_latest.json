@@ -1,0 +1,5 @@
+{
+  "extends": "config_s1_candidate_universe_b1_shadow_stop25.json",
+  "strategy_version": "s1_candidate_universe_b1_shadow_full_2022_latest",
+  "s1_candidate_universe_shadow_only_enabled": true
+}

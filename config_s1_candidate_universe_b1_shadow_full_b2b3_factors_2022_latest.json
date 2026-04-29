@@ -1,0 +1,11 @@
+{
+  "extends": "config_s1_candidate_universe_b1_shadow_stop25.json",
+  "strategy_version": "s1_candidate_universe_b1_shadow_full_b2b3_factors_2022_latest",
+  "s1_candidate_universe_shadow_only_enabled": true,
+  "s1_b2_product_tilt_enabled": false,
+  "s1_b3_clean_vega_tilt_enabled": false,
+  "s1_forward_vega_filter_enabled": false,
+  "s1_track_contract_iv_trend": true,
+  "s1_b3_vov_lookback_short": 5,
+  "s1_b3_vov_lookback_long": 20
+}

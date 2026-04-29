@@ -1,0 +1,14 @@
+{
+  "extends": "config_s1_baseline_b1_liquidity_oi_rank_stop25.json",
+  "strategy_version": "s1_baseline_b2_product_tilt025_stop25",
+  "s1_b2_product_tilt_enabled": true,
+  "s1_b2_tilt_strength": 0.25,
+  "s1_b2_floor_weight": 0.50,
+  "s1_b2_power": 1.50,
+  "s1_b2_missing_side_penalty": 0.70,
+  "s1_b2_missing_score": 20.0,
+  "s1_b2_score_clip_low": 5.0,
+  "s1_b2_score_clip_high": 95.0,
+  "s1_b2_score_top_contracts_per_side": 5,
+  "s1_b2_product_budget_diagnostics_enabled": true
+}

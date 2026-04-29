@@ -1,0 +1,3 @@
+display_name: S1 因子分层报告
+short_description: 分析 S1 full shadow/B2/B3 因子的 IC、分层、相关性、正交化和用途归属，并输出中文研究报告与飞书 DOCX。
+default_prompt: 请基于 S1 full shadow 或 factor_layers 输出，写一份中文因子分层检验报告，并同时输出 Markdown、Word DOCX 和飞书可导入 DOCX。报告必须区分选品种、选 Put/Call、选合约和环境调节四个决策层级，分析 Rank IC、Q1-Q5 分层、止损概率、权利金留存、vega/gamma 归因、stop overshoot、相关性矩阵和正交化/残差 IC，并判断每个因子应作为硬过滤、排序、预算、止损控制、环境调节还是暂不采用。

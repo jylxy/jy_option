@@ -1,0 +1,7 @@
+{
+  "extends": "config_s1_candidate_universe_b1_shadow_stop25.json",
+  "strategy_version": "s1_candidate_universe_b1_shadow_202503_signal_stop25",
+  "s1_candidate_universe_signal_start_date": "2025-03-01",
+  "s1_candidate_universe_signal_end_date": "2025-03-31",
+  "s1_candidate_universe_skip_new_opens_after_signal_end": true
+}

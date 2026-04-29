@@ -21,6 +21,7 @@
   "s1_min_volume": 0,
   "s1_min_oi": 0,
   "s1_min_premium_fee_multiple": 1.0,
+  "s1_min_option_price": 0.0,
   "s1_protect_enabled": false,
   "s1_protect_ratio": 0.0,
   "s1_allow_add_same_side": true,

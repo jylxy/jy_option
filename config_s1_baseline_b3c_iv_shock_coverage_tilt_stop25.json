@@ -1,0 +1,19 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_stop25.json",
+  "strategy_version": "s1_baseline_b3c_iv_shock_coverage_tilt_stop25",
+  "s1_track_contract_iv_trend": true,
+  "s1_b3_clean_vega_tilt_enabled": true,
+  "s1_b3_tilt_strength": 0.50,
+  "s1_b3_floor_weight": 0.50,
+  "s1_b3_power": 1.50,
+  "s1_b3_score_clip_low": 5.0,
+  "s1_b3_score_clip_high": 95.0,
+  "s1_b3_weight_b2": 0.70,
+  "s1_b3_weight_forward_variance": 0.0,
+  "s1_b3_weight_vol_of_vol": 0.0,
+  "s1_b3_weight_iv_shock": 0.30,
+  "s1_b3_weight_joint_stress": 0.0,
+  "s1_b3_weight_vomma": 0.0,
+  "s1_b3_weight_skew_stability": 0.0,
+  "s1_b3_product_side_budget_diagnostics_enabled": true
+}

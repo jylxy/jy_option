@@ -16,6 +16,7 @@ output/*
 # Local scratch files
 *_tmp.py
 tmp_*.py
+tmp_*/
 src/_analyze_*.py
 src/_check_*.py
 src/_debug_*.py

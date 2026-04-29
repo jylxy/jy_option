@@ -218,6 +218,85 @@ def calc_iv_batch(df, price_col="option_close", spot_col="spot_close",
     return pd.Series(result, index=df.index)
 
 
+def calc_option_price_batch(df, spot_col="spot_close", strike_col="strike",
+                            dte_col="dte", iv_col="implied_vol",
+                            otype_col="option_type", exchange_col="exchange",
+                            model=None, r=RISK_FREE_RATE,
+                            spot_shift_pct=0.0, iv_shift=0.0):
+    """Vectorized theoretical option price for BSM / Black76.
+
+    `iv_shift` is expressed in absolute volatility units: 0.05 means +5 vol
+    points. `spot_shift_pct` is a relative shock applied to the underlying or
+    futures price before repricing.
+    """
+    n = len(df)
+    if n == 0:
+        return pd.Series(dtype=float)
+
+    spots = pd.to_numeric(df[spot_col], errors="coerce").to_numpy(dtype=float)
+    strikes = pd.to_numeric(df[strike_col], errors="coerce").to_numpy(dtype=float)
+    dtes = pd.to_numeric(df[dte_col], errors="coerce").to_numpy(dtype=float)
+    ivs = pd.to_numeric(df[iv_col], errors="coerce").to_numpy(dtype=float)
+    otypes = df[otype_col].values
+    is_call = (otypes == "C")
+    spots = spots * (1.0 + float(spot_shift_pct or 0.0))
+    ivs = ivs + float(iv_shift or 0.0)
+    t = dtes / 365.0
+    models = _resolve_models(df, exchange_col=exchange_col, model=model)
+
+    valid = (
+        (spots > 0)
+        & (strikes > 0)
+        & (dtes > 0)
+        & (ivs > 0)
+        & np.isfinite(ivs)
+    )
+    prices = np.full(n, np.nan)
+    if not valid.any():
+        return pd.Series(prices, index=df.index)
+
+    valid_idx = np.where(valid)[0]
+    v_spots = spots[valid]
+    v_strikes = strikes[valid]
+    v_t = t[valid]
+    v_ivs = ivs[valid]
+    v_call = is_call[valid]
+    v_models = models[valid]
+
+    if (v_models == "black_scholes").any():
+        mask = (v_models == "black_scholes")
+        sub_idx = valid_idx[mask]
+        sub_spots = v_spots[mask]
+        sub_strikes = v_strikes[mask]
+        sub_t = v_t[mask]
+        sub_ivs = v_ivs[mask]
+        sub_call = v_call[mask]
+
+        d1, d2 = _bsm_d1_d2(sub_spots, sub_strikes, sub_t, r, sub_ivs)
+        exp_rt = np.exp(-r * sub_t)
+        call = sub_spots * _norm_cdf(d1) - sub_strikes * exp_rt * _norm_cdf(d2)
+        put = sub_strikes * exp_rt * _norm_cdf(-d2) - sub_spots * _norm_cdf(-d1)
+        prices[sub_idx] = np.where(sub_call, call, put)
+
+    if (v_models == "black").any():
+        mask = (v_models == "black")
+        sub_idx = valid_idx[mask]
+        sub_forwards = v_spots[mask]
+        sub_strikes = v_strikes[mask]
+        sub_t = v_t[mask]
+        sub_ivs = v_ivs[mask]
+        sub_call = v_call[mask]
+
+        d1, d2 = _black_d1_d2(sub_forwards, sub_strikes, sub_t, sub_ivs)
+        exp_rt = np.exp(-r * sub_t)
+        call = exp_rt * (sub_forwards * _norm_cdf(d1) - sub_strikes * _norm_cdf(d2))
+        put = exp_rt * (sub_strikes * _norm_cdf(-d2) - sub_forwards * _norm_cdf(-d1))
+        prices[sub_idx] = np.where(sub_call, call, put)
+
+    prices = np.where(prices >= 0, prices, np.nan)
+    return pd.Series(prices, index=df.index)
+
+
 def calc_greeks_batch(df, spot_col="spot_close", strike_col="strike",
                       dte_col="dte", iv_col="implied_vol", otype_col="option_type",
                       exchange_col="exchange", model=None, r=RISK_FREE_RATE):

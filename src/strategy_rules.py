@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import percentileofscore
 from margin_model import estimate_margin, resolve_margin_ratio
+from option_calc import calc_option_price_batch
 
 # ── 默认参数 ──────────────────────────────────────────────────────────────────
 
@@ -170,6 +171,70 @@ DEFAULT_PARAMS = {
     "s1_forward_vega_structural_low_min_trend_confidence": 0.35,
     "s1_use_stress_score": False,
     "s1_min_premium_fee_multiple": 2.0,
+    "s1_min_option_price": 0.0,
+    "s1_b2_product_tilt_enabled": False,
+    "s1_b2_tilt_strength": 0.0,
+    "s1_b2_floor_weight": 0.50,
+    "s1_b2_power": 1.50,
+    "s1_b2_missing_side_penalty": 0.70,
+    "s1_b2_missing_score": 20.0,
+    "s1_b2_score_clip_low": 5.0,
+    "s1_b2_score_clip_high": 95.0,
+    "s1_b2_score_top_contracts_per_side": 5,
+    "s1_b2_product_budget_diagnostics_enabled": True,
+    "s1_b3_clean_vega_tilt_enabled": False,
+    "s1_b3_tilt_strength": 0.0,
+    "s1_b3_floor_weight": 0.50,
+    "s1_b3_power": 1.50,
+    "s1_b3_score_clip_low": 5.0,
+    "s1_b3_score_clip_high": 95.0,
+    "s1_b3_weight_b2": 0.60,
+    "s1_b3_weight_forward_variance": 0.08,
+    "s1_b3_weight_vol_of_vol": 0.08,
+    "s1_b3_weight_iv_shock": 0.10,
+    "s1_b3_weight_joint_stress": 0.06,
+    "s1_b3_weight_vomma": 0.04,
+    "s1_b3_weight_skew_stability": 0.04,
+    "s1_b3_vov_lookback_short": 5,
+    "s1_b3_vov_lookback_long": 20,
+    "s1_b3_product_side_budget_diagnostics_enabled": True,
+    "s1_b4_factor_role_enabled": False,
+    "s1_b4_hard_filter_enabled": False,
+    "s1_b4_contract_rank_enabled": False,
+    "s1_b4_product_side_tilt_enabled": False,
+    "s1_b4_vov_penalty_enabled": False,
+    "s1_b4_breakeven_penalty_enabled": False,
+    "s1_b4_min_net_premium_cash": 0.0,
+    "s1_b4_max_friction_ratio": 0.20,
+    "s1_b4_weight_premium_to_iv10": 0.30,
+    "s1_b4_weight_premium_to_stress": 0.25,
+    "s1_b4_weight_premium_yield_margin": 0.20,
+    "s1_b4_weight_gamma_rent": 0.15,
+    "s1_b4_weight_vomma": 0.10,
+    "s1_b4_weight_breakeven_cushion": 0.0,
+    "s1_b4_weight_vol_of_vol": 0.0,
+    "s1_b4_product_weight_premium_to_stress": 0.35,
+    "s1_b4_product_weight_premium_to_iv10": 0.30,
+    "s1_b4_product_weight_premium_yield_margin": 0.20,
+    "s1_b4_product_weight_gamma_rent": 0.15,
+    "s1_b4_contract_breakeven_penalty_rank_low": 30.0,
+    "s1_b4_contract_breakeven_penalty_rank_very_low": 15.0,
+    "s1_b4_contract_breakeven_penalty_points_low": 10.0,
+    "s1_b4_contract_breakeven_penalty_points_very_low": 20.0,
+    "s1_b4_contract_vov_penalty_rank_low": 30.0,
+    "s1_b4_contract_vov_penalty_rank_very_low": 15.0,
+    "s1_b4_contract_vov_penalty_points_low": 10.0,
+    "s1_b4_contract_vov_penalty_points_very_low": 20.0,
+    "s1_b4_side_vov_penalty_rank_low": 30.0,
+    "s1_b4_side_vov_penalty_rank_very_low": 15.0,
+    "s1_b4_side_vov_penalty_mult_low": 0.85,
+    "s1_b4_side_vov_penalty_mult_very_low": 0.70,
+    "s1_b4_product_tilt_strength": 0.35,
+    "s1_b4_floor_weight": 0.50,
+    "s1_b4_power": 1.25,
+    "s1_b4_score_clip_low": 5.0,
+    "s1_b4_score_clip_high": 95.0,
+    "s1_b4_product_side_budget_diagnostics_enabled": True,
     "s1_stress_spot_move_pct": 0.03,
     "s1_stress_iv_up_points": 5.0,
     "s1_stress_premium_loss_multiple": 0.0,
@@ -393,6 +458,252 @@ def _float_or_nan(value):
     except (TypeError, ValueError):
         return np.nan
     return value if np.isfinite(value) else np.nan
+
+
+def _safe_ratio_series(numerator, denominator):
+    num = pd.to_numeric(numerator, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    den = pd.to_numeric(denominator, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    den = den.where(den.abs() > 1e-12, np.nan)
+    return (num / den).replace([np.inf, -np.inf], np.nan)
+
+
+def _numeric_column(frame, col, default=np.nan):
+    if col in frame.columns:
+        return pd.to_numeric(frame[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return pd.Series(default, index=frame.index, dtype=float)
+
+
+def _neutral_rank_high(series):
+    return _pct_rank_high(series, fill_value=0.10).clip(0.0, 1.0)
+
+
+def _neutral_rank_low(series):
+    return _pct_rank_low(series, fill_value=0.10).clip(0.0, 1.0)
+
+
+def _resolve_candidate_rv_ref(frame, iv_series):
+    """Infer a same-day RV reference without using future data."""
+    iv = pd.to_numeric(iv_series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    candidates = []
+
+    for col in ("rv_ref", "entry_rv_ref", "rv"):
+        if col in frame.columns:
+            candidates.append(pd.to_numeric(frame[col], errors="coerce"))
+
+    if "entry_iv_rv_spread" in frame.columns:
+        spread = pd.to_numeric(frame["entry_iv_rv_spread"], errors="coerce")
+        candidates.append(iv - spread)
+    elif "iv_rv_spread" in frame.columns:
+        spread = pd.to_numeric(frame["iv_rv_spread"], errors="coerce")
+        candidates.append(iv - spread)
+
+    if "entry_iv_rv_ratio" in frame.columns:
+        ratio = pd.to_numeric(frame["entry_iv_rv_ratio"], errors="coerce")
+        candidates.append(iv / ratio.replace(0.0, np.nan))
+    elif "iv_rv_ratio" in frame.columns:
+        ratio = pd.to_numeric(frame["iv_rv_ratio"], errors="coerce")
+        candidates.append(iv / ratio.replace(0.0, np.nan))
+
+    if not candidates:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+
+    rv = pd.concat(candidates, axis=1).replace([np.inf, -np.inf], np.nan).max(axis=1, skipna=True)
+    return rv.where((rv > 0.0) & (rv < 5.0))
+
+
+def _add_s1_premium_quality_fields(frame, option_type, mult, roundtrip_fee,
+                                   theta_cash, stress_spot_move_pct=0.03,
+                                   exchange=None, product=None):
+    """Add B2 premium-quality diagnostics without changing trading decisions."""
+    if frame is None or frame.empty:
+        return frame
+
+    c = frame
+    eps = 1e-12
+    mult = float(mult)
+    roundtrip_fee = float(roundtrip_fee or 0.0)
+    opt = str(option_type or "").upper()[:1]
+
+    spot = _numeric_column(c, "spot_close")
+    strike = _numeric_column(c, "strike")
+    dte = _numeric_column(c, "dte")
+    option_price = _numeric_column(c, "option_close")
+    iv = _numeric_column(c, "implied_vol")
+    if iv.notna().sum() == 0:
+        iv = _numeric_column(c, "contract_iv")
+    gross_premium_cash = option_price * mult
+    net_premium_cash = pd.to_numeric(c["net_premium_cash"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    net_premium_unit = net_premium_cash / mult if mult > 0 else pd.Series(np.nan, index=c.index)
+
+    c["gross_premium_cash"] = gross_premium_cash
+    c["premium_yield_margin"] = (
+        _safe_ratio_series(net_premium_cash, c["margin"])
+        * (252.0 / dte.replace(0.0, np.nan))
+    )
+    c["premium_yield_notional"] = (
+        _safe_ratio_series(net_premium_cash, spot * mult)
+        * (252.0 / dte.replace(0.0, np.nan))
+    )
+
+    if opt == "P":
+        breakeven = strike - net_premium_unit
+        cushion_abs = spot - breakeven
+    else:
+        breakeven = strike + net_premium_unit
+        cushion_abs = breakeven - spot
+    c["breakeven_price"] = breakeven
+    c["breakeven_cushion_abs"] = cushion_abs
+
+    rv_ref = _resolve_candidate_rv_ref(c, iv)
+    c["rv_ref"] = rv_ref
+    c["iv_rv_spread_candidate"] = iv - rv_ref
+    c["iv_rv_ratio_candidate"] = _safe_ratio_series(iv, rv_ref)
+    c["variance_carry"] = iv * iv - rv_ref * rv_ref
+
+    sqrt_year = np.sqrt((dte / 252.0).where(dte > 0.0))
+    implied_move = spot * iv * sqrt_year
+    realized_move = spot * rv_ref * sqrt_year
+    c["breakeven_cushion_iv"] = _safe_ratio_series(cushion_abs, implied_move)
+    c["breakeven_cushion_rv"] = _safe_ratio_series(cushion_abs, realized_move)
+
+    price_frame = c.copy()
+    price_frame["implied_vol"] = iv
+    if "exchange" not in price_frame.columns:
+        price_frame["exchange"] = exchange
+    if "product" not in price_frame.columns:
+        price_frame["product"] = product
+    base_model_price = calc_option_price_batch(price_frame)
+    iv5_price = calc_option_price_batch(price_frame, iv_shift=0.05)
+    iv10_price = calc_option_price_batch(price_frame, iv_shift=0.10)
+    vega_cash = _numeric_column(c, "vega", 0.0).abs() * mult
+    iv5_loss = ((iv5_price - base_model_price).clip(lower=0.0) * mult).replace([np.inf, -np.inf], np.nan)
+    iv10_loss = ((iv10_price - base_model_price).clip(lower=0.0) * mult).replace([np.inf, -np.inf], np.nan)
+    c["iv_shock_loss_5_cash"] = iv5_loss.fillna(vega_cash * 5.0)
+    c["iv_shock_loss_10_cash"] = iv10_loss.fillna(vega_cash * 10.0)
+    vomma_cash = (c["iv_shock_loss_10_cash"] - 2.0 * c["iv_shock_loss_5_cash"]).clip(lower=0.0)
+    c["b3_vomma_cash"] = vomma_cash.replace([np.inf, -np.inf], np.nan)
+    c["b3_vomma_loss_ratio"] = _safe_ratio_series(c["b3_vomma_cash"], net_premium_cash)
+    c["premium_to_iv5_loss"] = _safe_ratio_series(net_premium_cash, c["iv_shock_loss_5_cash"])
+    c["premium_to_iv10_loss"] = _safe_ratio_series(net_premium_cash, c["iv_shock_loss_10_cash"])
+    c["premium_to_stress_loss"] = _safe_ratio_series(net_premium_cash, c["stress_loss"])
+
+    theta_cash = pd.to_numeric(theta_cash, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    c["theta_vega_efficiency"] = _safe_ratio_series(theta_cash, vega_cash)
+    gamma = _numeric_column(c, "gamma", 0.0).abs()
+    gamma_shock_pct = max(float(stress_spot_move_pct or 0.03), 0.0)
+    gamma_rent_cash = 0.5 * gamma * (spot * gamma_shock_pct) ** 2 * mult
+    c["gamma_rent_cash"] = gamma_rent_cash.replace([np.inf, -np.inf], np.nan)
+    c["gamma_rent_penalty"] = _safe_ratio_series(c["gamma_rent_cash"], net_premium_cash)
+
+    c["fee_ratio"] = _safe_ratio_series(pd.Series(roundtrip_fee, index=c.index), gross_premium_cash)
+    c["slippage_ratio"] = 0.0
+    c["friction_ratio"] = c["fee_ratio"].fillna(0.0) + c["slippage_ratio"]
+
+    c["iv_rv_carry_score"] = _neutral_rank_high(c["variance_carry"])
+    c["breakeven_cushion_score"] = (
+        0.5 * _neutral_rank_high(c["breakeven_cushion_iv"])
+        + 0.5 * _neutral_rank_high(c["breakeven_cushion_rv"])
+    )
+    c["premium_to_iv_shock_score"] = (
+        0.5 * _neutral_rank_high(c["premium_to_iv5_loss"])
+        + 0.5 * _neutral_rank_high(c["premium_to_iv10_loss"])
+    )
+    c["premium_to_stress_loss_score"] = _neutral_rank_high(c["premium_to_stress_loss"])
+    c["theta_vega_efficiency_score"] = _neutral_rank_high(c["theta_vega_efficiency"])
+    liquidity_score = pd.to_numeric(
+        c.get("liquidity_score", pd.Series(0.10, index=c.index)),
+        errors="coerce",
+    ).fillna(0.10).clip(0.0, 1.0)
+    c["cost_liquidity_score"] = (
+        0.5 * _neutral_rank_low(c["friction_ratio"])
+        + 0.5 * liquidity_score
+    )
+    raw_score = (
+        0.25 * c["iv_rv_carry_score"]
+        + 0.20 * c["breakeven_cushion_score"]
+        + 0.20 * c["premium_to_iv_shock_score"]
+        + 0.15 * c["premium_to_stress_loss_score"]
+        + 0.10 * c["theta_vega_efficiency_score"]
+        + 0.10 * c["cost_liquidity_score"]
+    )
+    c["premium_quality_score"] = (raw_score * 100.0).clip(0.0, 100.0)
+    c["premium_quality_rank_in_side"] = _neutral_rank_high(c["premium_quality_score"])
+    return c
+
+
+def _apply_s1_b4_contract_ranking(frame, b4_params=None):
+    """Apply B4 role-aware contract score and optional friction-only hard gates."""
+    if frame is None or frame.empty:
+        return frame
+    params = b4_params or {}
+    c = frame.copy()
+
+    if bool(params.get("hard_filter_enabled", False)):
+        min_net_premium = float(params.get("min_net_premium_cash", 0.0) or 0.0)
+        max_friction = params.get("max_friction_ratio", None)
+        if min_net_premium > 0 and "net_premium_cash" in c.columns:
+            net_premium = pd.to_numeric(c["net_premium_cash"], errors="coerce")
+            c = c[net_premium >= min_net_premium].copy()
+        if max_friction is not None and "friction_ratio" in c.columns:
+            try:
+                max_friction = float(max_friction)
+            except (TypeError, ValueError):
+                max_friction = np.nan
+            if np.isfinite(max_friction):
+                friction = pd.to_numeric(c["friction_ratio"], errors="coerce")
+                c = c[friction.isna() | (friction <= max_friction)].copy()
+        if c.empty:
+            return c
+
+    weights = {
+        "b4_premium_to_iv10_score": float(params.get("weight_premium_to_iv10", 0.30) or 0.0),
+        "b4_premium_to_stress_score": float(params.get("weight_premium_to_stress", 0.25) or 0.0),
+        "b4_premium_yield_margin_score": float(params.get("weight_premium_yield_margin", 0.20) or 0.0),
+        "b4_gamma_rent_score": float(params.get("weight_gamma_rent", 0.15) or 0.0),
+        "b4_vomma_score": float(params.get("weight_vomma", 0.10) or 0.0),
+    }
+    weight_sum = sum(max(0.0, w) for w in weights.values())
+    if weight_sum <= 0:
+        c["b4_contract_score"] = c.get("premium_quality_score", 50.0)
+        return c
+
+    c["b4_premium_to_iv10_score"] = 100.0 * _neutral_rank_high(c.get("premium_to_iv10_loss"))
+    c["b4_premium_to_stress_score"] = 100.0 * _neutral_rank_high(c.get("premium_to_stress_loss"))
+    c["b4_premium_yield_margin_score"] = 100.0 * _neutral_rank_high(c.get("premium_yield_margin"))
+    c["b4_gamma_rent_score"] = 100.0 * _neutral_rank_low(c.get("gamma_rent_penalty"))
+    c["b4_vomma_score"] = 100.0 * _neutral_rank_low(c.get("b3_vomma_loss_ratio"))
+    c["b4_breakeven_cushion_score"] = 100.0 * _neutral_rank_high(c.get("breakeven_cushion_score"))
+    if "b3_vol_of_vol_proxy" in c.columns:
+        c["b4_vol_of_vol_score"] = 100.0 * _neutral_rank_low(c.get("b3_vol_of_vol_proxy"))
+    else:
+        c["b4_vol_of_vol_score"] = np.nan
+
+    score = pd.Series(0.0, index=c.index, dtype=float)
+    for column, weight in weights.items():
+        weight = max(0.0, float(weight or 0.0))
+        if weight <= 0:
+            continue
+        score += weight * pd.to_numeric(c[column], errors="coerce").fillna(50.0)
+    c["b4_contract_score_raw"] = (score / weight_sum).clip(0.0, 100.0)
+    penalty = pd.Series(0.0, index=c.index, dtype=float)
+    if bool(params.get("breakeven_penalty_enabled", False)):
+        rank = pd.to_numeric(c["b4_breakeven_cushion_score"], errors="coerce")
+        very_low = float(params.get("breakeven_penalty_rank_very_low", 15.0) or 15.0)
+        low = float(params.get("breakeven_penalty_rank_low", 30.0) or 30.0)
+        very_low_points = float(params.get("breakeven_penalty_points_very_low", 20.0) or 20.0)
+        low_points = float(params.get("breakeven_penalty_points_low", 10.0) or 10.0)
+        penalty += np.where(rank < very_low, very_low_points, np.where(rank < low, low_points, 0.0))
+    if bool(params.get("vov_penalty_enabled", False)):
+        rank = pd.to_numeric(c["b4_vol_of_vol_score"], errors="coerce")
+        very_low = float(params.get("vov_penalty_rank_very_low", 15.0) or 15.0)
+        low = float(params.get("vov_penalty_rank_low", 30.0) or 30.0)
+        very_low_points = float(params.get("vov_penalty_points_very_low", 20.0) or 20.0)
+        low_points = float(params.get("vov_penalty_points_low", 10.0) or 10.0)
+        penalty += np.where(rank < very_low, very_low_points, np.where(rank < low, low_points, 0.0))
+    c["b4_contract_penalty_points"] = pd.Series(penalty, index=c.index, dtype=float)
+    c["b4_contract_score"] = (c["b4_contract_score_raw"] - c["b4_contract_penalty_points"]).clip(0.0, 100.0)
+    c["quality_score"] = c["b4_contract_score"]
+    return c
 
 
 def classify_s1_trend_confidence(returns, rv_trend=np.nan, *,
@@ -1686,7 +1997,8 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                    max_abs_delta=0.10, target_abs_delta=None,
                    carry_metric="premium_margin", fee_per_contract=0.0,
                    roundtrip_fee_per_contract=None,
-                   min_premium_fee_multiple=0.0, use_stress_score=False,
+                   min_premium_fee_multiple=0.0, min_option_price=0.0,
+                   use_stress_score=False,
                    stress_spot_move_pct=0.03, stress_iv_up_points=5.0,
                    stress_premium_loss_multiple=0.0,
                    gamma_penalty=0.0, vega_penalty=0.0,
@@ -1697,8 +2009,10 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                    liquidity_weight=0.05,
                    delta_weight=0.0,
                    return_candidates=False, max_candidates=1,
-                   exchange=None, product=None):
+                   exchange=None, product=None, b4_params=None):
     """Deterministic S1 sell-leg selector with optional carry/stress ranking."""
+    option_price = pd.to_numeric(day_df["option_close"], errors="coerce").fillna(0)
+    price_positive = option_price > 0
     if option_type == "P":
         c = day_df[
             (day_df["option_type"] == "P") &
@@ -1706,7 +2020,7 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             (day_df["delta"] < 0) &
             (day_df["delta"].abs() >= min_abs_delta) &
             (day_df["delta"].abs() <= max_abs_delta) &
-            (day_df["option_close"] >= 0.5)
+            price_positive
         ]
     else:
         c = day_df[
@@ -1715,8 +2029,13 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             (day_df["delta"] > 0) &
             (day_df["delta"] >= min_abs_delta) &
             (day_df["delta"] <= max_abs_delta) &
-            (day_df["option_close"] >= 0.5)
+            price_positive
         ]
+    if c.empty:
+        return None
+    min_option_price = float(min_option_price or 0.0)
+    if min_option_price > 0:
+        c = c[pd.to_numeric(c["option_close"], errors="coerce").fillna(0) >= min_option_price]
     if c.empty:
         return None
     roundtrip_fee = (
@@ -1792,13 +2111,42 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
     volume_rank = _pct_rank_high(c["volume"]) if "volume" in c.columns else pd.Series(0.0, index=c.index)
     oi_rank = _pct_rank_high(c["open_interest"]) if "open_interest" in c.columns else pd.Series(0.0, index=c.index)
     c["liquidity_score"] = 0.5 * volume_rank + 0.5 * oi_rank
+    c = _add_s1_premium_quality_fields(
+        c, option_type, mult, roundtrip_fee, theta_cash,
+        stress_spot_move_pct=stress_spot_move_pct,
+        exchange=exchange, product=product,
+    )
+    ranking_key = str(ranking_mode or "").lower()
+    if ranking_key in {"b4", "b4_role", "b4_dedup", "b4_contract"}:
+        c = _apply_s1_b4_contract_ranking(c, b4_params=b4_params)
+        if c is None or c.empty:
+            return None
+        ranked = _stable_rank(
+            c,
+            [
+                "b4_contract_score",
+                "premium_to_iv10_loss",
+                "premium_to_stress_loss",
+                "premium_yield_margin",
+                "gamma_rent_penalty",
+                "open_interest",
+                "volume",
+            ],
+            [False, False, False, False, True, False, False],
+        )
+        if return_candidates:
+            if ranked is None:
+                return ranked
+            max_n = int(max_candidates or 0)
+            return ranked if max_n <= 0 else ranked.head(max_n)
+        return None if ranked is None or ranked.empty else ranked.iloc[0]
 
     if "iv_residual" in c.columns and iv_residual_weight > 0:
         iv_res = c["iv_residual"].fillna(0).clip(-1, 1)
         c["quality_score"] = c["carry_score"] * (1 + iv_residual_weight * iv_res)
     else:
         c["quality_score"] = c["carry_score"]
-    if str(ranking_mode or "").lower() in {"risk_reward", "stress_reward", "premium_stress"}:
+    if ranking_key in {"risk_reward", "stress_reward", "premium_stress"}:
         gamma_abs = c["gamma"].abs().fillna(0) if "gamma" in c.columns else pd.Series(0.0, index=c.index)
         vega_abs = c["vega"].abs().fillna(0) if "vega" in c.columns else pd.Series(0.0, index=c.index)
         gamma_penalty_rank = _pct_rank_high(gamma_abs)
@@ -1830,7 +2178,7 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
             return ranked if max_n <= 0 else ranked.head(max_n)
         return None if ranked is None or ranked.empty else ranked.iloc[0]
 
-    if str(ranking_mode or "").lower() in {"liquidity", "liquidity_oi", "volume_oi"}:
+    if ranking_key in {"liquidity", "liquidity_oi", "volume_oi"}:
         ranked = _stable_rank(
             c,
             ["liquidity_score", "open_interest", "volume", "delta_dist"],
