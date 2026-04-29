@@ -1,0 +1,16 @@
+{
+  "extends": "config_s1_baseline_b6a_residual_contract_quality_stop25.json",
+  "strategy_version": "s1_baseline_b6c_residual_product_tilt_stop25",
+  "s1_b6_product_tilt_enabled": true,
+  "s1_b6_product_tilt_strength": 0.15,
+  "s1_b6_product_floor_weight": 0.80,
+  "s1_b6_product_power": 1.25,
+  "s1_b6_product_multiplier_min": 0.80,
+  "s1_b6_product_multiplier_max": 1.20,
+  "s1_b6_product_weight_theta_per_vega": 0.45,
+  "s1_b6_product_weight_premium_to_stress": 0.20,
+  "s1_b6_product_weight_theta_per_gamma": 0.15,
+  "s1_b6_product_weight_tail_beta": 0.10,
+  "s1_b6_product_weight_gamma_per_premium": 0.10,
+  "s1_b6_product_budget_diagnostics_enabled": true
+}

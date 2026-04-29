@@ -235,6 +235,53 @@ DEFAULT_PARAMS = {
     "s1_b4_score_clip_low": 5.0,
     "s1_b4_score_clip_high": 95.0,
     "s1_b4_product_side_budget_diagnostics_enabled": True,
+    "s1_b6_hard_filter_enabled": False,
+    "s1_b6_contract_rank_enabled": False,
+    "s1_b6_min_net_premium_cash": 0.0,
+    "s1_b6_max_friction_ratio": 0.20,
+    "s1_b6_weight_premium_to_stress": 0.24,
+    "s1_b6_weight_premium_to_iv10": 0.22,
+    "s1_b6_weight_theta_per_vega": 0.22,
+    "s1_b6_weight_theta_per_gamma": 0.12,
+    "s1_b6_weight_tail_move_coverage": 0.10,
+    "s1_b6_weight_vomma": 0.06,
+    "s1_b6_weight_premium_yield_margin": 0.04,
+    "s1_b6_side_tilt_enabled": False,
+    "s1_b6_product_tilt_enabled": False,
+    "s1_b6_side_tilt_strength": 0.25,
+    "s1_b6_product_tilt_strength": 0.15,
+    "s1_b6_side_floor_weight": 0.70,
+    "s1_b6_product_floor_weight": 0.80,
+    "s1_b6_side_power": 1.25,
+    "s1_b6_product_power": 1.25,
+    "s1_b6_score_clip_low": 5.0,
+    "s1_b6_score_clip_high": 95.0,
+    "s1_b6_missing_factor_score": 50.0,
+    "s1_b6_side_multiplier_min": 0.70,
+    "s1_b6_side_multiplier_max": 1.30,
+    "s1_b6_product_multiplier_min": 0.80,
+    "s1_b6_product_multiplier_max": 1.20,
+    "s1_b6_side_weight_theta_per_vega": 0.35,
+    "s1_b6_side_weight_premium_to_stress": 0.25,
+    "s1_b6_side_weight_theta_per_gamma": 0.15,
+    "s1_b6_side_weight_premium_to_margin": 0.10,
+    "s1_b6_side_weight_vega_per_premium": 0.10,
+    "s1_b6_side_weight_gamma_per_premium": 0.05,
+    "s1_b6_product_weight_theta_per_vega": 0.45,
+    "s1_b6_product_weight_premium_to_stress": 0.20,
+    "s1_b6_product_weight_theta_per_gamma": 0.15,
+    "s1_b6_product_weight_tail_beta": 0.10,
+    "s1_b6_product_weight_gamma_per_premium": 0.10,
+    "s1_b6_product_side_budget_diagnostics_enabled": True,
+    "s1_b6_product_budget_diagnostics_enabled": True,
+    "s1_b6_side_direction_penalty_enabled": True,
+    "s1_b6_side_adverse_trend_z": 0.80,
+    "s1_b6_side_adverse_trend_mult": 0.85,
+    "s1_b6_side_breakout_rank_low": 30.0,
+    "s1_b6_side_breakout_mult_low": 0.90,
+    "s1_b6_side_skew_rank_low": 30.0,
+    "s1_b6_side_skew_mult_low": 0.90,
+    "s1_b6_side_cooldown_mult_floor": 0.70,
     "s1_b5_shadow_factor_extension_enabled": False,
     "s1_b5_delta_ladder_enabled": True,
     "s1_b5_product_side_trend_skew_enabled": True,
@@ -494,6 +541,14 @@ def _neutral_rank_low(series):
     return _pct_rank_low(series, fill_value=0.10).clip(0.0, 1.0)
 
 
+def _b6_rank_high(series):
+    return _pct_rank_high(series, fill_value=0.50).clip(0.0, 1.0)
+
+
+def _b6_rank_low(series):
+    return _pct_rank_low(series, fill_value=0.50).clip(0.0, 1.0)
+
+
 def _resolve_candidate_rv_ref(frame, iv_series):
     """Infer a same-day RV reference without using future data."""
     iv = pd.to_numeric(iv_series, errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -603,6 +658,12 @@ def _add_s1_premium_quality_fields(frame, option_type, mult, roundtrip_fee,
     theta_cash = pd.to_numeric(theta_cash, errors="coerce").replace([np.inf, -np.inf], np.nan)
     c["theta_vega_efficiency"] = _safe_ratio_series(theta_cash, vega_cash)
     gamma = _numeric_column(c, "gamma", 0.0).abs()
+    spot_for_gamma = pd.to_numeric(c.get("spot_close", c.get("spot", np.nan)), errors="coerce")
+    gamma_cash_unscaled = gamma * mult * spot_for_gamma * spot_for_gamma
+    c["b5_theta_per_vega"] = _safe_ratio_series(theta_cash, vega_cash)
+    c["b5_premium_per_vega"] = _safe_ratio_series(net_premium_cash, vega_cash)
+    c["b5_theta_per_gamma"] = _safe_ratio_series(theta_cash, gamma_cash_unscaled)
+    c["b5_gamma_theta_ratio"] = _safe_ratio_series(gamma_cash_unscaled, theta_cash)
     gamma_shock_pct = max(float(stress_spot_move_pct or 0.03), 0.0)
     gamma_rent_cash = 0.5 * gamma * (spot * gamma_shock_pct) ** 2 * mult
     c["gamma_rent_cash"] = gamma_rent_cash.replace([np.inf, -np.inf], np.nan)
@@ -716,6 +777,73 @@ def _apply_s1_b4_contract_ranking(frame, b4_params=None):
     c["b4_contract_penalty_points"] = pd.Series(penalty, index=c.index, dtype=float)
     c["b4_contract_score"] = (c["b4_contract_score_raw"] - c["b4_contract_penalty_points"]).clip(0.0, 100.0)
     c["quality_score"] = c["b4_contract_score"]
+    return c
+
+
+def _apply_s1_b6_contract_ranking(frame, b6_params=None):
+    """Apply B6 residual-quality contract score with neutral missing-factor ranks."""
+    if frame is None or frame.empty:
+        return frame
+    params = b6_params or {}
+    c = frame.copy()
+
+    if bool(params.get("hard_filter_enabled", False)):
+        min_net_premium = float(params.get("min_net_premium_cash", 0.0) or 0.0)
+        max_friction = params.get("max_friction_ratio", None)
+        if min_net_premium > 0 and "net_premium_cash" in c.columns:
+            net_premium = pd.to_numeric(c["net_premium_cash"], errors="coerce")
+            c = c[net_premium >= min_net_premium].copy()
+        if max_friction is not None and "friction_ratio" in c.columns:
+            try:
+                max_friction = float(max_friction)
+            except (TypeError, ValueError):
+                max_friction = np.nan
+            if np.isfinite(max_friction):
+                friction = pd.to_numeric(c["friction_ratio"], errors="coerce")
+                c = c[friction.isna() | (friction <= max_friction)].copy()
+        if c.empty:
+            return c
+
+    if "b5_theta_per_vega" not in c.columns:
+        c["b5_theta_per_vega"] = c.get("theta_vega_efficiency", np.nan)
+    if "b5_theta_per_gamma" not in c.columns:
+        c["b5_theta_per_gamma"] = np.nan
+    if "b5_premium_to_tail_move_loss" not in c.columns:
+        c["b5_premium_to_tail_move_loss"] = np.nan
+
+    def col(name):
+        return c[name] if name in c.columns else pd.Series(np.nan, index=c.index, dtype=float)
+
+    c["b6_premium_to_stress_score"] = 100.0 * _b6_rank_high(col("premium_to_stress_loss"))
+    c["b6_premium_to_iv10_score"] = 100.0 * _b6_rank_high(col("premium_to_iv10_loss"))
+    c["b6_theta_per_vega_score"] = 100.0 * _b6_rank_high(col("b5_theta_per_vega"))
+    c["b6_theta_per_gamma_score"] = 100.0 * _b6_rank_high(col("b5_theta_per_gamma"))
+    c["b6_tail_move_coverage_score"] = 100.0 * _b6_rank_high(col("b5_premium_to_tail_move_loss"))
+    c["b6_vomma_score"] = 100.0 * _b6_rank_low(col("b3_vomma_loss_ratio"))
+    c["b6_premium_yield_margin_score"] = 100.0 * _b6_rank_high(col("premium_yield_margin"))
+
+    weights = {
+        "b6_premium_to_stress_score": float(params.get("weight_premium_to_stress", 0.24) or 0.0),
+        "b6_premium_to_iv10_score": float(params.get("weight_premium_to_iv10", 0.22) or 0.0),
+        "b6_theta_per_vega_score": float(params.get("weight_theta_per_vega", 0.22) or 0.0),
+        "b6_theta_per_gamma_score": float(params.get("weight_theta_per_gamma", 0.12) or 0.0),
+        "b6_tail_move_coverage_score": float(params.get("weight_tail_move_coverage", 0.10) or 0.0),
+        "b6_vomma_score": float(params.get("weight_vomma", 0.06) or 0.0),
+        "b6_premium_yield_margin_score": float(params.get("weight_premium_yield_margin", 0.04) or 0.0),
+    }
+    weight_sum = sum(max(0.0, w) for w in weights.values())
+    missing_score = float(params.get("missing_factor_score", 50.0) or 50.0)
+    if weight_sum <= 0:
+        c["b6_contract_score"] = c.get("premium_quality_score", missing_score)
+    else:
+        score = pd.Series(0.0, index=c.index, dtype=float)
+        for column, weight in weights.items():
+            weight = max(0.0, float(weight or 0.0))
+            if weight <= 0:
+                continue
+            score += weight * pd.to_numeric(c[column], errors="coerce").fillna(missing_score)
+        c["b6_contract_score"] = (score / weight_sum).clip(0.0, 100.0)
+    c["quality_score"] = c["b6_contract_score"]
     return c
 
 
@@ -2146,6 +2274,31 @@ def select_s1_sell(day_df, option_type, mult, mr, min_volume=0, min_oi=0,
                 "volume",
             ],
             [False, False, False, False, True, False, False],
+        )
+        if return_candidates:
+            if ranked is None:
+                return ranked
+            max_n = int(max_candidates or 0)
+            return ranked if max_n <= 0 else ranked.head(max_n)
+        return None if ranked is None or ranked.empty else ranked.iloc[0]
+
+    if ranking_key in {"b6", "b6_residual_quality", "b6_contract", "b6_role"}:
+        c = _apply_s1_b6_contract_ranking(c, b6_params=b4_params)
+        if c is None or c.empty:
+            return None
+        ranked = _stable_rank(
+            c,
+            [
+                "b6_contract_score",
+                "b6_theta_per_vega_score",
+                "b6_premium_to_stress_score",
+                "b6_premium_to_iv10_score",
+                "b6_theta_per_gamma_score",
+                "b6_tail_move_coverage_score",
+                "open_interest",
+                "volume",
+            ],
+            [False, False, False, False, False, False, False, False],
         )
         if return_candidates:
             if ranked is None:

@@ -1,0 +1,18 @@
+{
+  "extends": "config_s1_baseline_b1_liquidity_oi_rank_stop25.json",
+  "strategy_version": "s1_baseline_b6a_residual_contract_quality_stop25",
+  "s1_ranking_mode": "b6_residual_quality",
+  "s1_b6_contract_rank_enabled": true,
+  "s1_b6_hard_filter_enabled": true,
+  "s1_b6_min_net_premium_cash": 100.0,
+  "s1_b6_max_friction_ratio": 0.10,
+  "s1_b6_weight_premium_to_stress": 0.24,
+  "s1_b6_weight_premium_to_iv10": 0.22,
+  "s1_b6_weight_theta_per_vega": 0.22,
+  "s1_b6_weight_theta_per_gamma": 0.12,
+  "s1_b6_weight_tail_move_coverage": 0.10,
+  "s1_b6_weight_vomma": 0.06,
+  "s1_b6_weight_premium_yield_margin": 0.04,
+  "s1_b6_missing_factor_score": 50.0,
+  "s1_b5_shadow_factor_extension_enabled": false
+}
