@@ -1,0 +1,19 @@
+{
+  "extends": "config_s1_candidate_universe_b1_shadow_full_b2b3_factors_2022_latest.json",
+  "strategy_version": "s1_candidate_universe_b5_full_shadow_v1_2022_latest",
+  "s1_candidate_universe_shadow_only_enabled": true,
+  "s1_candidate_universe_max_candidates_per_side": 0,
+  "s1_b5_shadow_factor_extension_enabled": true,
+  "s1_b5_delta_ladder_enabled": true,
+  "s1_b5_product_side_trend_skew_enabled": true,
+  "s1_b5_cooldown_state_enabled": true,
+  "s1_b5_portfolio_panel_enabled": true,
+  "s1_b5_tail_dependence_enabled": true,
+  "s1_b5_tail_dependence_mode": "empirical_v1",
+  "s1_b5_min_history_days": 60,
+  "s1_b5_tail_window_days": 120,
+  "s1_b5_tail_quantile": 0.05,
+  "s1_b5_mae_lookback_days": 20,
+  "s1_b5_trend_long_lookback_days": 60,
+  "s1_b5_delta_bucket_edges": [0.0, 0.02, 0.04, 0.06, 0.08, 0.10]
+}
