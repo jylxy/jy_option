@@ -358,3 +358,164 @@ tail dependence、stop cluster、sector stress、expiry cluster、margin shock
 进入组合预算和上限，不参与 B6 的合约排序。
 ```
 
+## 7. B6 Residual IC 后的修订结论
+
+2026-04-29 追加 B6 品种层与品种-方向层 residual IC 审计后，因子库使用原则需要进一步收紧：原始 IC 不能直接作为品种预算 alpha，尤其不能直接使用 `premium_to_margin`、`premium_to_stress` 这类与标签共享 premium / margin / stress 结构的指标做大幅预算倾斜。
+
+本次 residual IC 使用 `factor_and_label_resid` 口径，即在每个 `signal_date` 横截面内同时对因子和未来标签做 OLS 残差化，再计算 Rank IC。控制变量包括 premium、margin、stress、candidate count、delta、theta、vega、gamma、cooldown、P/C 侧别、趋势和 IV momentum 等基础结构。
+
+### 7.1 品种层修订
+
+| 因子 | Raw IC: PnL/Margin | Full Residual IC | Full Residual Stop IC | 修订后用途 |
+| --- | ---: | ---: | ---: | --- |
+| `product_premium_to_margin` | 0.253 | 0.012 | -0.060 | 只做 Premium Pool / Deployment Ratio 诊断，不再作为独立品种预算 alpha |
+| `product_premium_to_stress` | 0.213 | 0.017 | -0.006 | 可做承保质量辅助，不单独加预算 |
+| `product_vega_per_premium_low` | 0.195 | -0.002 | 0.012 | 只做 vega 风险诊断，不作为收益因子 |
+| `product_gamma_per_premium_low` | 0.218 | 0.018 | 0.029 | 可做 gamma 风险惩罚辅助 |
+| `product_theta_per_vega` | 0.068 | 0.056 | 0.076 | 品种层最值得保留的 residual quality 因子 |
+| `product_theta_per_gamma` | 0.172 | 0.025 | 0.013 | 弱正，可做 gamma 辅助 |
+| `product_tail_beta_abs_max_low` | -0.033 | 0.026 | 0.025 | 可进入尾部风险惩罚或 Tail-HRP 诊断 |
+
+品种层结论：
+
+```text
+不要用 raw premium/margin 直接选品种。
+raw premium/margin 只告诉我们权利金池在哪里；
+能不能把预算倾斜过去，要看 residual 后仍有效的 theta/vega、premium/stress、tail beta 和 stop 风险。
+```
+
+因此，品种层主线从原来的：
+
+```text
+高 premium/margin、高 premium/stress 的品种多给预算
+```
+
+修订为：
+
+```text
+先看权利金池是否足够厚；
+再用 product_theta_per_vega、product_premium_to_stress、tail beta、gamma 风险做质量修正；
+只允许温和预算倾斜，不做硬筛和大幅加仓。
+```
+
+### 7.2 品种-方向层修订
+
+| 因子 | Raw IC: PnL/Margin | Full Residual IC | Full Residual Stop IC | 修订后用途 |
+| --- | ---: | ---: | ---: | --- |
+| `side_premium_to_margin` | 0.340 | 0.057 | -0.034 | 收益端仍有残差，但止损端偏负；只能配合 stop penalty 使用 |
+| `side_premium_to_stress` | 0.270 | 0.033 | 0.006 | P/C 侧承保质量排序候选 |
+| `side_avg_abs_delta` | 0.279 | 0.005 | 0.012 | 原始 IC 主要是几何效应，只用于 delta 梯队，不作为 alpha |
+| `side_vega_per_premium_low` | 0.252 | 0.015 | 0.025 | vega 风险诊断和轻度惩罚 |
+| `side_gamma_per_premium_low` | 0.277 | 0.011 | 0.007 | 较弱，只做辅助 |
+| `side_theta_per_vega` | 0.084 | 0.040 | 0.043 | P/C 侧最干净的质量因子之一 |
+| `side_theta_per_gamma` | 0.205 | 0.029 | 0.021 | P/C 侧 gamma 辅助因子 |
+| `side_trend_alignment` | 0.018 | 0.016 | 0.012 | 条件因子，不单独作为收益排序 |
+| `side_momentum_alignment` | 0.025 | 0.000 | -0.007 | 暂不进主线，作为环境切片观察 |
+| `side_breakout_cushion` | 0.067 | -0.004 | -0.004 | 暂不进主线 |
+
+品种-方向层结论：
+
+```text
+P/C 侧预算比纯品种预算更值得继续。
+side_premium_to_margin 仍能解释收益，但会带来止损端隐患；
+side_theta_per_vega、side_premium_to_stress、side_theta_per_gamma 更适合作为质量型倾斜因子。
+```
+
+因此，P/C 侧主线从原来的：
+
+```text
+趋势 / skew / premium quality 混合决定 Put/Call 预算
+```
+
+修订为：
+
+```text
+收益端：side_premium_to_margin 只能轻度参与；
+质量端：side_theta_per_vega、side_premium_to_stress、side_theta_per_gamma 优先；
+风险端：stop cluster、cooldown、skew steepening、breakout 只做惩罚或约束；
+side_avg_abs_delta 只用于 delta<0.1 内部梯队设计，不能突破硬约束。
+```
+
+### 7.3 因子库采纳状态修订
+
+| 因子族 | 旧理解 | residual IC 后的新理解 | 决策 |
+| --- | --- | --- | --- |
+| Premium / Margin | 高 IC，可能是品种预算主因子 | 大量来自同分母和权利金池结构 | 降级为诊断与轻度辅助 |
+| Premium / Stress | 高 IC，可能是尾部质量主因子 | 仍有弱残差，但没有 raw IC 那么强 | 保留为质量辅助 |
+| Theta / Vega | 原先偏防守、止损规避 | residual 后最干净，收益和止损均有解释 | 升级为核心质量因子 |
+| Theta / Gamma | 有效但与 stress/gamma 共线 | residual 后仍弱正 | 保留为辅助 |
+| Avg Delta | raw IC 很强 | residual 后消失，主要是几何效应 | 只用于 delta 梯队 |
+| Trend / Momentum | 用于 P/C 偏移 | full residual 后不稳定 | 作为条件因子和切片，不进收益主 score |
+| Tail Beta / Tail Dependence | raw IC 不强 | residual 后出现弱正 | 进入尾部风控与组合层，不用普通收益 IC 否定 |
+
+## 8. 关于此前 B2 / B3 / B5 是否检查过同分母
+
+结论：此前已经做过一部分，而且在合约层做得比较完整；但在 B6 品种预算层做得不完整，今天补上。
+
+### 8.1 已经做过的部分
+
+B2 / B3 / B5 的 corrected full shadow 检验中，`scripts/analyze_candidate_universe_corrected.py` 已经包含：
+
+```text
+样本过滤：
+all
+completed_only
+premium_ge_100
+completed_premium_ge_100
+completed_premium_ge_100_low_fee
+```
+
+```text
+标签修正：
+cash_pnl
+pnl_per_margin
+pnl_per_stress
+pnl_per_premium_clip
+stop_avoidance
+stop_overshoot_avoidance
+```
+
+```text
+残差控制：
+log_entry_price
+log_open_premium_cash
+log_margin_estimate
+log_stress_loss
+dte
+abs_delta
+```
+
+也就是说，合约层的 `premium_to_iv10_loss`、`premium_to_stress_loss`、`premium_yield_margin`、`theta_per_vega`、`theta_per_gamma` 等因子，之前已经经过了比原始 IC 更严格的控制。之前报告里也已经明确写过：许多原始比例 IC 很漂亮，但控制价格、权利金、保证金、stress、DTE、delta 后会明显衰减。
+
+### 8.2 之前没有完整做的部分
+
+此前没有完整解决的是：
+
+```text
+product 层：signal_date + product 的预算倾斜因子同分母控制；
+product-side 层：signal_date + product + option_type 的 P/C 预算因子同分母控制；
+premium_to_margin 与 future_pnl_per_margin 的共同 margin 分母；
+premium_to_stress 与 future_pnl_per_stress 的共同 stress 分母；
+product/side 聚合后的 candidate count、side count、avg delta、theta/vega/gamma 结构污染。
+```
+
+因此，之前 B2/B3/B5 的结论可以继续用于“合约层选腿排序”，但不能直接外推到“品种层预算倾斜”。今天补的 B6 residual IC，专门就是为了补这个缺口。
+
+### 8.3 当前统一解释
+
+以后因子库解释统一为：
+
+```text
+合约层：
+B2 / B3 / B5 corrected IC 已经控制过分母和合约几何结构，可用于选腿排序和硬过滤。
+
+品种层：
+只能使用 B6 residual IC 后仍有效的质量因子，且只做温和预算倾斜。
+
+品种-方向层：
+优先使用 side_theta_per_vega、side_premium_to_stress、side_theta_per_gamma；
+side_premium_to_margin 只能轻度参与，并必须配 stop / cooldown / tail penalty。
+
+组合层：
+tail dependence、stop cluster、sector stress、expiry cluster 不用普通 IC 判断，进入 B7 风控。
+```
