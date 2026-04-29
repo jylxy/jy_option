@@ -89,6 +89,80 @@ LABELS: tuple[str, ...] = (
 )
 
 
+PRODUCT_CONTROL_SETS: dict[str, tuple[str, ...]] = {
+    "base_depth": (
+        "product_log_premium_sum",
+        "product_log_candidate_count",
+        "product_log_side_count",
+    ),
+    "margin_denominator": (
+        "product_log_premium_sum",
+        "product_log_margin_sum",
+        "product_log_candidate_count",
+        "product_avg_delta_ratio_to_cap",
+    ),
+    "stress_denominator": (
+        "product_log_premium_sum",
+        "product_log_stress_sum",
+        "product_log_candidate_count",
+        "product_avg_delta_ratio_to_cap",
+    ),
+    "full_denominator": (
+        "product_log_premium_sum",
+        "product_log_margin_sum",
+        "product_log_stress_sum",
+        "product_log_abs_vega_sum",
+        "product_log_abs_gamma_sum",
+        "product_log_abs_theta_sum",
+        "product_log_candidate_count",
+        "product_log_side_count",
+        "product_avg_delta_ratio_to_cap",
+        "product_cooldown_penalty",
+        "product_margin_share",
+        "product_stress_share",
+    ),
+}
+
+
+PRODUCT_SIDE_CONTROL_SETS: dict[str, tuple[str, ...]] = {
+    "base_depth": (
+        "side_log_premium_sum",
+        "side_log_candidate_count",
+        "side_avg_abs_delta",
+        "side_is_put",
+    ),
+    "margin_denominator": (
+        "side_log_premium_sum",
+        "side_log_margin_sum",
+        "side_log_candidate_count",
+        "side_avg_abs_delta",
+        "side_is_put",
+    ),
+    "stress_denominator": (
+        "side_log_premium_sum",
+        "side_log_stress_sum",
+        "side_log_candidate_count",
+        "side_avg_abs_delta",
+        "side_is_put",
+    ),
+    "full_denominator": (
+        "side_log_premium_sum",
+        "side_log_margin_sum",
+        "side_log_stress_sum",
+        "side_log_abs_vega_sum",
+        "side_log_abs_gamma_sum",
+        "side_log_abs_theta_sum",
+        "side_log_candidate_count",
+        "side_avg_abs_delta",
+        "side_cooldown_penalty",
+        "side_is_put",
+        "side_trend_alignment",
+        "side_iv_mom_5d",
+        "side_iv_accel",
+    ),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
@@ -123,6 +197,11 @@ def safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
 def safe_log1p(values: pd.Series) -> pd.Series:
     numeric = pd.to_numeric(values, errors="coerce")
     return np.log1p(numeric.where(numeric >= 0.0))
+
+
+def safe_log(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    return np.log(numeric.where(numeric > 0.0))
 
 
 def read_csv(path: Path, **kwargs) -> pd.DataFrame:
@@ -180,6 +259,14 @@ def add_product_features(df: pd.DataFrame) -> pd.DataFrame:
     gamma = df["product_cash_gamma_sum"].abs()
     df["product_premium_depth"] = safe_log1p(premium)
     df["product_candidate_depth"] = safe_log1p(df["product_candidate_count"])
+    df["product_log_premium_sum"] = safe_log(premium)
+    df["product_log_stress_sum"] = safe_log(stress)
+    df["product_log_margin_sum"] = safe_log(margin)
+    df["product_log_abs_vega_sum"] = safe_log(vega)
+    df["product_log_abs_gamma_sum"] = safe_log(gamma)
+    df["product_log_abs_theta_sum"] = safe_log(theta)
+    df["product_log_candidate_count"] = safe_log1p(df["product_candidate_count"])
+    df["product_log_side_count"] = safe_log1p(df["product_side_count"])
     df["product_premium_to_margin"] = safe_div(premium, margin)
     df["product_premium_to_stress"] = safe_div(premium, stress)
     df["product_theta_per_vega"] = safe_div(theta, vega)
@@ -208,6 +295,13 @@ def add_product_side_features(df: pd.DataFrame) -> pd.DataFrame:
     gamma = df["side_cash_gamma_sum"].abs()
     df["side_premium_depth"] = safe_log1p(premium)
     df["side_candidate_depth"] = safe_log1p(df["side_candidate_count"])
+    df["side_log_premium_sum"] = safe_log(premium)
+    df["side_log_stress_sum"] = safe_log(stress)
+    df["side_log_margin_sum"] = safe_log(margin)
+    df["side_log_abs_vega_sum"] = safe_log(vega)
+    df["side_log_abs_gamma_sum"] = safe_log(gamma)
+    df["side_log_abs_theta_sum"] = safe_log(theta)
+    df["side_log_candidate_count"] = safe_log1p(df["side_candidate_count"])
     df["side_premium_to_margin"] = safe_div(premium, margin)
     df["side_premium_to_stress"] = safe_div(premium, stress)
     df["side_theta_per_vega"] = safe_div(theta, vega)
@@ -217,6 +311,7 @@ def add_product_side_features(df: pd.DataFrame) -> pd.DataFrame:
     df["side_gamma_per_premium"] = safe_div(gamma, premium)
 
     is_put = df["option_type"].astype(str).str.upper().eq("P")
+    df["side_is_put"] = is_put.astype(float)
     trend = pd.to_numeric(df.get("b5_trend_z_20d"), errors="coerce")
     mom = pd.to_numeric(df.get("b5_mom_20d", trend), errors="coerce")
     up_dist = pd.to_numeric(df.get("b5_breakout_distance_up_60d"), errors="coerce")
@@ -289,6 +384,192 @@ def daily_rank_ic(df: pd.DataFrame, factors: Sequence[FactorSpec], labels: Seque
                     else np.nan,
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def rank_corr(left: pd.Series, right: pd.Series) -> float:
+    work = pd.DataFrame({"left": left, "right": right}).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(work) < 3 or work["left"].nunique() <= 1 or work["right"].nunique() <= 1:
+        return np.nan
+    corr = work["left"].rank().corr(work["right"].rank())
+    return float(corr) if np.isfinite(corr) else np.nan
+
+
+def pairwise_rank_corr(factors: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    factor_cols = [f"F::{col}" for col in factors.columns]
+    label_cols = [f"L::{col}" for col in labels.columns]
+    work = pd.concat(
+        [
+            factors.set_axis(factor_cols, axis=1),
+            labels.set_axis(label_cols, axis=1),
+        ],
+        axis=1,
+    )
+    work = work.replace([np.inf, -np.inf], np.nan)
+    if work.empty:
+        return pd.DataFrame(index=factors.columns, columns=labels.columns, dtype=float)
+    corr = work.rank().corr(method="pearson", min_periods=3)
+    if corr.empty:
+        return pd.DataFrame(index=factors.columns, columns=labels.columns, dtype=float)
+    out = corr.reindex(index=factor_cols, columns=label_cols)
+    out.index = factors.columns
+    out.columns = labels.columns
+    return out
+
+
+def ols_residual(y: pd.Series, controls: pd.DataFrame) -> pd.Series:
+    data = pd.concat(
+        [pd.to_numeric(y, errors="coerce").rename("_y"), controls.apply(pd.to_numeric, errors="coerce")],
+        axis=1,
+    )
+    data = data.replace([np.inf, -np.inf], np.nan).dropna()
+    residual = pd.Series(np.nan, index=y.index, dtype=float)
+    if data.empty:
+        return residual
+    control_cols = [
+        col
+        for col in data.columns
+        if col != "_y" and data[col].notna().sum() > 0 and data[col].nunique(dropna=True) > 1
+    ]
+    if not control_cols or len(data) <= len(control_cols) + 3:
+        residual.loc[data.index] = data["_y"] - data["_y"].mean()
+        return residual
+    x = data[control_cols].to_numpy(dtype=float)
+    x = np.column_stack([np.ones(len(x)), x])
+    beta = np.linalg.lstsq(x, data["_y"].to_numpy(dtype=float), rcond=None)[0]
+    residual.loc[data.index] = data["_y"].to_numpy(dtype=float) - x @ beta
+    return residual
+
+
+def ols_residual_frame(targets: pd.DataFrame, controls: pd.DataFrame) -> pd.DataFrame:
+    controls_num = controls.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    control_cols = [col for col in controls_num.columns if controls_num[col].nunique(dropna=True) > 1]
+    residuals = pd.DataFrame(np.nan, index=targets.index, columns=targets.columns, dtype=float)
+    if not control_cols:
+        for col in targets.columns:
+            y = pd.to_numeric(targets[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            valid = y.notna()
+            if valid.any():
+                residuals.loc[valid, col] = y.loc[valid] - y.loc[valid].mean()
+        return residuals
+
+    controls_num = controls_num[control_cols].dropna()
+    if controls_num.empty:
+        return residuals
+    x_all = controls_num.to_numpy(dtype=float)
+    x_all = np.column_stack([np.ones(len(x_all)), x_all])
+
+    for col in targets.columns:
+        y = pd.to_numeric(targets.loc[controls_num.index, col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        valid = y.notna().to_numpy()
+        if valid.sum() == 0:
+            continue
+        if valid.sum() <= len(control_cols) + 3:
+            valid_index = y.index[valid]
+            residuals.loc[valid_index, col] = y.loc[valid_index] - y.loc[valid_index].mean()
+            continue
+        x = x_all[valid]
+        y_values = y.to_numpy(dtype=float)[valid]
+        beta = np.linalg.lstsq(x, y_values, rcond=None)[0]
+        valid_index = y.index[valid]
+        residuals.loc[valid_index, col] = y_values - x @ beta
+    return residuals
+
+
+def summarize_ic_values(values: list[float], extra: dict[str, object]) -> dict[str, object]:
+    arr = pd.Series(values, dtype=float).dropna()
+    row = {
+        **extra,
+        "n_days": int(len(arr)),
+        "mean_ic": float(arr.mean()) if len(arr) else np.nan,
+        "median_ic": float(arr.median()) if len(arr) else np.nan,
+        "positive_ic_rate": float((arr > 0).mean()) if len(arr) else np.nan,
+        "t_stat": float(arr.mean() / (arr.std(ddof=1) / np.sqrt(len(arr))))
+        if len(arr) > 2 and arr.std(ddof=1) > 0
+        else np.nan,
+    }
+    return row
+
+
+def residual_ic_summary(
+    df: pd.DataFrame,
+    factors: Sequence[FactorSpec],
+    labels: Sequence[str],
+    control_sets: dict[str, tuple[str, ...]],
+    min_cross_section: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    factor_values = {spec.display: adjusted_factor(df, spec) for spec in factors}
+    label_cols = [label for label in labels if label in df.columns]
+
+    for control_name, requested_controls in control_sets.items():
+        controls = [col for col in requested_controls if col in df.columns]
+        if not controls:
+            continue
+        factor_resid_acc = {(spec.display, label): [] for spec in factors for label in label_cols}
+        double_resid_acc = {(spec.display, label): [] for spec in factors for label in label_cols}
+        used_controls_by_day: list[int] = []
+
+        for _, index in df.groupby("signal_date", sort=True).groups.items():
+            group = df.loc[index]
+            if len(group) < min_cross_section:
+                continue
+            controls_df = group[controls]
+            usable_controls = [
+                col
+                for col in controls
+                if pd.to_numeric(controls_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).nunique(dropna=True)
+                > 1
+            ]
+            if not usable_controls:
+                continue
+            used_controls_by_day.append(len(usable_controls))
+            controls_df = controls_df[usable_controls]
+
+            factor_frame = pd.DataFrame(
+                {spec.display: factor_values[spec.display].loc[group.index] for spec in factors},
+                index=group.index,
+            )
+            factor_resids = ols_residual_frame(factor_frame, controls_df)
+            label_resids = ols_residual_frame(group[label_cols], controls_df)
+
+            raw_label_corr = pairwise_rank_corr(factor_resids, group[label_cols])
+            double_resid_corr = pairwise_rank_corr(factor_resids, label_resids)
+            for spec in factors:
+                factor_name = spec.display
+                for label in label_cols:
+                    ic_factor_resid = raw_label_corr.loc[factor_name, label]
+                    if np.isfinite(ic_factor_resid):
+                        factor_resid_acc[(factor_name, label)].append(float(ic_factor_resid))
+                    ic_double_resid = double_resid_corr.loc[factor_name, label]
+                    if np.isfinite(ic_double_resid):
+                        double_resid_acc[(factor_name, label)].append(float(ic_double_resid))
+
+        avg_control_count = float(np.mean(used_controls_by_day)) if used_controls_by_day else np.nan
+        for spec in factors:
+            base = {
+                "factor": spec.display,
+                "raw_factor": spec.name,
+                "direction": spec.direction,
+                "family": spec.family,
+                "role": spec.role,
+                "control_set": control_name,
+                "requested_controls": "|".join(controls),
+                "avg_used_controls": avg_control_count,
+            }
+            for label in label_cols:
+                rows.append(
+                    summarize_ic_values(
+                        factor_resid_acc[(spec.display, label)],
+                        {**base, "label": label, "residual_mode": "factor_resid_vs_raw_label"},
+                    )
+                )
+                rows.append(
+                    summarize_ic_values(
+                        double_resid_acc[(spec.display, label)],
+                        {**base, "label": label, "residual_mode": "factor_and_label_resid"},
+                    )
+                )
     return pd.DataFrame(rows)
 
 
@@ -378,6 +659,26 @@ def plot_ic_heatmap(ic: pd.DataFrame, out_path: Path, title: str) -> None:
     plot_heatmap(pivot, out_path, title)
 
 
+def plot_residual_ic_heatmap(
+    residual: pd.DataFrame,
+    out_path: Path,
+    title: str,
+    control_set: str,
+    residual_mode: str = "factor_and_label_resid",
+) -> None:
+    if residual.empty:
+        return
+    data = residual[
+        residual["control_set"].eq(control_set)
+        & residual["residual_mode"].eq(residual_mode)
+        & residual["label"].isin(LABELS)
+    ].copy()
+    if data.empty:
+        return
+    pivot = data.pivot_table(index="factor", columns="label", values="mean_ic", aggfunc="mean")
+    plot_heatmap(pivot, out_path, title)
+
+
 def plot_spread_bar(spread: pd.DataFrame, out_path: Path, title: str, metric: str) -> None:
     col = f"{metric}_q5_minus_q1"
     if spread.empty or col not in spread.columns:
@@ -431,7 +732,14 @@ def write_factor_catalog(factors: Sequence[FactorSpec], out_path: Path) -> None:
     ).to_csv(out_path, index=False, encoding="utf-8-sig")
 
 
-def analyze_level(name: str, df: pd.DataFrame, factors: Sequence[FactorSpec], args: argparse.Namespace, out_dir: Path) -> None:
+def analyze_level(
+    name: str,
+    df: pd.DataFrame,
+    factors: Sequence[FactorSpec],
+    control_sets: dict[str, tuple[str, ...]],
+    args: argparse.Namespace,
+    out_dir: Path,
+) -> None:
     level_dir = out_dir / name
     level_dir.mkdir(parents=True, exist_ok=True)
     factors = available_factors(df, factors)
@@ -439,6 +747,8 @@ def analyze_level(name: str, df: pd.DataFrame, factors: Sequence[FactorSpec], ar
     write_factor_catalog(factors, level_dir / "factor_catalog.csv")
     ic = daily_rank_ic(df, factors, LABELS, args.min_cross_section)
     ic.to_csv(level_dir / "factor_ic_summary.csv", index=False, encoding="utf-8-sig")
+    residual = residual_ic_summary(df, factors, LABELS, control_sets, args.min_cross_section)
+    residual.to_csv(level_dir / "factor_residual_ic_summary.csv", index=False, encoding="utf-8-sig")
     layers = factor_layers(df, factors, args.bins, args.min_cross_section)
     layers.to_csv(level_dir / "factor_layer_summary.csv", index=False, encoding="utf-8-sig")
     spreads = spread_summary(layers)
@@ -451,6 +761,18 @@ def analyze_level(name: str, df: pd.DataFrame, factors: Sequence[FactorSpec], ar
     plot_spread_bar(spreads, level_dir / "03_spread_retention.png", f"{name}: Q5-Q1 retained ratio", "future_retained_ratio")
     plot_spread_bar(spreads, level_dir / "04_spread_stop_avoidance.png", f"{name}: Q5-Q1 stop avoidance", "future_stop_avoidance")
     plot_heatmap(corr, level_dir / "05_factor_correlation_matrix.png", f"{name}: factor correlation")
+    plot_residual_ic_heatmap(
+        residual,
+        level_dir / "06_residual_ic_full_denominator.png",
+        f"{name}: residual IC after full denominator controls",
+        "full_denominator",
+    )
+    plot_residual_ic_heatmap(
+        residual,
+        level_dir / "07_residual_ic_margin_denominator.png",
+        f"{name}: residual IC after margin denominator controls",
+        "margin_denominator",
+    )
 
 
 def main() -> None:
@@ -495,8 +817,8 @@ def main() -> None:
     product.to_csv(out_dir / "product_research_dataset.csv", index=False)
     side.to_csv(out_dir / "product_side_research_dataset.csv", index=False)
 
-    analyze_level("product", product, PRODUCT_FACTORS, args, out_dir)
-    analyze_level("product_side", side, PRODUCT_SIDE_FACTORS, args, out_dir)
+    analyze_level("product", product, PRODUCT_FACTORS, PRODUCT_CONTROL_SETS, args, out_dir)
+    analyze_level("product_side", side, PRODUCT_SIDE_FACTORS, PRODUCT_SIDE_CONTROL_SETS, args, out_dir)
     plot_product_scatter(product, out_dir / "06_product_premium_stress_scatter.png")
 
     manifest = pd.DataFrame(
