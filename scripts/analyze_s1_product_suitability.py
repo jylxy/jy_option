@@ -8,6 +8,11 @@ The screen is intentionally split into two parts:
 Example:
     python scripts/analyze_s1_product_suitability.py \
         --tag s1_b5_full_shadow_v1_2022_latest
+
+    python scripts/analyze_s1_product_suitability.py \
+        --tag s1_b5_full_shadow_v1_delta006_012 \
+        --min-abs-delta 0.06 --max-abs-delta 0.12 \
+        --min-option-price 0.5
 """
 
 from __future__ import annotations
@@ -70,6 +75,42 @@ def _weighted_score(parts: dict[str, tuple[pd.Series, float]]) -> pd.Series:
     if score is None or weight_sum <= 0:
         return pd.Series(50.0, index=next(iter(parts.values()))[0].index)
     return (score / weight_sum).clip(0.0, 100.0)
+
+
+def _filter_target_contract_band(candidates: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
+    c = candidates.copy()
+    filters = []
+
+    if args.min_abs_delta is not None:
+        c["abs_delta"] = _num(c, "abs_delta")
+        c = c[c["abs_delta"] >= float(args.min_abs_delta)].copy()
+        filters.append(f"abs_delta>={float(args.min_abs_delta):.4f}")
+    if args.max_abs_delta is not None:
+        c["abs_delta"] = _num(c, "abs_delta")
+        c = c[c["abs_delta"] <= float(args.max_abs_delta)].copy()
+        filters.append(f"abs_delta<={float(args.max_abs_delta):.4f}")
+    if args.min_option_price is not None:
+        c["option_price"] = _num(c, "option_price")
+        c = c[c["option_price"] >= float(args.min_option_price)].copy()
+        filters.append(f"option_price>={float(args.min_option_price):.4f}")
+    if args.max_option_price is not None:
+        c["option_price"] = _num(c, "option_price")
+        c = c[c["option_price"] <= float(args.max_option_price)].copy()
+        filters.append(f"option_price<={float(args.max_option_price):.4f}")
+    if args.max_rank_in_side is not None:
+        c["rank_in_side"] = _num(c, "rank_in_side")
+        c = c[c["rank_in_side"] <= float(args.max_rank_in_side)].copy()
+        filters.append(f"rank_in_side<={float(args.max_rank_in_side):.0f}")
+    if args.min_dte is not None:
+        c["dte"] = _num(c, "dte")
+        c = c[c["dte"] >= float(args.min_dte)].copy()
+        filters.append(f"dte>={float(args.min_dte):.0f}")
+    if args.max_dte is not None:
+        c["dte"] = _num(c, "dte")
+        c = c[c["dte"] <= float(args.max_dte)].copy()
+        filters.append(f"dte<={float(args.max_dte):.0f}")
+
+    return c, "; ".join(filters) if filters else "all_candidates"
 
 
 def _aggregate_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -422,7 +463,7 @@ def _reason_text(row: pd.Series) -> str:
     return ",".join(reasons) if reasons else "balanced"
 
 
-def _write_report(scored: pd.DataFrame, output_path: Path, tag: str) -> None:
+def _write_report(scored: pd.DataFrame, output_path: Path, tag: str, filter_description: str) -> None:
     def markdown_table(frame: pd.DataFrame, floatfmt: str = ".3f") -> str:
         if frame.empty:
             return "_No rows._"
@@ -449,6 +490,8 @@ def _write_report(scored: pd.DataFrame, output_path: Path, tag: str) -> None:
     lines.append("")
     lines.append("This screen uses ex-ante candidate factors as the primary suitability score.")
     lines.append("Shadow outcomes are reported as validation diagnostics, not as the only blacklist rule.")
+    lines.append("")
+    lines.append(f"Target contract band: `{filter_description}`")
     lines.append("")
     lines.append("## Tier Counts")
     counts = scored["recommended_tier"].value_counts().reindex(tier_order).fillna(0).astype(int)
@@ -495,6 +538,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="output/product_suitability")
     parser.add_argument("--tag", default="s1_b5_full_shadow_v1_2022_latest")
     parser.add_argument("--min-signal-days", type=int, default=120)
+    parser.add_argument("--min-abs-delta", type=float, default=None)
+    parser.add_argument("--max-abs-delta", type=float, default=None)
+    parser.add_argument("--min-option-price", type=float, default=None)
+    parser.add_argument("--max-option-price", type=float, default=None)
+    parser.add_argument("--max-rank-in-side", type=float, default=None)
+    parser.add_argument("--min-dte", type=float, default=None)
+    parser.add_argument("--max-dte", type=float, default=None)
     return parser.parse_args()
 
 
@@ -506,7 +556,12 @@ def main() -> None:
         raise FileNotFoundError(f"candidate file not found: {candidate_path}")
 
     candidates = pd.read_csv(candidate_path, low_memory=False)
+    candidates, filter_description = _filter_target_contract_band(candidates, args)
+    if candidates.empty:
+        raise ValueError(f"no candidates left after target contract filter: {filter_description}")
     outcomes = pd.read_csv(outcomes_path, low_memory=False) if outcomes_path.exists() else pd.DataFrame()
+    if not outcomes.empty and "candidate_id" in outcomes.columns and "candidate_id" in candidates.columns:
+        outcomes = outcomes[outcomes["candidate_id"].isin(candidates["candidate_id"])].copy()
     product_candidates = _aggregate_candidates(candidates)
     product_outcomes = _aggregate_outcomes(outcomes)
     merged = product_candidates.merge(product_outcomes, on="product", how="left")
@@ -517,10 +572,12 @@ def main() -> None:
     csv_path = out_dir / f"product_suitability_{args.tag}.csv"
     md_path = out_dir / f"product_suitability_{args.tag}.md"
     scored.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    _write_report(scored, md_path, args.tag)
+    _write_report(scored, md_path, args.tag, filter_description)
 
     print(f"wrote {csv_path}")
     print(f"wrote {md_path}")
+    print(f"target_filter: {filter_description}")
+    print(f"filtered_candidates: {len(candidates)}")
     print(scored["recommended_tier"].value_counts().to_string())
     show_cols = [
         "product",
