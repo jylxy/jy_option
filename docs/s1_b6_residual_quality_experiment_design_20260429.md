@@ -29,7 +29,78 @@ S1 net return
 
 B6 的直接目标不是马上追求最高 NAV，而是让策略从“能收到权利金”升级为“能收到更干净、更容易留住的权利金”。
 
-## 2. B6 相对 B1 的不变项
+## 2. 与 B5 实验总结第 14 节的承接关系
+
+上一轮 B5 full shadow / 因子分层总结给出的第 14 节，是 B6/B7 的研究总纲。B6 设计必须完整承接这三条线，而不是另起炉灶。
+
+### 2.1 第一条线：B6 合约层排序
+
+B5 支持优先推进合约层排序。去共线后的核心因子包括：
+
+```text
+premium_to_iv10_loss 或 b5_premium_per_vega
+premium_to_stress_loss 或 gamma_rent_penalty_low
+b5_theta_per_gamma
+b5_theta_per_vega
+b5_premium_to_tail_move_loss
+```
+
+交易含义是：
+
+```text
+在同一品种、同一方向、同一次月内部，
+优先卖那些权利金能够覆盖 IV shock、stress loss 和历史尾部移动，
+同时 theta / vega、theta / gamma 更干净的合约。
+```
+
+B6a 正是对这条线的交易化验证。它保留 B1 的低价、tick、friction、手续费覆盖、成交量和持仓量硬过滤，不把这些交易卫生因子当作 alpha。
+
+### 2.2 第二条线：B6 P/C 侧预算
+
+B5 的另一个重要结论是：趋势、breakout、skew、IV state 不应直接当作合约 alpha，而应服务于 P/C 侧预算。
+
+因此 B6b 的问题不是“哪个合约因为趋势更好”，而是：
+
+```text
+今天这个品种更适合卖 Put、卖 Call，还是维持双卖？
+```
+
+初始规则方向为：
+
+```text
+上涨趋势：Put 预算可提升，Call 预算或 Call delta 应压低；
+下跌趋势：Call 预算可提升，Put 预算或 Put delta 应压低；
+震荡环境：维持双卖，以 product-side 质量因子决定轻微倾斜；
+skew 变陡、IV 上升、刚止损未冷却：对应方向预算收缩。
+```
+
+这条线解决的是 P/C 方向风险，不应与合约层的 `premium_to_iv10_loss`、`premium_to_stress_loss`、`premium_yield_margin` 重复计分。
+
+### 2.3 第三条线：B7 组合层风险预算
+
+B5 已经显示 Top5 stress 占比偏高，说明单张合约质量变好并不自动等于组合安全。组合层必须单独处理：
+
+```text
+板块集中
+到期日集中
+tail correlation
+stop cluster
+same-expiry gamma
+margin shock
+effective product count
+top stress share
+```
+
+这部分不进入 B6 的合约排序或 P/C 预算，而进入 B7。B7 可以引入 Tail-HRP，用尾部相关性、止损聚集和 stress loss 相关性分配组合风险预算，而不是简单等权或流动性权重。
+
+一句话：
+
+```text
+B6 解决“卖哪张合约、卖哪一侧”；
+B7 解决“这些仓位能不能一起卖、卖多大”。
+```
+
+## 3. B6 相对 B1 的不变项
 
 B6 的所有实验均以 B1 为基准，不改变以下口径：
 
@@ -47,9 +118,9 @@ B6 的所有实验均以 B1 为基准，不改变以下口径：
 
 这点很重要：B6 只验证“因子归位后是否改善交易质量”，不同时混入新的组合风控和容量约束。
 
-## 3. B6 的因子使用原则
+## 4. B6 的因子使用原则
 
-### 3.1 不再使用 raw premium/margin 做大幅预算 alpha
+### 4.1 不再使用 raw premium/margin 做大幅预算 alpha
 
 B6 residual IC 审计后，`product_premium_to_margin` 的 raw IC 很高，但在 full denominator 残差控制后几乎消失，说明它很大程度上只是告诉我们“哪里权利金池更厚”，而不一定说明“这个品种更会赚钱”。
 
@@ -60,7 +131,7 @@ premium/margin 可以帮助识别 Premium Pool；
 但不能单独决定品种大幅加预算。
 ```
 
-### 3.2 核心升级为 theta/vega 和 theta/gamma 质量
+### 4.2 核心升级为 theta/vega 和 theta/gamma 质量
 
 残差 IC 后最值得保留的是：
 
@@ -86,7 +157,7 @@ vega 损耗
 gamma 路径亏损
 ```
 
-### 3.3 P/C 侧比纯品种层更值得优先尝试
+### 4.3 P/C 侧比纯品种层更值得优先尝试
 
 B6 residual IC 显示，product-side 层的信号更清楚：
 
@@ -102,7 +173,7 @@ side_theta_per_gamma
 这个品种今天更适合卖 Put，还是卖 Call？
 ```
 
-### 3.4 组合层暂不并入 B6
+### 4.4 组合层暂不并入 B6
 
 以下因子先不进入 B6 交易规则，而进入 B7：
 
@@ -119,11 +190,11 @@ Tail-HRP
 
 B6 可以输出这些诊断，但不让它们参与交易，避免把“因子有效性”和“组合约束有效性”混在一起。
 
-## 4. 第一批 B6 实验
+## 5. 第一批 B6 实验
 
 第一批建议先跑 3 条线，分别回答三个层级问题。
 
-### 4.1 B6a：合约层残差质量排序
+### 5.1 B6a：合约层残差质量排序
 
 实验问题：
 
@@ -167,7 +238,7 @@ Stop count 和 stop loss 是否下降；
 Theta / Vega、Theta / Gamma 暴露质量是否变好。
 ```
 
-### 4.2 B6b：P/C 侧残差质量预算倾斜
+### 5.2 B6b：P/C 侧残差质量预算倾斜
 
 实验问题：
 
@@ -220,7 +291,7 @@ side-level retention 是否提高；
 Put / Call 各自 vega 和 gamma 损耗是否改善。
 ```
 
-### 4.3 B6c：品种层轻量残差质量预算倾斜
+### 5.3 B6c：品种层轻量残差质量预算倾斜
 
 实验问题：
 
@@ -269,11 +340,11 @@ Top 5 品种 premium / stress / margin 占比是否没有恶化；
 是否没有把预算集中到白糖、玻璃等高权利金但高尾损品种。
 ```
 
-## 5. 第二批候选实验
+## 6. 第二批候选实验
 
 第一批结果清楚后，再考虑组合版，不建议一开始就全开。
 
-### 5.1 B6d：合约 + P/C + 品种轻量组合版
+### 6.1 B6d：合约 + P/C + 品种轻量组合版
 
 实验问题：
 
@@ -302,7 +373,7 @@ Stop loss / opened premium 下降；
 Premium Pool 损失不超过 15%。
 ```
 
-### 5.2 B6e：防守版质量因子
+### 6.2 B6e：防守版质量因子
 
 实验问题：
 
@@ -323,9 +394,9 @@ side multiplier clip 收窄到 0.75 - 1.25。
 
 这条线不一定 NAV 最高，但可以检验 B6 因子是否真的有风控价值。
 
-## 6. 实现要求
+## 7. 实现要求
 
-### 6.1 需要新增的配置命名
+### 7.1 需要新增的配置命名
 
 建议配置文件：
 
@@ -347,7 +418,7 @@ s1_b6d_residual_quality_combo_2022_latest
 s1_b6e_residual_defensive_2022_latest
 ```
 
-### 6.2 需要新增的代码能力
+### 7.2 需要新增的代码能力
 
 当前 B4 代码可以复用部分框架，但还不完全符合 B6 的残差质量结论。B6 实现应新增独立模式：
 
@@ -379,7 +450,7 @@ missing factor score = 50
 
 原因是很多新品种或短历史品种在上市初期会缺少足够历史，不应因缺字段形成幸存者偏差。
 
-### 6.3 不允许引入未来函数
+### 7.3 不允许引入未来函数
 
 B6 的所有横截面 rank / z-score 必须只使用当日候选池：
 
@@ -399,11 +470,11 @@ cooldown release 只能看当前可见 IV/RV/skew 是否回落；
 不能使用未来持仓表现来决定当天预算。
 ```
 
-## 7. 输出与评估
+## 8. 输出与评估
 
 B6 每条实验必须与 B1、B2C、B4a/B4b/B4c 做同截止日对比。
 
-### 7.1 绩效指标
+### 8.1 绩效指标
 
 ```text
 NAV
@@ -415,7 +486,7 @@ Worst 1d / 5d PnL
 Monthly win rate
 ```
 
-### 7.2 收益公式拆解
+### 8.2 收益公式拆解
 
 必须输出：
 
@@ -431,7 +502,7 @@ Tail Loss / Opened Premium
 
 这部分是判断 B6 的核心。如果 B6 NAV 变好但只是因为开了更多权利金，而 retention 和 tail 变差，则不能认为 B6 成功。
 
-### 7.3 Greeks 与卖方质量指标
+### 8.3 Greeks 与卖方质量指标
 
 必须输出：
 
@@ -455,7 +526,7 @@ premium / stress loss
 Vega PnL 应尽量为正，至少不能因为 B6 放大预算而恶化。
 ```
 
-### 7.4 结构诊断
+### 8.4 结构诊断
 
 必须输出：
 
@@ -471,7 +542,7 @@ effective product count
 product-side budget multiplier distribution
 ```
 
-### 7.5 稳健性切片
+### 8.5 稳健性切片
 
 至少拆：
 
@@ -486,9 +557,9 @@ product-side budget multiplier distribution
 止损 cluster 窗口
 ```
 
-## 8. 判断标准
+## 9. 判断标准
 
-### 8.1 可进入下一轮主线的条件
+### 9.1 可进入下一轮主线的条件
 
 B6d 只有同时满足以下条件，才能进入下一轮主线：
 
@@ -504,7 +575,7 @@ Premium Pool 损失不超过 15%；
 Top 5 品种 stress share 不显著恶化。
 ```
 
-### 8.2 需要否决的情况
+### 9.2 需要否决的情况
 
 即使 NAV 变好，出现以下情况也不能直接采纳：
 
@@ -518,7 +589,7 @@ stop loss / opened premium 更高；
 关键压力期回撤显著扩大。
 ```
 
-### 8.3 如果 B6a 好、B6b/B6c 不好
+### 9.3 如果 B6a 好、B6b/B6c 不好
 
 说明因子更适合做合约层排序，而不适合做预算倾斜。下一步应该：
 
@@ -529,7 +600,7 @@ stop loss / opened premium 更高；
 进入 B7 组合层风控实验。
 ```
 
-### 8.4 如果 B6b 好、B6c 不好
+### 9.4 如果 B6b 好、B6c 不好
 
 说明 product-side 比 product 更有交易意义。下一步应该：
 
@@ -539,7 +610,7 @@ stop loss / opened premium 更高；
 不要直接按品种 raw premium/margin 加仓。
 ```
 
-### 8.5 如果 B6c 好但集中度恶化
+### 9.5 如果 B6c 好但集中度恶化
 
 说明品种因子有收益，但需要 B7 组合层接管。下一步应该：
 
@@ -549,7 +620,7 @@ stop loss / opened premium 更高；
 不允许单独上线。
 ```
 
-## 9. 建议执行顺序
+## 10. 建议执行顺序
 
 第一阶段先跑：
 
@@ -580,4 +651,3 @@ B6 到底改善了公式里的哪一项？
 ```
 
 这是 B6 能否进入 S1 下一版主线的唯一判断框架。
-
