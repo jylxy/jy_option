@@ -30,6 +30,13 @@ from s3_rules import (
     select_s3_sell,
     select_s3_sell_by_otm,
 )
+from strategy_sizing import (
+    calc_s1_size,
+    calc_s1_stress_size,
+    calc_s3_size,
+    calc_s3_size_v2,
+    calc_s4_size,
+)
 
 # ── 默认参数 ──────────────────────────────────────────────────────────────────
 
@@ -623,77 +630,6 @@ def select_s4(day_df, option_type):
 
 
 # ── 手数计算 ──────────────────────────────────────────────────────────────────
-
-def calc_s1_size(nav, margin_per, single_margin, iv_scale):
-    """S1每方向卖腿手数 = nav × margin_per/2 × iv_scale / 单手保证金"""
-    if single_margin <= 0:
-        return 1
-    return max(1, int(nav * margin_per / 2 * iv_scale / single_margin))
-
-
-def calc_s1_stress_size(nav, stress_budget_pct, one_contract_stress_loss,
-                        iv_scale=1.0, min_qty=1, max_qty=50):
-    """Size S1 by stress-risk budget instead of target margin usage."""
-    if one_contract_stress_loss is None or not np.isfinite(one_contract_stress_loss):
-        return 0
-    if one_contract_stress_loss <= 0:
-        return int(max(min_qty, 1))
-    budget = float(nav) * float(stress_budget_pct or 0.0) * float(iv_scale or 1.0)
-    if budget <= 0:
-        return 0
-    qty = int(budget / float(one_contract_stress_loss))
-    qty = max(int(min_qty or 1), qty)
-    if max_qty is not None and int(max_qty) > 0:
-        qty = min(qty, int(max_qty))
-    return max(qty, 0)
-
-
-def calc_s3_size(nav, margin_per, sell_margin, s3_ratio, iv_scale):
-    """
-    S3手数计算
-    买腿手数 = nav × margin_per/2 × iv_scale / (单手卖腿保证金 × ratio)
-    卖腿手数 = 买腿 × ratio
-    """
-    if sell_margin <= 0:
-        return 1, s3_ratio
-    buy_qty = max(1, int(nav * margin_per / 2 * iv_scale / (sell_margin * s3_ratio)))
-    sell_qty = buy_qty * s3_ratio
-    return buy_qty, sell_qty
-
-
-def calc_s4_size(nav, s4_prem, n_s4_products, cost_per_hand, max_hands=5):
-    """S4每方向手数，预算 = nav × s4_prem / 品种数 / 2方向"""
-    if n_s4_products <= 0 or cost_per_hand <= 0:
-        return 1
-    budget = nav * s4_prem / n_s4_products / 2
-    qty = max(1, int(budget / cost_per_hand))
-    return min(qty, max_hands)
-
-
-def calc_s3_size_v2(nav, margin_per, sell_margin, buy_premium,
-                     sell_premium, mult, iv_scale,
-                     ratio_candidates=(2, 3), net_premium_tolerance=0.3):
-    """
-    S3手数计算（v2）：灵活比例 + 零成本进场约束
-
-    先尝试小比例(1:2)，若净权利金不够覆盖买腿成本再尝试大比例(1:3)。
-    返回 (buy_qty, sell_qty, chosen_ratio) 或 None（无法满足零成本约束时）
-    """
-    if sell_margin <= 0 or buy_premium <= 0 or sell_premium <= 0:
-        return None
-    for ratio in sorted(ratio_candidates):
-        buy_qty = max(1, int(nav * margin_per / 2 * iv_scale
-                             / (sell_margin * ratio)))
-        sell_qty = buy_qty * ratio
-        # 零成本检查：net_premium = sell收入 - buy成本
-        buy_cost = buy_premium * mult * buy_qty
-        sell_income = sell_premium * mult * sell_qty
-        net_premium = sell_income - buy_cost
-        # 容忍范围：net_premium >= -buy_cost × tolerance
-        if net_premium >= -buy_cost * net_premium_tolerance:
-            return buy_qty, sell_qty, ratio
-    return None
-
 
 def check_emergency_protect(sell_strike, spot_close, option_type,
                              trigger_otm_pct=5.0):
