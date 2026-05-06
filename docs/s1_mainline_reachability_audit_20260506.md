@@ -90,6 +90,12 @@
 
 `strategy_rules.py` 继续 re-export 这些函数，外部调用路径保持兼容。这样做的目的不是改变 S3 逻辑，而是把 S1 主线规则、S3 结构规则和通用保证金/筛选规则逐步分层，降低 `strategy_rules.py` 的体积和误读风险。
 
+## 4.6 第七轮 S1 P/C 侧选择分层
+
+已新增 `src/s1_side_selection.py`，承接 S1 趋势状态识别、趋势强弱侧预算/分数调整、动量惩罚、P/C 单侧或双卖选择逻辑。
+
+`strategy_rules.py` 继续 re-export 这些函数，保持 `toolkit_minute_engine.py` 与历史测试的导入路径不变。该拆分让后续研究 P/C 偏移、趋势置信度、range pressure 与双卖门控时，可以直接在一个小模块中修改和测试，避免继续扩大 `strategy_rules.py`。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：
