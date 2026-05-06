@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 EXP_DIR = ROOT / "experiments" / "s1_autoresearch"
 IDEA_DIR = EXP_DIR / "ideas"
 REVIEW_DIR = EXP_DIR / "reviews"

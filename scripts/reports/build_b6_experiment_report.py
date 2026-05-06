@@ -29,7 +29,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "output"
 DOCS = ROOT / "docs"
 ANALYSIS = OUTPUT / "analysis_s1_b6_experiment_20260430"

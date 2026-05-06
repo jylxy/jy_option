@@ -2,11 +2,13 @@
 
 本目录是当前 S1 卖权策略的主要代码仓库。当前生产级回测入口是 `src/toolkit_minute_engine.py`，历史 `true_minute_engine.py`、Parquet 直读引擎和早期试验脚本已经归档到 `archive/`。
 
+当前研究主线已经收敛为 `P3B/A0`：`B0` 基准规则 + `B1` 流动性/OI 排序 + `B2C` 品种预算倾斜 + 乐得期限偏好 + `P5 A0` 组级 1.5x 止损。详细口径见 `docs/s1_p3b_a0_mainline_spec.md`。
+
 ## 当前主入口
 
 ```bash
 python3 src/toolkit_minute_engine.py \
-  --config config_s1_baseline_b2_product_tilt075_stop15.json \
+  --config config_s1_p5_p3b_a0_group_stop15.json \
   --start-date 2022-01-01 \
   --end-date 2026-05-06 \
   --tag s1_example
@@ -26,7 +28,7 @@ python3 src/toolkit_minute_engine.py \
 | 目录 | 当前用途 | 整理原则 |
 |---|---|---|
 | `src/` | 回测引擎和可复用业务模块。 | 只保留当前主路径会调用的代码。历史引擎、一次性脚本不再放这里。 |
-| `scripts/` | 实验启动、结果分析、报告生成、autoresearch 辅助脚本。 | 保留，但必须在 `scripts/README.md` 中登记用途。 |
+| `scripts/` | 实验启动、结果分析、报告生成、autoresearch 辅助脚本。 | 根目录只保留 `s1_cli.py` 和 README，其余按功能放入子目录。 |
 | `docs/` | 策略设计、实验方案、审计报告、结构整理记录。 | 研究结论和实验设计统一沉淀在这里。 |
 | `experiments/` | 自动研究系统、审计、scorecard、review 输出。 | 作为实验元数据和自动研究工作区。 |
 | `output/` | 回测落盘结果、图表、报告中间产物。 | 不应作为核心代码依赖来源。 |
@@ -63,7 +65,15 @@ python3 src/toolkit_minute_engine.py \
 
 ## 脚本管理
 
-脚本清单见 `scripts/README.md`。新增脚本必须满足：
+脚本清单见 `scripts/README.md`。优先使用统一入口：
+
+```bash
+python scripts/s1_cli.py --list
+python scripts/s1_cli.py analyze-backtest --help
+python scripts/s1_cli.py report-s1 --help
+```
+
+新增脚本必须满足：
 
 1. 能说明用途：实验启动、结果分析、报告生成、审计、数据维护或 scratch。
 2. 如果是一次性脚本，完成后应移动到 `archive/src_scratch/` 或合并进正式分析脚本。
