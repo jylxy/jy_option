@@ -78,6 +78,12 @@
 
 性能侧，本轮为合约级 IV vol-of-vol 估算增加 `(option_code, lookback, history_length, last_date)` 缓存，避免同一天同一合约在 B3/B4/B6 实验路径里重复构造历史序列。该缓存会在每日合约 IV 历史更新时清空。
 
+## 4.4 第五轮主线合约历史轻量化
+
+已新增 `src/contract_history.py`，承接合约级 IV/价格历史更新与 `contract_iv_change_1d/3d/5d`、`contract_price_change_1d/3d/5d` 状态计算。
+
+主引擎中的 `_update_contract_iv_history` 与 `_contract_trend_state` 已改为调用该模块，并增加 `(option_code, history_length, last_date)` 缓存。该路径会被 P3B/A0 的 S1 选腿使用，因此这是主线性能优化；计算口径保持与原实现一致，但避免为每个候选合约反复构造小 pandas Series。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：

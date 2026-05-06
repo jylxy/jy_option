@@ -131,6 +131,10 @@ from iv_warmup import (
 )
 import portfolio_risk as port_risk
 import vol_regime as vol_rules
+from contract_history import (
+    contract_trend_state_from_history,
+    update_contract_iv_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +156,7 @@ class ToolkitMinuteEngine:
         self._iv_history = defaultdict(lambda: {'dates': [], 'ivs': []})
         self._spot_history = defaultdict(lambda: {'dates': [], 'spots': []})
         self._contract_iv_history = defaultdict(lambda: {'dates': [], 'ivs': [], 'prices': []})
+        self._contract_trend_state_cache = {}
         self._contract_iv_vov_cache = {}
         self._day_realized = {'pnl': 0.0, 'fee': 0.0, 's1': 0.0, 's3': 0.0, 's4': 0.0}
         self._day_attr_realized = self._zero_attr_bucket()
@@ -437,67 +442,23 @@ class ToolkitMinuteEngine:
     def _update_contract_iv_history(self, daily_df, date_str):
         if not self.config.get('s1_track_contract_iv_trend', True):
             return
-        cols = {'option_code', 'implied_vol', 'option_close'}
-        if daily_df.empty or not cols.issubset(set(daily_df.columns)):
+        updated = update_contract_iv_history(self._contract_iv_history, daily_df, date_str)
+        if not updated:
             return
+        self._contract_trend_state_cache.clear()
         self._contract_iv_vov_cache.clear()
-        rows = daily_df[['option_code', 'implied_vol', 'option_close']].copy()
-        rows['implied_vol'] = pd.to_numeric(rows['implied_vol'], errors='coerce')
-        rows['option_close'] = pd.to_numeric(rows['option_close'], errors='coerce')
-        rows = rows[
-            rows['option_code'].notna() &
-            (rows['implied_vol'] > 0) &
-            (rows['option_close'] > 0)
-        ]
-        if rows.empty:
-            return
-        for row in rows.itertuples(index=False):
-            code = str(row.option_code)
-            hist = self._contract_iv_history[code]
-            iv = float(row.implied_vol)
-            price = float(row.option_close)
-            if hist['dates'] and hist['dates'][-1] == date_str:
-                hist['ivs'][-1] = iv
-                hist['prices'][-1] = price
-            else:
-                hist['dates'].append(date_str)
-                hist['ivs'].append(iv)
-                hist['prices'].append(price)
 
     def _contract_trend_state(self, option_code):
-        hist = self._contract_iv_history.get(str(option_code))
-        state = {
-            'contract_iv': np.nan,
-            'contract_iv_change_1d': np.nan,
-            'contract_iv_change_3d': np.nan,
-            'contract_iv_change_5d': np.nan,
-            'contract_price': np.nan,
-            'contract_price_change_1d': np.nan,
-            'contract_price_change_3d': np.nan,
-            'contract_price_change_5d': np.nan,
-        }
-        if not hist:
-            return state
-        ivs = pd.to_numeric(pd.Series(hist.get('ivs', [])), errors='coerce')
-        prices = pd.to_numeric(pd.Series(hist.get('prices', [])), errors='coerce')
-        if len(ivs) >= 1 and pd.notna(ivs.iloc[-1]):
-            state['contract_iv'] = float(ivs.iloc[-1])
-        if len(prices) >= 1 and pd.notna(prices.iloc[-1]):
-            state['contract_price'] = float(prices.iloc[-1])
-        if len(ivs) >= 2 and pd.notna(ivs.iloc[-1]) and pd.notna(ivs.iloc[-2]):
-            state['contract_iv_change_1d'] = float(ivs.iloc[-1] - ivs.iloc[-2])
-        if len(prices) >= 2 and pd.notna(prices.iloc[-1]) and pd.notna(prices.iloc[-2]):
-            prev = float(prices.iloc[-2])
-            if prev > 0:
-                state['contract_price_change_1d'] = float(prices.iloc[-1] / prev - 1.0)
-        for lookback in (3, 5):
-            if len(ivs) > lookback and pd.notna(ivs.iloc[-1]) and pd.notna(ivs.iloc[-1 - lookback]):
-                state[f'contract_iv_change_{lookback}d'] = float(ivs.iloc[-1] - ivs.iloc[-1 - lookback])
-            if len(prices) > lookback and pd.notna(prices.iloc[-1]) and pd.notna(prices.iloc[-1 - lookback]):
-                prev = float(prices.iloc[-1 - lookback])
-                if prev > 0:
-                    state[f'contract_price_change_{lookback}d'] = float(prices.iloc[-1] / prev - 1.0)
-        return state
+        code = str(option_code)
+        hist = self._contract_iv_history.get(code)
+        dates = (hist.get('dates') or ['']) if hist else ['']
+        key = (code, len(hist.get('ivs', [])) if hist else 0, dates[-1])
+        if key not in self._contract_trend_state_cache:
+            self._contract_trend_state_cache[key] = contract_trend_state_from_history(
+                self._contract_iv_history,
+                code,
+            )
+        return dict(self._contract_trend_state_cache[key])
 
     def _prepare_s1_selection_frame(self, ef, option_type):
         side = ef[ef['option_type'] == option_type].copy()
@@ -2823,7 +2784,8 @@ class ToolkitMinuteEngine:
         hist = self._contract_iv_history.get(code)
         if not hist:
             return np.nan
-        key = (code, int(lookback or 20), len(hist.get('ivs', [])), hist.get('dates', [''])[-1])
+        dates = hist.get('dates') or ['']
+        key = (code, int(lookback or 20), len(hist.get('ivs', [])), dates[-1])
         if key not in self._contract_iv_vov_cache:
             self._contract_iv_vov_cache[key] = contract_iv_vov_from_history(
                 self._contract_iv_history,
