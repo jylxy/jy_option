@@ -112,13 +112,19 @@ from s1_experimental_scoring import (
 from s1_shadow_universe import (
     S1_B5_CANDIDATE_FIELDS,
     add_b5_shadow_fields,
-    write_b5_candidate_panels,
+    write_s1_candidate_outputs,
 )
 from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
-from result_output import write_backtest_outputs
-from portfolio_diagnostics import build_portfolio_diagnostics_records
+from result_output import (
+    append_daily_diagnostics_records,
+    build_nav_snapshot_record,
+    roll_position_previous_marks,
+    write_backtest_outputs,
+    write_nav_progress,
+    write_orders_only,
+)
 from day_loader import ToolkitDayLoader
 from config_loader import load_engine_config
 from iv_warmup import (
@@ -1124,33 +1130,6 @@ class ToolkitMinuteEngine:
                 })
         self._s1_shadow_candidates = []
 
-    def _write_s1_b5_candidate_panels(self, candidates_df, tag):
-        write_b5_candidate_panels(
-            candidates_df,
-            tag,
-            config=self.config,
-            spot_history=self._spot_history,
-            history_series=self._history_series,
-            output_dir=OUTPUT_DIR,
-            logger=logger,
-        )
-
-    def _write_s1_candidate_outputs(self, tag):
-        if not self._s1_candidate_universe_enabled():
-            return
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        candidates_df = pd.DataFrame(self.s1_candidate_records)
-        candidates_path = os.path.join(OUTPUT_DIR, f"s1_candidate_universe_{tag}.csv")
-        candidates_df.to_csv(candidates_path, index=False)
-        logger.info("S1 candidate universe: %s (%d rows)", candidates_path, len(candidates_df))
-        self._write_s1_b5_candidate_panels(candidates_df, tag)
-
-        if self.config.get('s1_candidate_universe_shadow_enabled', False):
-            outcomes_df = pd.DataFrame(self.s1_candidate_outcomes)
-            outcomes_path = os.path.join(OUTPUT_DIR, f"s1_candidate_outcomes_{tag}.csv")
-            outcomes_df.to_csv(outcomes_path, index=False)
-            logger.info("S1 candidate outcomes: %s (%d rows)", outcomes_path, len(outcomes_df))
-
     def _normalize_open_budget(self, budget):
         return normalize_open_budget(budget)
 
@@ -1359,8 +1338,7 @@ class ToolkitMinuteEngine:
                 logger.info("  [%d/%d] %s NAV=%.0f 持仓=%d %.0fs",
                             di, len(dates), date_str, nav, len(self.positions), elapsed)
                 if self.nav_records:
-                    pd.DataFrame(self.nav_records).to_csv(
-                        os.path.join(OUTPUT_DIR, f"nav_{tag}.csv"), index=False)
+                    write_nav_progress(self.nav_records, tag, output_dir=OUTPUT_DIR)
 
                 # 批量预加载接下来的N天（日频聚合，不拉分钟明细）
                 upcoming = dates[di:di + batch_size]
@@ -1452,8 +1430,8 @@ class ToolkitMinuteEngine:
             self._output_results(nav_df, orders_df, stats, tag, total_elapsed)
         else:
             logger.warning("无NAV数据，跳过输出")
-            orders_df.to_csv(os.path.join(OUTPUT_DIR, f"orders_{tag}.csv"), index=False)
-            self._write_s1_candidate_outputs(tag)
+            write_orders_only(orders_df, tag, output_dir=OUTPUT_DIR)
+            self._write_s1_candidate_outputs_bundle(tag)
 
         # 打印结果
         print("\n=== 回测结果 ===")
@@ -4783,114 +4761,50 @@ class ToolkitMinuteEngine:
         snapshot['s1_ledet_margin_score'] = margin_score
         return snapshot
 
-    def _record_daily_diagnostics(self, date_str, nav):
-        if not self.config.get('portfolio_diagnostics_enabled', True):
-            return
+    def _append_daily_diagnostics(self, date_str, nav):
         budget = self._current_open_budget or self._get_effective_open_budget()
-        self.diagnostics_records.extend(
-            build_portfolio_diagnostics_records(
-                positions=self.positions,
-                config=self.config,
-                budget=budget,
-                date_str=date_str,
-                nav=nav,
-                current_vol_regimes=self._current_vol_regimes,
-                current_portfolio_regime=self._current_portfolio_regime,
-                normalize_product_key=self._normalize_product_key,
-                get_product_bucket=self._get_product_bucket,
-                get_product_corr_group=self._get_product_corr_group,
-            )
+        append_daily_diagnostics_records(
+            self.diagnostics_records,
+            positions=self.positions,
+            config=self.config,
+            budget=budget,
+            date_str=date_str,
+            nav=nav,
+            current_vol_regimes=self._current_vol_regimes,
+            current_portfolio_regime=self._current_portfolio_regime,
+            normalize_product_key=self._normalize_product_key,
+            get_product_bucket=self._get_product_bucket,
+            get_product_corr_group=self._get_product_corr_group,
         )
 
     def _update_nav_snapshot(self, date_str):
-        """记录每日NAV"""
+        """Record one daily NAV snapshot."""
         holding_pnl = sum(p.daily_pnl() for p in self.positions)
-        realized_pnl = self._day_realized['pnl']
-        realized_fee = self._day_realized['fee']
-        day_pnl = holding_pnl + realized_pnl - realized_fee
-
-        s1_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == 'S1') + self._day_realized['s1']
-        s3_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == 'S3') + self._day_realized['s3']
-        s4_pnl = sum(p.daily_pnl() for p in self.positions if p.strat == 'S4') + self._day_realized['s4']
-
-        # PnL归因
-        attr = dict(self._day_attr_realized)
-        for p in self.positions:
-            pa = p.pnl_attribution()
-            for k in attr:
-                attr[k] += pa[k]
-
-        cum_pnl = (self.nav_records[-1]['cum_pnl'] if self.nav_records else 0) + day_pnl
-        nav = self.capital + cum_pnl
-        margin = sum(p.cur_margin() for p in self.positions if p.role == 'sell')
-
-        cd = sum(p.cash_delta() for p in self.positions)
-        cv = sum(p.cash_vega() for p in self.positions)
-        cg = sum(p.cash_gamma() for p in self.positions)
+        day_pnl = holding_pnl + self._day_realized['pnl'] - self._day_realized['fee']
+        cum_pnl = (self.nav_records[-1]['cum_pnl'] if self.nav_records else 0.0) + day_pnl
+        nav_for_shape = self.capital + cum_pnl
         budget = self._current_open_budget or self._get_effective_open_budget()
-        regime_counts = self._current_vol_regime_counts or Counter()
         stress_state = self._get_open_stress_loss_state()
-        structural_low_count = sum(
-            1 for state in self._current_iv_state.values()
-            if state.get('is_structural_low_iv')
+        s1_shape = self._s1_sell_shape_snapshot(max(nav_for_shape, 1.0))
+        nav_record, nav = build_nav_snapshot_record(
+            date_str,
+            positions=self.positions,
+            nav_records=self.nav_records,
+            capital=self.capital,
+            day_realized=self._day_realized,
+            day_attr_realized=self._day_attr_realized,
+            current_open_budget=self._current_open_budget,
+            effective_open_budget=budget,
+            current_vol_regime_counts=self._current_vol_regime_counts,
+            current_iv_state=self._current_iv_state,
+            current_portfolio_regime=self._current_portfolio_regime,
+            stress_state=stress_state,
+            s1_shape=s1_shape,
+            config=self.config,
         )
-        self._record_daily_diagnostics(date_str, nav)
-        s1_shape = self._s1_sell_shape_snapshot(nav)
-
-        nav_record = {
-            'date': date_str, 'nav': nav, 'cum_pnl': cum_pnl,
-            's1_pnl': s1_pnl, 's3_pnl': s3_pnl, 's4_pnl': s4_pnl,
-            'fee': realized_fee, 'margin_used': margin,
-            'cash_delta': cd / max(nav, 1), 'cash_vega': cv / max(nav, 1),
-            'cash_gamma': cg / max(nav, 1),
-            'delta_pnl': attr['delta_pnl'], 'gamma_pnl': attr['gamma_pnl'],
-            'theta_pnl': attr['theta_pnl'], 'vega_pnl': attr['vega_pnl'],
-            'residual_pnl': attr['residual_pnl'],
-            'portfolio_vol_regime': self._current_portfolio_regime,
-            'effective_margin_cap': budget.get('margin_cap', np.nan),
-            'effective_s1_margin_cap': budget.get('s1_margin_cap', np.nan),
-            'effective_s3_margin_cap': budget.get('s3_margin_cap', np.nan),
-            'effective_product_margin_cap': budget.get('product_margin_cap', np.nan),
-            'effective_product_side_margin_cap': budget.get('product_side_margin_cap', np.nan),
-            'effective_bucket_margin_cap': budget.get('bucket_margin_cap', np.nan),
-            'effective_corr_group_margin_cap': budget.get('corr_group_margin_cap', np.nan),
-            'effective_bucket_max_active_products': int(
-                self.config.get('portfolio_bucket_max_active_products', 3) or 0
-            ),
-            'effective_corr_group_max_active_products': int(
-                self.config.get('portfolio_corr_group_max_active_products', 2) or 0
-            ),
-            'effective_stress_loss_cap': budget.get('portfolio_stress_loss_cap', np.nan),
-            'effective_bucket_stress_loss_cap': budget.get('portfolio_bucket_stress_loss_cap', np.nan),
-            'effective_product_side_stress_loss_cap': budget.get('product_side_stress_loss_cap', np.nan),
-            'effective_corr_group_stress_loss_cap': budget.get('corr_group_stress_loss_cap', np.nan),
-            'effective_contract_stress_loss_cap': budget.get('contract_stress_loss_cap', np.nan),
-            'effective_contract_lot_cap': int(self.config.get('portfolio_contract_lot_cap', 0) or 0),
-            'effective_s1_stress_budget_pct': budget.get('s1_stress_loss_budget_pct', np.nan),
-            'open_budget_risk_scale': budget.get('risk_scale', np.nan),
-            'open_budget_brake_reason': budget.get('brake_reason', ''),
-            'current_drawdown': budget.get('current_drawdown', np.nan),
-            'recent_stop_count': budget.get('recent_stop_count', np.nan),
-            'stress_loss_used': stress_state.get('stress_loss', 0.0) / max(nav, 1),
-            'vol_falling_products': regime_counts.get('falling_vol_carry', 0),
-            'vol_low_products': regime_counts.get('low_stable_vol', 0),
-            'vol_normal_products': regime_counts.get('normal_vol', 0),
-            'vol_high_products': regime_counts.get('high_rising_vol', 0),
-            'vol_post_stop_products': regime_counts.get('post_stop_cooldown', 0),
-            'structural_low_iv_products': structural_low_count,
-            'n_positions': len(self.positions),
-        }
-        nav_record.update(s1_shape)
+        self._append_daily_diagnostics(date_str, nav)
         self.nav_records.append(nav_record)
-
-        for p in self.positions:
-            p.prev_price = p.cur_price
-            p.prev_spot = p.cur_spot
-            p.prev_iv = p.cur_iv
-            p.prev_delta = p.cur_delta
-            p.prev_gamma = p.cur_gamma
-            p.prev_vega = p.cur_vega
-            p.prev_theta = p.cur_theta
+        roll_position_previous_marks(self.positions)
 
     # ── 输出 ─────────────────────────────────────────────────────────────────
 
@@ -4906,7 +4820,19 @@ class ToolkitMinuteEngine:
             output_dir=OUTPUT_DIR,
             logger=logger,
         )
-        self._write_s1_candidate_outputs(tag)
+        self._write_s1_candidate_outputs_bundle(tag)
+
+    def _write_s1_candidate_outputs_bundle(self, tag):
+        write_s1_candidate_outputs(
+            self.s1_candidate_records,
+            self.s1_candidate_outcomes,
+            tag,
+            config=self.config,
+            spot_history=self._spot_history,
+            history_series=self._history_series,
+            output_dir=OUTPUT_DIR,
+            logger=logger,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

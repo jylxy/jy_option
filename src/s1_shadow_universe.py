@@ -603,3 +603,47 @@ def write_b5_candidate_panels(
     portfolio_path = os.path.join(output_dir, f"s1_b5_portfolio_panel_{tag}.csv")
     portfolio_panel.to_csv(portfolio_path, index=False)
     logger.info("S1 B5 portfolio panel: %s (%d rows)", portfolio_path, len(portfolio_panel))
+
+
+def write_s1_candidate_outputs(
+    candidate_records,
+    candidate_outcomes,
+    tag: str,
+    *,
+    config: dict,
+    spot_history,
+    history_series,
+    output_dir: str,
+    logger,
+) -> dict:
+    """Write S1 candidate universe, B5 panels, and optional shadow outcomes."""
+    if not config.get('s1_candidate_universe_dump_enabled', False):
+        return {}
+
+    os.makedirs(output_dir, exist_ok=True)
+    paths = {}
+
+    candidates_df = pd.DataFrame(candidate_records)
+    candidates_path = os.path.join(output_dir, f"s1_candidate_universe_{tag}.csv")
+    candidates_df.to_csv(candidates_path, index=False)
+    paths['candidates'] = candidates_path
+    logger.info("S1 candidate universe: %s (%d rows)", candidates_path, len(candidates_df))
+
+    write_b5_candidate_panels(
+        candidates_df,
+        tag,
+        config=config,
+        spot_history=spot_history,
+        history_series=history_series,
+        output_dir=output_dir,
+        logger=logger,
+    )
+
+    if config.get('s1_candidate_universe_shadow_enabled', False):
+        outcomes_df = pd.DataFrame(candidate_outcomes)
+        outcomes_path = os.path.join(output_dir, f"s1_candidate_outcomes_{tag}.csv")
+        outcomes_df.to_csv(outcomes_path, index=False)
+        paths['outcomes'] = outcomes_path
+        logger.info("S1 candidate outcomes: %s (%d rows)", outcomes_path, len(outcomes_df))
+
+    return paths

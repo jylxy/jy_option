@@ -12,7 +12,13 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from s1_shadow_universe import add_b5_shadow_fields, effective_count, hhi, write_b5_candidate_panels  # noqa: E402
+from s1_shadow_universe import (  # noqa: E402
+    add_b5_shadow_fields,
+    effective_count,
+    hhi,
+    write_b5_candidate_panels,
+    write_s1_candidate_outputs,
+)
 
 
 class S1ShadowUniverseTest(unittest.TestCase):
@@ -76,6 +82,28 @@ class S1ShadowUniverseTest(unittest.TestCase):
             portfolio = pd.read_csv(os.path.join(tmp, "s1_b5_portfolio_panel_unit.csv"))
             self.assertEqual(int(portfolio.loc[0, "active_product_count"]), 1)
             self.assertAlmostEqual(float(portfolio.loc[0, "top1_product_stress_share"]), 1.0)
+
+    def test_write_s1_candidate_outputs_writes_universe_and_outcomes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = write_s1_candidate_outputs(
+                [{"candidate_id": 1, "signal_date": "2025-05-06", "product": "CU"}],
+                [{"candidate_id": 1, "reason": "shadow_expiry"}],
+                "unit",
+                config={
+                    "s1_candidate_universe_dump_enabled": True,
+                    "s1_candidate_universe_shadow_enabled": True,
+                    "s1_b5_shadow_factor_extension_enabled": False,
+                },
+                spot_history={},
+                history_series=lambda *_args: pd.Series(dtype=float),
+                output_dir=tmp,
+                logger=logging.getLogger("test_s1_shadow_universe"),
+            )
+
+            self.assertTrue(os.path.exists(paths["candidates"]))
+            self.assertTrue(os.path.exists(paths["outcomes"]))
+            self.assertEqual(len(pd.read_csv(paths["candidates"])), 1)
+            self.assertEqual(len(pd.read_csv(paths["outcomes"])), 1)
 
     def test_add_b5_shadow_fields_uses_vectorized_loss_metrics(self):
         candidates = pd.DataFrame([
