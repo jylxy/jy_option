@@ -1,5 +1,5 @@
 """
-合并分区小文件 — 每个日期目录下的多个 parquet 文件合并为 1 个
+Archived data-maintenance script: 合并分区小文件 — 每个日期目录下的多个 parquet 文件合并为 1 个
 
 DuckDB PARTITION_BY 为每个原始 row_group 生成独立文件，
 导致每个日期目录下有几百个 2-10KB 小文件。

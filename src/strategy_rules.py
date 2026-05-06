@@ -101,6 +101,9 @@ DEFAULT_PARAMS = {
     "take_profit_enabled": False,
     "premium_stop_multiple": 2.50,
     "premium_stop_requires_daily_iv_non_decrease": True,
+    "s1_stop_close_scope": "group",
+    "s1_layered_stop_enabled": False,
+    "s1_layered_stop_levels": [],
     "cooldown_days_after_stop": 1,
     "cooldown_repeat_lookback_days": 20,
     "cooldown_repeat_extra_days": 2,
@@ -640,9 +643,15 @@ def _add_s1_premium_quality_fields(frame, option_type, mult, roundtrip_fee,
         price_frame["exchange"] = exchange
     if "product" not in price_frame.columns:
         price_frame["product"] = product
-    base_model_price = calc_option_price_batch(price_frame)
-    iv5_price = calc_option_price_batch(price_frame, iv_shift=0.05)
-    iv10_price = calc_option_price_batch(price_frame, iv_shift=0.10)
+    required_price_cols = {"spot_close", "strike", "dte", "implied_vol", "option_type"}
+    if required_price_cols.issubset(set(price_frame.columns)):
+        base_model_price = calc_option_price_batch(price_frame)
+        iv5_price = calc_option_price_batch(price_frame, iv_shift=0.05)
+        iv10_price = calc_option_price_batch(price_frame, iv_shift=0.10)
+    else:
+        base_model_price = option_price
+        iv5_price = pd.Series(np.nan, index=c.index)
+        iv10_price = pd.Series(np.nan, index=c.index)
     vega_cash = _numeric_column(c, "vega", 0.0).abs() * mult
     iv5_loss = ((iv5_price - base_model_price).clip(lower=0.0) * mult).replace([np.inf, -np.inf], np.nan)
     iv10_loss = ((iv10_price - base_model_price).clip(lower=0.0) * mult).replace([np.inf, -np.inf], np.nan)

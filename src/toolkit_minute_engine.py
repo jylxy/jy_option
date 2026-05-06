@@ -16,6 +16,7 @@ import sys
 import time
 import logging
 import argparse
+import re
 from datetime import datetime
 from collections import Counter, defaultdict
 
@@ -73,6 +74,29 @@ from product_lifecycle import (
 )
 from position_model import Position
 from execution_model import apply_execution_slippage
+from open_execution import (
+    build_open_execution_context,
+    build_open_order_record,
+    estimate_volume_weighted_close,
+    scale_deferred_open_item,
+    split_open_quantity,
+)
+from intraday_execution import (
+    build_intraday_price_context,
+    confirm_intraday_stop_price,
+    index_intraday_positions,
+    intraday_stop_required_volume,
+    intraday_stop_threshold,
+    is_intraday_stop_price_illiquid,
+    prefilter_intraday_exit_codes_by_daily_high,
+    resolve_stop_execution_price,
+)
+from stop_policy import (
+    parse_s1_layered_stop_levels,
+    s1_layer_level_key,
+    select_s1_stop_scope_positions,
+)
+from s1_pending_open import build_s1_sell_pending_item
 from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
@@ -123,6 +147,7 @@ class ToolkitMinuteEngine:
         self._reentry_plans = {}
         self._stop_history = defaultdict(list)
         self._stop_side_history = defaultdict(list)
+        self._layered_stop_done = defaultdict(set)
         self._product_first_trade_dates = {}
         self._product_like_sql_cache = {}
         self._warmup_contract_sql_cache = {}
@@ -386,6 +411,18 @@ class ToolkitMinuteEngine:
             product_iv_pcts,
             self._iv_history,
         )
+
+    def _premium_stop_hit(self, pos, multiple, product_iv_pcts=None):
+        multiple = float(multiple or 0.0)
+        if multiple <= 0 or pos.cur_price < pos.open_price * multiple:
+            return False
+        require_daily_iv = bool(self.config.get("premium_stop_requires_daily_iv_non_decrease", True))
+        if not require_daily_iv:
+            return True
+        product_iv_pcts = product_iv_pcts or {}
+        if not product_iv_pcts or pos.product not in product_iv_pcts:
+            return True
+        return vol_rules.product_iv_not_falling(self._iv_history, pos.product)
 
     def _is_reentry_blocked(self, strat, product, opt_type, date_str):
         plan = self._reentry_plans.get(self._reentry_key(strat, product, opt_type))
@@ -2315,6 +2352,120 @@ class ToolkitMinuteEngine:
 
     # ── Phase 0: T+1 执行 ────────────────────────────────────────────────────
 
+    def _pending_open_execution_risk_ok(self, item, code, actual_n, price, nav, date_str):
+        """Re-check execution-day margin and portfolio limits before opening."""
+        if item['role'] != 'sell':
+            return True
+        strat = item['strat']
+        exec_budget = self._execution_budget_for_item(item)
+        total_m = self._get_open_sell_margin_total(include_pending=False)
+        strat_m = self._get_open_sell_margin_total(strat, include_pending=False)
+        new_m = estimate_margin(
+            item['spot'], item['strike'], item['opt_type'],
+            price, item['mult'], item['mr'], 0.5,
+            exchange=item['exchange'], product=item.get('product')
+        ) * actual_n
+        cap_key = f"{strat.lower()}_margin_cap"
+        effective_strategy_cap = exec_budget.get(cap_key, self.config.get(cap_key, 0.25))
+        if not port_risk.check_margin_ok(
+            total_m, strat_m, new_m, nav,
+            exec_budget.get('margin_cap', self.config.get('margin_cap', 0.50)),
+            effective_strategy_cap,
+        ):
+            return False
+        item_n = float(item.get('n', 0) or 0)
+        exposure_scale = actual_n / item_n if item_n > 0 else 0.0
+        new_cash_vega = float(item.get('cash_vega', 0.0) or 0.0) * exposure_scale
+        new_cash_gamma = float(item.get('cash_gamma', 0.0) or 0.0) * exposure_scale
+        new_stress_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0) * actual_n
+        return self._passes_portfolio_construction(
+            item.get('product', ''), nav, new_m, date_str=date_str,
+            new_cash_vega=new_cash_vega,
+            new_cash_gamma=new_cash_gamma,
+            new_stress_loss=new_stress_loss,
+            budget=exec_budget,
+            include_pending=False,
+            option_type=item.get('opt_type'),
+            code=code,
+            new_lots=actual_n,
+        )
+
+    def _build_position_from_pending_open(
+        self,
+        item,
+        code,
+        actual_n,
+        price,
+        raw_execution_price,
+        execution_slippage,
+        date_str,
+    ):
+        """Create a Position and attach entry metadata for a filled open."""
+        pos = Position(
+            item['strat'], item['product'], code, item['opt_type'],
+            item['strike'], price, actual_n, date_str,
+            item['mult'], item['expiry'], item['mr'], item['role'],
+            spot=item['spot'], exchange=item['exchange'],
+            group_id=item.get('group_id', ''),
+            underlying_code=item.get('underlying_code', ''),
+        )
+        open_fee_per_contract = self._safe_float(
+            item.get('open_fee_per_contract', np.nan),
+            self._option_fee_per_contract(
+                item.get('product'),
+                item.get('opt_type'),
+                action='open',
+                default=self.config.get('fee', 0.0),
+            ),
+        )
+        close_fee_per_contract = self._safe_float(
+            item.get('close_fee_per_contract', np.nan),
+            self._option_fee_per_contract(
+                item.get('product'),
+                item.get('opt_type'),
+                action='close',
+                default=self.config.get('fee', 0.0),
+            ),
+        )
+        roundtrip_fee_per_contract = open_fee_per_contract + close_fee_per_contract
+        item['open_fee_per_contract'] = open_fee_per_contract
+        item['close_fee_per_contract'] = close_fee_per_contract
+        item['roundtrip_fee_per_contract'] = roundtrip_fee_per_contract
+        pos.entry_meta = self._entry_meta_from_item(item)
+        slippage_cash = float(execution_slippage) * float(item['mult']) * float(actual_n)
+        pos.entry_meta.update({
+            'open_raw_execution_price': raw_execution_price,
+            'open_execution_slippage': execution_slippage,
+            'open_execution_slippage_cash': slippage_cash,
+        })
+        one_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0)
+        if one_loss > 0:
+            pos.stress_loss = one_loss * actual_n
+        self._set_open_greeks_for_attribution(pos, date_str)
+        return (
+            pos,
+            open_fee_per_contract,
+            close_fee_per_contract,
+            roundtrip_fee_per_contract,
+            slippage_cash,
+        )
+
+    @staticmethod
+    def _trim_s1_open_candidates(candidates, *, baseline_mode, split_enabled,
+                                 max_candidates, max_delta_gap):
+        if candidates is None or candidates.empty:
+            return candidates
+        if baseline_mode:
+            return candidates.head(max_candidates) if max_candidates > 0 else candidates
+        if split_enabled and max_candidates > 1:
+            trimmed = candidates
+            if max_delta_gap > 0 and 'abs_delta' in candidates.columns:
+                center_delta = float(candidates['abs_delta'].iloc[0])
+                delta = pd.to_numeric(candidates['abs_delta'], errors='coerce')
+                trimmed = candidates[(delta - center_delta).abs() <= max_delta_gap]
+            return trimmed.head(max_candidates)
+        return candidates.head(1)
+
     def _execute_pending_opens(self, minute_df, date_str):
         """
         执行昨日决策的待开仓，用T+1当日全日TWAP。
@@ -2326,32 +2477,14 @@ class ToolkitMinuteEngine:
         vol_limit_pct = self.config.get('volume_limit_pct', 0.10)  # 日成交量的10%
         executed = 0
         deferred = []  # 超量部分留到下一天
-        day_volume = {}
-        bars_by_code = {}
-        if not minute_df.empty:
-            vol_agg = minute_df.groupby('ths_code')['volume'].sum()
-            day_volume = vol_agg.to_dict()
-            bars_by_code = {
-                code: grp.sort_values('time')
-                for code, grp in minute_df.groupby('ths_code', sort=False)
-            }
+        open_context = build_open_execution_context(minute_df)
 
         for item in self._pending_opens:
             code = item['code']
-            code_bars = bars_by_code.get(code)
+            code_bars = open_context.bars_by_code.get(code)
 
             # 计算全天TWAP/VWAP（只用当日真实分钟成交）
-            if code_bars is not None and not code_bars.empty:
-                valid = code_bars[code_bars['volume'] > 0]
-                if not valid.empty:
-                    prices = valid['close'].values.astype(float)
-                    volumes = valid['volume'].values.astype(float)
-                    total_vol = volumes.sum()
-                    price = float(np.sum(prices * volumes) / total_vol) if total_vol > 0 else float(prices[-1])
-                else:
-                    price = 0.0
-            else:
-                price = 0.0
+            price = estimate_volume_weighted_close(code_bars)
 
             if price <= 0:
                 continue
@@ -2369,111 +2502,36 @@ class ToolkitMinuteEngine:
                 continue
 
             target_n = item['n']
-            today_vol = day_volume.get(code, 0)
-            max_today = max(1, int(today_vol * vol_limit_pct)) if today_vol > 0 else target_n
-            actual_n = min(target_n, max_today)
-            remaining_n = target_n - actual_n
+            today_vol = open_context.day_volume.get(code, 0)
+            actual_n, remaining_n = split_open_quantity(target_n, today_vol, vol_limit_pct)
 
             if remaining_n > 0:
                 # 超量部分留到下一天
-                deferred_item = dict(item)
-                deferred_item['n'] = remaining_n
-                original_n = float(item.get('n', 0) or 0)
-                scale = remaining_n / original_n if original_n > 0 else 0.0
-                one_loss = float(deferred_item.get('one_contract_stress_loss', 0.0) or 0.0)
-                if one_loss > 0:
-                    deferred_item['stress_loss'] = one_loss * remaining_n
-                if 'cash_vega' in deferred_item:
-                    deferred_item['cash_vega'] = float(deferred_item.get('cash_vega', 0.0) or 0.0) * scale
-                if 'cash_gamma' in deferred_item:
-                    deferred_item['cash_gamma'] = float(deferred_item.get('cash_gamma', 0.0) or 0.0) * scale
-                if 'margin' in deferred_item:
-                    deferred_item['margin'] = float(deferred_item.get('margin', 0.0) or 0.0) * scale
-                deferred.append(deferred_item)
+                deferred.append(scale_deferred_open_item(item, remaining_n))
                 logger.debug("  %s 分批建仓: %s 目标%d手, 今日%d手(当日成交%d), 剩余%d手",
                              date_str, code, target_n, actual_n, today_vol, remaining_n)
 
             if actual_n <= 0:
                 continue
 
-            # 保证金验证（卖腿）
-            if item['role'] == 'sell':
-                strat = item['strat']
-                exec_budget = self._execution_budget_for_item(item)
-                total_m = self._get_open_sell_margin_total(include_pending=False)
-                strat_m = self._get_open_sell_margin_total(strat, include_pending=False)
-                new_m = estimate_margin(
-                    item['spot'], item['strike'], item['opt_type'],
-                    price, item['mult'], item['mr'], 0.5,
-                    exchange=item['exchange'], product=item.get('product')
-                ) * actual_n
-                cap_key = f"{strat.lower()}_margin_cap"
-                effective_strategy_cap = exec_budget.get(cap_key, self.config.get(cap_key, 0.25))
-                if not port_risk.check_margin_ok(
-                    total_m, strat_m, new_m, nav,
-                    exec_budget.get('margin_cap', self.config.get('margin_cap', 0.50)),
-                    effective_strategy_cap,
-                ):
-                    continue
-                item_n = float(item.get('n', 0) or 0)
-                exposure_scale = actual_n / item_n if item_n > 0 else 0.0
-                new_cash_vega = float(item.get('cash_vega', 0.0) or 0.0) * exposure_scale
-                new_cash_gamma = float(item.get('cash_gamma', 0.0) or 0.0) * exposure_scale
-                new_stress_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0) * actual_n
-                if not self._passes_portfolio_construction(
-                    item.get('product', ''), nav, new_m, date_str=date_str,
-                    new_cash_vega=new_cash_vega,
-                    new_cash_gamma=new_cash_gamma,
-                    new_stress_loss=new_stress_loss,
-                    budget=exec_budget,
-                    include_pending=False,
-                    option_type=item.get('opt_type'),
-                    code=code,
-                    new_lots=actual_n,
-                ):
-                    continue
+            if not self._pending_open_execution_risk_ok(item, code, actual_n, price, nav, date_str):
+                continue
 
-            pos = Position(
-                item['strat'], item['product'], code, item['opt_type'],
-                item['strike'], price, actual_n, date_str,
-                item['mult'], item['expiry'], item['mr'], item['role'],
-                spot=item['spot'], exchange=item['exchange'],
-                group_id=item.get('group_id', ''),
-                underlying_code=item.get('underlying_code', ''),
+            (
+                pos,
+                open_fee_per_contract,
+                close_fee_per_contract,
+                roundtrip_fee_per_contract,
+                slippage_cash,
+            ) = self._build_position_from_pending_open(
+                item,
+                code,
+                actual_n,
+                price,
+                raw_execution_price,
+                execution_slippage,
+                date_str,
             )
-            open_fee_per_contract = self._safe_float(
-                item.get('open_fee_per_contract', np.nan),
-                self._option_fee_per_contract(
-                    item.get('product'),
-                    item.get('opt_type'),
-                    action='open',
-                    default=self.config.get('fee', 0.0),
-                ),
-            )
-            close_fee_per_contract = self._safe_float(
-                item.get('close_fee_per_contract', np.nan),
-                self._option_fee_per_contract(
-                    item.get('product'),
-                    item.get('opt_type'),
-                    action='close',
-                    default=self.config.get('fee', 0.0),
-                ),
-            )
-            roundtrip_fee_per_contract = open_fee_per_contract + close_fee_per_contract
-            item['open_fee_per_contract'] = open_fee_per_contract
-            item['close_fee_per_contract'] = close_fee_per_contract
-            item['roundtrip_fee_per_contract'] = roundtrip_fee_per_contract
-            pos.entry_meta = self._entry_meta_from_item(item)
-            slippage_cash = float(execution_slippage) * float(item['mult']) * float(actual_n)
-            pos.entry_meta.update({
-                'open_raw_execution_price': raw_execution_price,
-                'open_execution_slippage': execution_slippage,
-                'open_execution_slippage_cash': slippage_cash,
-            })
-            one_loss = float(item.get('one_contract_stress_loss', 0.0) or 0.0)
-            if one_loss > 0:
-                pos.stress_loss = one_loss * actual_n
-            self._set_open_greeks_for_attribution(pos, date_str)
             self.positions.append(pos)
             open_fee = open_fee_per_contract * actual_n
             self._day_realized['fee'] += open_fee
@@ -2484,178 +2542,24 @@ class ToolkitMinuteEngine:
                 else -gross_premium_cash - open_fee
             )
             open_margin = pos.cur_margin() if item['role'] == 'sell' else 0.0
-            ref_price = self._safe_float(item.get('ref_price', np.nan), np.nan)
-            price_drift = price / ref_price - 1.0 if np.isfinite(ref_price) and ref_price > 0 else np.nan
-            theta = self._safe_float(item.get('theta', np.nan), np.nan)
-            theta_cash = abs(theta) * float(item['mult']) * float(actual_n) if np.isfinite(theta) else np.nan
-            stress_loss = float(pos.stress_loss or 0.0)
-            exec_premium_stress = (
-                net_premium_cash / stress_loss
-                if item['role'] == 'sell' and stress_loss > 0
-                else np.nan
-            )
-            exec_theta_stress = (
-                theta_cash / stress_loss
-                if item['role'] == 'sell' and stress_loss > 0 and np.isfinite(theta_cash)
-                else np.nan
-            )
-            exec_premium_margin = (
-                net_premium_cash / open_margin
-                if item['role'] == 'sell' and open_margin > 0
-                else np.nan
-            )
-            self.orders.append({
-                'date': date_str, 'signal_date': item.get('signal_date', ''),
-                'action': f"open_{item['role']}",
-                'strategy': item['strat'], 'product': item['product'],
-                'code': code, 'option_type': item['opt_type'],
-                'strike': item['strike'], 'expiry': str(item['expiry'])[:10],
-                'price': round(price, 4), 'quantity': actual_n,
-                'raw_execution_price': round(raw_execution_price, 4),
-                'execution_slippage': round(execution_slippage, 6),
-                'execution_slippage_cash': round(slippage_cash, 2),
-                'fee': round(open_fee, 2),
-                'fee_per_contract': open_fee_per_contract,
-                'fee_action': 'open',
-                'open_fee_per_contract': open_fee_per_contract,
-                'close_fee_per_contract': close_fee_per_contract,
-                'roundtrip_fee_per_contract': roundtrip_fee_per_contract,
-                'pnl': 0,
-                'stress_loss': round(pos.stress_loss, 2),
-                'open_margin': round(open_margin, 2),
-                'one_contract_margin': item.get('one_contract_margin', np.nan),
-                'gross_premium_cash': round(gross_premium_cash, 2),
-                'net_premium_cash': round(net_premium_cash, 2),
-                'signal_ref_price': ref_price,
-                'execution_price_drift': price_drift,
-                'premium_stress': exec_premium_stress,
-                'theta_stress': exec_theta_stress,
-                'premium_margin': exec_premium_margin,
-                'signal_premium_stress': item.get('premium_stress', np.nan),
-                'signal_theta_stress': item.get('theta_stress', np.nan),
-                'signal_premium_margin': item.get('premium_margin', np.nan),
-                'premium_yield_margin': item.get('premium_yield_margin', np.nan),
-                'premium_yield_notional': item.get('premium_yield_notional', np.nan),
-                'rv_ref': item.get('rv_ref', np.nan),
-                'iv_rv_spread_candidate': item.get('iv_rv_spread_candidate', np.nan),
-                'iv_rv_ratio_candidate': item.get('iv_rv_ratio_candidate', np.nan),
-                'variance_carry': item.get('variance_carry', np.nan),
-                'breakeven_price': item.get('breakeven_price', np.nan),
-                'breakeven_cushion_abs': item.get('breakeven_cushion_abs', np.nan),
-                'breakeven_cushion_iv': item.get('breakeven_cushion_iv', np.nan),
-                'breakeven_cushion_rv': item.get('breakeven_cushion_rv', np.nan),
-                'iv_shock_loss_5_cash': item.get('iv_shock_loss_5_cash', np.nan),
-                'iv_shock_loss_10_cash': item.get('iv_shock_loss_10_cash', np.nan),
-                'premium_to_iv5_loss': item.get('premium_to_iv5_loss', np.nan),
-                'premium_to_iv10_loss': item.get('premium_to_iv10_loss', np.nan),
-                'premium_to_stress_loss': item.get('premium_to_stress_loss', np.nan),
-                'theta_vega_efficiency': item.get('theta_vega_efficiency', np.nan),
-                'gamma_rent_cash': item.get('gamma_rent_cash', np.nan),
-                'gamma_rent_penalty': item.get('gamma_rent_penalty', np.nan),
-                'fee_ratio': item.get('fee_ratio', np.nan),
-                'slippage_ratio': item.get('slippage_ratio', np.nan),
-                'friction_ratio': item.get('friction_ratio', np.nan),
-                'premium_quality_score': item.get('premium_quality_score', np.nan),
-                'premium_quality_rank_in_side': item.get('premium_quality_rank_in_side', np.nan),
-                'iv_rv_carry_score': item.get('iv_rv_carry_score', np.nan),
-                'breakeven_cushion_score': item.get('breakeven_cushion_score', np.nan),
-                'premium_to_iv_shock_score': item.get('premium_to_iv_shock_score', np.nan),
-                'premium_to_stress_loss_score': item.get('premium_to_stress_loss_score', np.nan),
-                'theta_vega_efficiency_score': item.get('theta_vega_efficiency_score', np.nan),
-                'cost_liquidity_score': item.get('cost_liquidity_score', np.nan),
-                'b3_forward_variance_pressure': item.get('b3_forward_variance_pressure', np.nan),
-                'b3_vol_of_vol_proxy': item.get('b3_vol_of_vol_proxy', np.nan),
-                'b3_vov_trend': item.get('b3_vov_trend', np.nan),
-                'b3_iv_shock_coverage': item.get('b3_iv_shock_coverage', np.nan),
-                'b3_joint_stress_coverage': item.get('b3_joint_stress_coverage', np.nan),
-                'b3_vomma_cash': item.get('b3_vomma_cash', np.nan),
-                'b3_vomma_loss_ratio': item.get('b3_vomma_loss_ratio', np.nan),
-                'b3_skew_steepening': item.get('b3_skew_steepening', np.nan),
-                'b3_clean_vega_score': item.get('b3_clean_vega_score', np.nan),
-                'b3_forward_variance_score': item.get('b3_forward_variance_score', np.nan),
-                'b3_vol_of_vol_score': item.get('b3_vol_of_vol_score', np.nan),
-                'b3_iv_shock_score': item.get('b3_iv_shock_score', np.nan),
-                'b3_joint_stress_score': item.get('b3_joint_stress_score', np.nan),
-                'b3_vomma_score': item.get('b3_vomma_score', np.nan),
-                'b3_skew_stability_score': item.get('b3_skew_stability_score', np.nan),
-                'b4_contract_score': item.get('b4_contract_score', np.nan),
-                'b4_product_side_score': item.get('b4_product_side_score', np.nan),
-                'b4_premium_to_iv10_score': item.get('b4_premium_to_iv10_score', np.nan),
-                'b4_premium_to_stress_score': item.get('b4_premium_to_stress_score', np.nan),
-                'b4_premium_yield_margin_score': item.get('b4_premium_yield_margin_score', np.nan),
-                'b4_gamma_rent_score': item.get('b4_gamma_rent_score', np.nan),
-                'b4_vomma_score': item.get('b4_vomma_score', np.nan),
-                'b4_breakeven_cushion_score': item.get('b4_breakeven_cushion_score', np.nan),
-                'b4_vol_of_vol_score': item.get('b4_vol_of_vol_score', np.nan),
-                'abs_delta': item.get('abs_delta', np.nan),
-                'delta': item.get('delta', np.nan),
-                'gamma': item.get('gamma', np.nan),
-                'vega': item.get('vega', np.nan),
-                'theta': item.get('theta', np.nan),
-                'volume': item.get('volume', np.nan),
-                'open_interest': item.get('open_interest', np.nan),
-                'moneyness': item.get('moneyness', np.nan),
-                'liquidity_score': item.get('liquidity_score', np.nan),
-                'vol_regime': item.get('vol_regime', ''),
-                'selection_score': item.get('selection_score', np.nan),
-                'selection_rank': item.get('selection_rank', np.nan),
-                'entry_atm_iv': item.get('entry_atm_iv', np.nan),
-                'entry_iv_pct': item.get('entry_iv_pct', np.nan),
-                'entry_iv_trend': item.get('entry_iv_trend', np.nan),
-                'entry_rv_trend': item.get('entry_rv_trend', np.nan),
-                'entry_iv_rv_spread': item.get('entry_iv_rv_spread', np.nan),
-                'entry_iv_rv_ratio': item.get('entry_iv_rv_ratio', np.nan),
-                'contract_iv': item.get('contract_iv', np.nan),
-                'contract_iv_change_1d': item.get('contract_iv_change_1d', np.nan),
-                'contract_iv_change_3d': item.get('contract_iv_change_3d', np.nan),
-                'contract_iv_change_5d': item.get('contract_iv_change_5d', np.nan),
-                'contract_iv_change_for_vega': item.get('contract_iv_change_for_vega', np.nan),
-                'contract_iv_skew_to_atm': item.get('contract_iv_skew_to_atm', np.nan),
-                'contract_skew_change_for_vega': item.get('contract_skew_change_for_vega', np.nan),
-                'contract_price_change_1d': item.get('contract_price_change_1d', np.nan),
-                'effective_margin_cap': item.get('effective_margin_cap', np.nan),
-                'effective_strategy_margin_cap': item.get('effective_strategy_margin_cap', np.nan),
-                'effective_product_margin_cap': item.get('effective_product_margin_cap', np.nan),
-                'effective_product_side_margin_cap': item.get('effective_product_side_margin_cap', np.nan),
-                'effective_bucket_margin_cap': item.get('effective_bucket_margin_cap', np.nan),
-                'effective_corr_group_margin_cap': item.get('effective_corr_group_margin_cap', np.nan),
-                'effective_stress_loss_cap': item.get('effective_stress_loss_cap', np.nan),
-                'effective_bucket_stress_loss_cap': item.get('effective_bucket_stress_loss_cap', np.nan),
-                'effective_product_side_stress_loss_cap': item.get('effective_product_side_stress_loss_cap', np.nan),
-                'effective_corr_group_stress_loss_cap': item.get('effective_corr_group_stress_loss_cap', np.nan),
-                'effective_contract_stress_loss_cap': item.get('effective_contract_stress_loss_cap', np.nan),
-                'open_budget_risk_scale': item.get('open_budget_risk_scale', np.nan),
-                'open_budget_brake_reason': item.get('open_budget_brake_reason', ''),
-                'trend_state': item.get('trend_state', ''),
-                'trend_score': item.get('trend_score', np.nan),
-                'trend_confidence': item.get('trend_confidence', np.nan),
-                'trend_range_position': item.get('trend_range_position', np.nan),
-                'trend_range_pressure': item.get('trend_range_pressure', ''),
-                'trend_role': item.get('trend_role', ''),
-                'side_score_mult': item.get('side_score_mult', np.nan),
-                'side_budget_mult': item.get('side_budget_mult', np.nan),
-                'side_delta_cap': item.get('side_delta_cap', np.nan),
-                'ladder_candidate_count': item.get('ladder_candidate_count', np.nan),
-                'ladder_delta_gap': item.get('ladder_delta_gap', np.nan),
-                'effective_s1_stress_max_qty': item.get('effective_s1_stress_max_qty', np.nan),
-                'b2_product_score': item.get('b2_product_score', np.nan),
-                'b2_product_equal_budget_pct': item.get('b2_product_equal_budget_pct', np.nan),
-                'b2_product_quality_budget_pct': item.get('b2_product_quality_budget_pct', np.nan),
-                'b2_product_final_budget_pct': item.get('b2_product_final_budget_pct', np.nan),
-                'b2_product_budget_mult': item.get('b2_product_budget_mult', np.nan),
-                'b3_product_side_score': item.get('b3_product_side_score', np.nan),
-                'b3_side_equal_budget_pct': item.get('b3_side_equal_budget_pct', np.nan),
-                'b3_side_quality_budget_pct': item.get('b3_side_quality_budget_pct', np.nan),
-                'b3_side_final_budget_pct': item.get('b3_side_final_budget_pct', np.nan),
-                'b3_side_budget_mult': item.get('b3_side_budget_mult', np.nan),
-                'b3_clean_vega_tilt_strength': item.get('b3_clean_vega_tilt_strength', np.nan),
-                'b4_side_equal_budget_pct': item.get('b4_side_equal_budget_pct', np.nan),
-                'b4_side_quality_budget_pct': item.get('b4_side_quality_budget_pct', np.nan),
-                'b4_side_final_budget_pct': item.get('b4_side_final_budget_pct', np.nan),
-                'b4_side_budget_mult': item.get('b4_side_budget_mult', np.nan),
-                'b4_product_tilt_strength': item.get('b4_product_tilt_strength', np.nan),
-                'b4_side_vov_penalty_mult': item.get('b4_side_vov_penalty_mult', np.nan),
-            })
+            self.orders.append(build_open_order_record(
+                date_str=date_str,
+                item=item,
+                code=code,
+                actual_n=actual_n,
+                price=price,
+                raw_execution_price=raw_execution_price,
+                execution_slippage=execution_slippage,
+                slippage_cash=slippage_cash,
+                open_fee=open_fee,
+                open_fee_per_contract=open_fee_per_contract,
+                close_fee_per_contract=close_fee_per_contract,
+                roundtrip_fee_per_contract=roundtrip_fee_per_contract,
+                pos=pos,
+                open_margin=open_margin,
+                gross_premium_cash=gross_premium_cash,
+                net_premium_cash=net_premium_cash,
+            ))
             executed += 1
 
         if executed:
@@ -2761,6 +2665,73 @@ class ToolkitMinuteEngine:
         pos.prev_gamma = pos.cur_gamma = float(greeks['gamma'])
         pos.prev_vega = pos.cur_vega = float(greeks['vega'])
         pos.prev_theta = pos.cur_theta = float(greeks['theta'])
+
+    def _s1_stop_scope_positions(self, trigger_pos, scope, multiple=0.0):
+        return select_s1_stop_scope_positions(
+            self.positions,
+            trigger_pos,
+            scope,
+            multiple=float(multiple or 0.0),
+        )
+
+    @staticmethod
+    def _s1_layer_level_key(level):
+        return s1_layer_level_key(level)
+
+    def _s1_layered_stop_levels(self):
+        return parse_s1_layered_stop_levels(self.config.get('s1_layered_stop_levels') or [])
+
+    def _close_s1_stop_scope(self, trigger_pos, date_str, reason, fee_per_hand,
+                             exec_time='', scope='group', multiple=0.0,
+                             action='close', ratio=1.0):
+        to_close = self._s1_stop_scope_positions(trigger_pos, scope, multiple=multiple)
+        if not to_close:
+            return False
+        action = str(action or 'close').lower()
+        if action == 'warn':
+            return True
+        qty_by_pos = None
+        if action == 'reduce':
+            qty_by_pos = {}
+            ratio = min(max(float(ratio or 0.0), 0.0), 1.0)
+            if ratio <= 0:
+                return True
+            for pos in to_close:
+                qty = int(np.ceil(float(pos.n) * ratio))
+                qty = min(max(qty, 1), int(pos.n))
+                qty_by_pos[pos] = qty
+        self._close_positions(
+            to_close,
+            date_str,
+            reason,
+            fee_per_hand,
+            exec_time=exec_time,
+            close_qty_by_pos=qty_by_pos,
+        )
+        return True
+
+    def _apply_s1_layered_premium_stop(self, pos, date_str, fee, product_iv_pcts=None, exec_time=''):
+        for level in self._s1_layered_stop_levels():
+            key = self._s1_layer_level_key(level)
+            if key in self._layered_stop_done[id(pos)]:
+                continue
+            multiple = float(level.get('multiple', 0.0) or 0.0)
+            if not self._premium_stop_hit(pos, multiple, product_iv_pcts):
+                continue
+            self._layered_stop_done[id(pos)].add(key)
+            reason = f"sl_{pos.strat.lower()}_{level.get('action', 'close')}_{int(round(multiple * 100))}"
+            return self._close_s1_stop_scope(
+                pos,
+                date_str,
+                reason,
+                fee,
+                exec_time=exec_time,
+                scope=level.get('scope', 'contract'),
+                multiple=multiple,
+                action=level.get('action', 'close'),
+                ratio=level.get('ratio', 1.0),
+            )
+        return False
 
     def _calc_product_iv_pcts(self, daily_df, date_str):
         """基于日频ATM IV更新历史分位，并生成低IV准入所需状态。"""
@@ -2916,27 +2887,35 @@ class ToolkitMinuteEngine:
         if check_tp:
             take_profit_enabled = bool(cfg.get('take_profit_enabled', False))
             premium_stop_multiple = float(cfg.get('premium_stop_multiple', 0.0) or 0.0)
-            closed_groups = set()
             for pos in list(self.positions):
                 if pos.role != 'sell' or pos not in self.positions:
                     continue
                 if not is_exit_eligible(pos):
                     continue
-                gid = pos.group_id
-                if gid and gid in closed_groups:
-                    continue
-                if premium_stop_multiple > 0 and self._should_trigger_premium_stop(pos, product_iv_pcts):
-                    self._close_group(pos, date_str, f'sl_{pos.strat.lower()}', fee, exec_time=exec_time)
-                    if gid:
-                        closed_groups.add(gid)
+                if cfg.get('s1_layered_stop_enabled', False) and pos.strat == 'S1':
+                    if self._apply_s1_layered_premium_stop(
+                        pos, date_str, fee, product_iv_pcts=product_iv_pcts, exec_time=exec_time
+                    ):
+                        continue
+                elif premium_stop_multiple > 0 and self._should_trigger_premium_stop(pos, product_iv_pcts):
+                    scope = cfg.get('s1_stop_close_scope', 'group') if pos.strat == 'S1' else 'group'
+                    self._close_s1_stop_scope(
+                        pos,
+                        date_str,
+                        f'sl_{pos.strat.lower()}',
+                        fee,
+                        exec_time=exec_time,
+                        scope=scope,
+                        multiple=premium_stop_multiple,
+                        action='close',
+                    )
                     continue
                 if take_profit_enabled:
+                    gid = pos.group_id
                     tp = cfg.get('s1_tp', 0.40) if pos.strat == 'S1' else cfg.get('s3_tp', 0.30)
                     tp_fee = self._position_roundtrip_fee_per_side(pos, default=fee)
                     if pos.profit_pct(tp_fee) >= tp and pos.dte > cfg.get('tp_min_dte', 5):
                         self._close_group(pos, date_str, f'tp_{pos.strat.lower()}', fee, exec_time=exec_time)
-                        if gid:
-                            closed_groups.add(gid)
 
         if check_expiry:
             for pos in list(self.positions):
@@ -2958,88 +2937,26 @@ class ToolkitMinuteEngine:
                     self._close_group(pos, date_str, 's4_dte_exit', fee, exec_time=exec_time)
 
     def _is_intraday_stop_price_illiquid(self, code, price, volume, pos_by_code, qty_by_code):
-        cfg = self.config
-        if not cfg.get('intraday_stop_liquidity_filter_enabled', True):
-            return False
-        multiple = float(cfg.get('premium_stop_multiple', 0.0) or 0.0)
-        if multiple <= 0 or price <= 0:
-            return False
-
-        positions = pos_by_code.get(code, [])
-        triggers_stop = any(
-            pos.role == 'sell' and pos.open_price > 0 and price >= pos.open_price * multiple
-            for pos in positions
+        return is_intraday_stop_price_illiquid(
+            self.config, code, price, volume, pos_by_code, qty_by_code
         )
-        if not triggers_stop:
-            return False
-
-        min_volume = float(cfg.get('intraday_stop_min_trade_volume', 3) or 0.0)
-        volume_ratio = float(cfg.get('intraday_stop_min_group_volume_ratio', 0.10) or 0.0)
-        group_qty = float(qty_by_code.get(code, 0) or 0.0)
-        required_volume = max(min_volume, np.ceil(group_qty * volume_ratio))
-        return float(volume or 0.0) < required_volume
 
     def _intraday_stop_threshold(self, code, pos_by_code):
-        multiple = float(self.config.get('premium_stop_multiple', 0.0) or 0.0)
-        if multiple <= 0:
-            return np.nan
-        thresholds = [
-            float(pos.open_price) * multiple
-            for pos in pos_by_code.get(code, [])
-            if pos.role == 'sell' and float(getattr(pos, 'open_price', 0.0) or 0.0) > 0
-        ]
-        return min(thresholds) if thresholds else np.nan
+        return intraday_stop_threshold(self.config, code, pos_by_code)
 
     def _intraday_stop_required_volume(self, code, qty_by_code):
-        min_volume = float(self.config.get('intraday_stop_min_trade_volume', 3) or 0.0)
-        volume_ratio = float(self.config.get('intraday_stop_min_group_volume_ratio', 0.10) or 0.0)
-        group_qty = float(qty_by_code.get(code, 0) or 0.0)
-        return max(min_volume, np.ceil(group_qty * volume_ratio))
+        return intraday_stop_required_volume(self.config, code, qty_by_code)
 
     def _prefilter_intraday_exit_codes_by_daily_high(self, date_str, exit_codes):
         """Skip minute stop scans when the daily high cannot reach any stop line."""
-        if not exit_codes or not self.config.get('intraday_stop_daily_high_prefilter_enabled', True):
-            return set(exit_codes or [])
-        if self.config.get('take_profit_enabled', False):
-            return set(exit_codes)
-
-        multiple = float(self.config.get('premium_stop_multiple', 0.0) or 0.0)
-        if multiple <= 0:
-            return set()
-
         high_map = self.loader.get_daily_option_high_map(date_str)
-        if not high_map:
-            return set(exit_codes)
-
-        code_set = set(exit_codes)
-        positions_by_group = defaultdict(list)
-        for pos in self.positions:
-            if not getattr(pos, 'code', None) or pos.code not in code_set:
-                continue
-            gid = getattr(pos, 'group_id', None) or pos.code
-            positions_by_group[gid].append(pos)
-
-        keep_codes = set()
-        for positions in positions_by_group.values():
-            group_codes = {pos.code for pos in positions if getattr(pos, 'code', None)}
-            group_may_stop = False
-            for pos in positions:
-                if pos.role != 'sell':
-                    continue
-                open_price = float(getattr(pos, 'open_price', 0.0) or 0.0)
-                if open_price <= 0:
-                    group_may_stop = True
-                    break
-                day_high = high_map.get(pos.code)
-                if day_high is None or day_high <= 0:
-                    group_may_stop = True
-                    break
-                if float(day_high) >= open_price * multiple:
-                    group_may_stop = True
-                    break
-            if group_may_stop:
-                keep_codes.update(group_codes)
-
+        code_set = set(exit_codes or [])
+        keep_codes = prefilter_intraday_exit_codes_by_daily_high(
+            config=self.config,
+            positions=self.positions,
+            high_map=high_map,
+            exit_codes=code_set,
+        )
         skipped_codes = code_set - keep_codes
         if skipped_codes:
             logger.debug(
@@ -3049,59 +2966,19 @@ class ToolkitMinuteEngine:
         return keep_codes
 
     def _confirm_intraday_stop_price(self, code, price, volume, tm, stop_pending, pos_by_code, qty_by_code):
-        threshold = self._intraday_stop_threshold(code, pos_by_code)
-        if not np.isfinite(threshold) or threshold <= 0 or price < threshold:
-            revert_ratio = float(self.config.get('intraday_stop_confirmation_revert_ratio', 0.98) or 0.98)
-            if np.isfinite(threshold) and threshold > 0 and price < threshold * revert_ratio:
-                stop_pending.pop(code, None)
-            return True
-
-        if self._is_intraday_stop_price_illiquid(code, price, volume, pos_by_code, qty_by_code):
-            # Keep it as a candidate only; a single thin print should not execute the stop.
-            pass
-
-        if not self.config.get('intraday_stop_confirmation_enabled', True):
-            return not self._is_intraday_stop_price_illiquid(code, price, volume, pos_by_code, qty_by_code)
-
-        now = pd.Timestamp(tm)
-        max_minutes = float(self.config.get('intraday_stop_confirmation_max_minutes', 30) or 0.0)
-        required_obs = max(1, int(self.config.get('intraday_stop_confirmation_observations', 2) or 1))
-        required_volume = self._intraday_stop_required_volume(code, qty_by_code)
-        cur_volume = float(volume or 0.0)
-
-        pending = stop_pending.get(code)
-        if pending:
-            age_minutes = (now - pending['first_time']).total_seconds() / 60.0
-            if max_minutes > 0 and age_minutes > max_minutes:
-                pending = None
-                stop_pending.pop(code, None)
-        if not pending:
-            stop_pending[code] = {
-                'first_time': now,
-                'observations': 1,
-                'cum_volume': max(cur_volume, 0.0),
-                'threshold': threshold,
-                'max_price': price,
-            }
-            return False
-
-        pending['observations'] += 1
-        pending['cum_volume'] += max(cur_volume, 0.0)
-        pending['threshold'] = min(float(pending.get('threshold', threshold)), threshold)
-        pending['max_price'] = max(float(pending.get('max_price', price)), price)
-
-        use_cum_volume = bool(self.config.get('intraday_stop_confirmation_use_cumulative_volume', True))
-        if use_cum_volume:
-            volume_ok = pending['cum_volume'] >= required_volume and cur_volume > 0
-        else:
-            volume_ok = cur_volume >= required_volume
-        if pending['observations'] >= required_obs and volume_ok:
-            stop_pending.pop(code, None)
-            return True
-        return False
+        return confirm_intraday_stop_price(
+            config=self.config,
+            code=code,
+            price=price,
+            volume=volume,
+            tm=tm,
+            stop_pending=stop_pending,
+            positions_by_code=pos_by_code,
+            quantity_by_code=qty_by_code,
+        )
 
     def _process_intraday_exits(self, minute_df, date_str):
-        """盘中逐分钟监控止盈和Greeks超限，触发即按该分钟close成交。"""
+        """盘中逐分钟监控止损；默认按触发分钟 close，可配置为下一分钟 high 压力成交。"""
         if minute_df.empty or not self.positions:
             return False
 
@@ -3122,27 +2999,42 @@ class ToolkitMinuteEngine:
             if dte >= 0:
                 pos.dte = dte
 
-        pos_by_code = defaultdict(list)
-        for pos in eligible_positions:
-            pos_by_code[pos.code].append(pos)
-        qty_by_code = {
-            code: sum(int(getattr(pos, 'n', 0) or 0) for pos in positions)
-            for code, positions in pos_by_code.items()
-        }
-
-        pos_by_underlying = defaultdict(list)
-        for pos in eligible_positions:
-            if pos.underlying_code:
-                pos_by_underlying[pos.underlying_code].append(pos)
-
-        price_df = price_df.sort_values(['time', 'ths_code'])
-        price_groups = {tm: grp for tm, grp in price_df.groupby('time')}
-        time_points = sorted(price_groups.keys())
-        if not time_points:
+        position_index = index_intraday_positions(eligible_positions)
+        price_context = build_intraday_price_context(
+            price_df,
+            execution_mode=self.config.get('intraday_stop_execution_price_mode', 'current_close'),
+        )
+        if not price_context.time_points:
             return False
 
+        def stop_execution_price(code, tm, fallback_price):
+            return resolve_stop_execution_price(
+                mode=price_context.stop_execution_mode,
+                code=code,
+                tm=tm,
+                fallback_price=fallback_price,
+                time_points=price_context.time_points,
+                time_index=price_context.time_index,
+                next_price_maps=price_context.next_price_maps,
+            )
+
+        def apply_scope_stop_execution_price(trigger_pos, tm, trigger_price):
+            if price_context.stop_execution_mode != 'next_minute_high':
+                return
+            scope = (
+                self.config.get('s1_stop_close_scope', 'group')
+                if trigger_pos.strat == 'S1'
+                else 'group'
+            )
+            multiple = float(self.config.get('premium_stop_multiple', 0.0) or 0.0)
+            for pos in self._s1_stop_scope_positions(trigger_pos, scope, multiple=multiple):
+                fallback = self._safe_float(getattr(pos, 'cur_price', np.nan), np.nan)
+                if not np.isfinite(fallback) or fallback <= 0:
+                    fallback = trigger_price
+                pos.cur_price = stop_execution_price(pos.code, tm, fallback)
+
         monitor_times = self._sample_intraday_times(
-            time_points,
+            price_context.time_points,
             self.config.get('intraday_risk_interval', 15),
         )
         greek_refresh_interval = max(
@@ -3152,13 +3044,13 @@ class ToolkitMinuteEngine:
                 self.config.get('intraday_risk_interval', 15),
             ) or 15),
         )
-        greek_refresh_times = set(self._sample_intraday_times(time_points, greek_refresh_interval))
-        greek_refresh_times.add(time_points[-1])
+        greek_refresh_times = set(self._sample_intraday_times(price_context.time_points, greek_refresh_interval))
+        greek_refresh_times.add(price_context.time_points[-1])
         spot_groups = {}
         if self.config.get('intraday_refresh_spot_greeks_for_attribution', True):
             spot_df = self.loader.load_spot_day_minute(
                 date_str,
-                list(pos_by_underlying),
+                list(position_index.positions_by_underlying),
                 time_list=greek_refresh_times,
             )
             if not spot_df.empty:
@@ -3166,39 +3058,70 @@ class ToolkitMinuteEngine:
                 spot_groups = {tm: grp for tm, grp in spot_df.groupby('time')}
         stop_pending = {}
         if self.config.get('intraday_stop_confirmation_use_full_minutes', True):
-            monitor_times = list(time_points)
+            monitor_times = list(price_context.time_points)
+        take_profit_enabled = bool(self.config.get('take_profit_enabled', False))
+        closed_any = False
         for tm in monitor_times:
             spot_grp = spot_groups.get(tm)
             if spot_grp is not None:
                 for row in spot_grp.itertuples(index=False):
-                    for pos in pos_by_underlying.get(row.underlying_code, []):
+                    for pos in position_index.positions_by_underlying.get(row.underlying_code, []):
                         pos.cur_spot = float(row.spot)
 
-            grp = price_groups.get(tm)
+            grp = price_context.price_groups.get(tm)
+            confirmed_stop_this_minute = False
             if grp is not None:
                 for row in grp.itertuples(index=False):
                     code = row.ths_code
                     price = float(row.close)
                     volume = float(getattr(row, 'volume', 0.0) or 0.0)
+                    threshold = self._intraday_stop_threshold(code, position_index.positions_by_code)
+                    stop_candidate = np.isfinite(threshold) and threshold > 0 and price >= threshold
                     if not self._confirm_intraday_stop_price(
-                        code, price, volume, tm, stop_pending, pos_by_code, qty_by_code
+                        code,
+                        price,
+                        volume,
+                        tm,
+                        stop_pending,
+                        position_index.positions_by_code,
+                        position_index.quantity_by_code,
                     ):
                         continue
-                    for pos in pos_by_code.get(code, []):
-                        pos.cur_price = price
+                    if not (stop_candidate or take_profit_enabled):
+                        continue
+                    confirmed_stop_this_minute = confirmed_stop_this_minute or stop_candidate
+                    execution_price = stop_execution_price(code, tm, price)
+                    for pos in position_index.positions_by_code.get(code, []):
+                        pos.cur_price = execution_price
+                        apply_scope_stop_execution_price(pos, tm, execution_price)
+
+            if not (take_profit_enabled or confirmed_stop_this_minute):
+                continue
 
             if self.config.get('intraday_refresh_spot_greeks_for_attribution', True) and tm in greek_refresh_times:
                 self._refresh_position_greeks()
 
+            before_positions = len(self.positions)
+            before_qty = sum(int(getattr(pos, 'n', 0) or 0) for pos in self.positions)
+            before_realized_pnl = float(self._day_realized.get('pnl', 0.0) or 0.0)
+            before_realized_fee = float(self._day_realized.get('fee', 0.0) or 0.0)
             self._apply_exit_rules(
                 date_str, fee, product_iv_pcts={},
                 check_greeks=False, check_tp=True, check_expiry=False,
                 exec_time=str(tm),
             )
+            after_qty = sum(int(getattr(pos, 'n', 0) or 0) for pos in self.positions)
+            if (
+                len(self.positions) != before_positions
+                or after_qty != before_qty
+                or float(self._day_realized.get('pnl', 0.0) or 0.0) != before_realized_pnl
+                or float(self._day_realized.get('fee', 0.0) or 0.0) != before_realized_fee
+            ):
+                closed_any = True
             if not self.positions:
                 break
 
-        return True
+        return closed_any
 
     def _baseline_product_order(self, product_frames):
         mode = str(self.config.get('s1_baseline_product_ranking_mode', 'code') or 'code').lower()
@@ -3237,15 +3160,98 @@ class ToolkitMinuteEngine:
         )
         return ranked['product'].tolist()
 
-    def _baseline_product_liquidity_stats(self, product, prod_df):
-        open_expiries = should_open_new(
+    @staticmethod
+    def _contract_month_series(df):
+        result = pd.Series(np.nan, index=df.index, dtype=float)
+        for col in ('underlying_code', 'code', 'ths_code'):
+            if col not in df.columns:
+                continue
+            text = df[col].astype(str).str.upper()
+            month = text.str.extract(r'(\d{4})', expand=False)
+            month = pd.to_numeric(month.str[-2:], errors='coerce')
+            month = month.where(month.between(1, 12))
+            result = result.where(result.notna(), month.astype(float))
+        if 'expiry_date' in df.columns:
+            expiry_month = pd.to_datetime(df['expiry_date'], errors='coerce').dt.month
+            result = result.where(result.notna(), expiry_month.astype(float))
+        return result
+
+    def _s1_product_expiry_override(self, product):
+        overrides = self.config.get('s1_product_expiry_overrides') or {}
+        if not isinstance(overrides, dict):
+            return {}
+        key = str(product or '').strip().upper()
+        override = overrides.get(key) or overrides.get(key.lower()) or {}
+        return override if isinstance(override, dict) else {}
+
+    def _select_s1_open_expiries(self, product_df_today, product):
+        override = self._s1_product_expiry_override(product)
+        mode = str(override.get('mode', self.config.get('s1_expiry_mode', 'dte')) or 'dte').lower()
+        prod_df = product_df_today
+        dte_target = override.get('dte_target', self.config.get('dte_target', 35))
+        dte_min = override.get('dte_min', self.config.get('dte_min', 15))
+        dte_max = override.get('dte_max', self.config.get('dte_max', 90))
+        respect_dte_bounds = bool(override.get('respect_dte_bounds', False))
+
+        if mode in {'allowed_contract_months', 'contract_months'}:
+            months = {
+                int(m) for m in override.get('months', [])
+                if pd.notna(m) and 1 <= int(m) <= 12
+            }
+            if not months:
+                return []
+            contract_month = self._contract_month_series(prod_df)
+            prod_df = prod_df[contract_month.isin(months)].copy()
+            if prod_df.empty:
+                return []
+            mode = str(override.get('selection_mode', 'nth_expiry') or 'nth_expiry').lower()
+
+        if respect_dte_bounds:
+            if 'dte' not in prod_df.columns:
+                return []
+            dte = pd.to_numeric(prod_df['dte'], errors='coerce')
+            prod_df = prod_df[dte.between(float(dte_min), float(dte_max), inclusive='both')].copy()
+            if prod_df.empty:
+                return []
+
+        if mode in {'main_month', 'main_expiry', 'most_liquid_expiry'}:
+            rows = []
+            for exp, exp_data in prod_df.groupby('expiry_date', sort=False):
+                if exp_data.empty:
+                    continue
+                dte = pd.to_numeric(exp_data['dte'], errors='coerce').dropna()
+                if dte.empty or float(dte.iloc[0]) <= 0:
+                    continue
+                volume = pd.to_numeric(exp_data.get('volume', 0.0), errors='coerce').fillna(0).clip(lower=0)
+                oi = pd.to_numeric(exp_data.get('open_interest', 0.0), errors='coerce').fillna(0).clip(lower=0)
+                rows.append({
+                    'expiry': str(exp),
+                    'dte': float(dte.iloc[0]),
+                    'volume': float(volume.sum()),
+                    'open_interest': float(oi.sum()),
+                })
+            if not rows:
+                return []
+            ranked = pd.DataFrame(rows)
+            ranked['score'] = np.log1p(ranked['volume']) + np.log1p(ranked['open_interest'])
+            ranked = ranked.sort_values(
+                ['score', 'open_interest', 'volume', 'dte', 'expiry'],
+                ascending=[False, False, False, True, True],
+                kind='mergesort',
+            )
+            return [ranked['expiry'].iloc[0]]
+
+        return should_open_new(
             prod_df,
-            dte_target=self.config.get('dte_target', 35),
-            dte_min=self.config.get('dte_min', 15),
-            dte_max=self.config.get('dte_max', 90),
-            mode=self.config.get('s1_expiry_mode', 'dte'),
-            expiry_rank=self.config.get('s1_expiry_rank', 2),
+            dte_target=dte_target,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            mode=mode,
+            expiry_rank=override.get('expiry_rank', self.config.get('s1_expiry_rank', 2)),
         )
+
+    def _baseline_product_liquidity_stats(self, product, prod_df):
+        open_expiries = self._select_s1_open_expiries(prod_df, product)
         if not open_expiries:
             return 0.0, 0.0
 
@@ -4033,14 +4039,7 @@ class ToolkitMinuteEngine:
             prod_df = product_frames.get(product)
             if prod_df is None or prod_df.empty:
                 continue
-            open_expiries = should_open_new(
-                prod_df,
-                dte_target=self.config.get('dte_target', 35),
-                dte_min=self.config.get('dte_min', 15),
-                dte_max=self.config.get('dte_max', 90),
-                mode=self.config.get('s1_expiry_mode', 'dte'),
-                expiry_rank=self.config.get('s1_expiry_rank', 2),
-            )
+            open_expiries = self._select_s1_open_expiries(prod_df, product)
             if not open_expiries:
                 continue
             for exp in open_expiries:
@@ -4359,6 +4358,299 @@ class ToolkitMinuteEngine:
 
         return budget_map, meta_map, candidate_cache
 
+    @staticmethod
+    def _s1_side_meta_from_product_budget(product_meta, option_type):
+        if not product_meta:
+            return {}
+        meta = {
+            'b2_product_score': product_meta.get('product_score', np.nan),
+            'b2_product_equal_budget_pct': product_meta.get('equal_budget_pct', np.nan),
+            'b2_product_quality_budget_pct': product_meta.get('quality_budget_pct', np.nan),
+            'b2_product_final_budget_pct': product_meta.get('final_budget_pct', np.nan),
+            'b2_product_budget_mult': product_meta.get('budget_mult', np.nan),
+        }
+        b3_side_meta = (product_meta.get('b3_side_meta') or {}).get(option_type, {})
+        if b3_side_meta:
+            meta.update({
+                'budget_mult': b3_side_meta.get('b3_side_budget_mult', 1.0),
+                'b3_product_side_score': b3_side_meta.get('b3_product_side_score', np.nan),
+                'b3_side_equal_budget_pct': b3_side_meta.get('b3_side_equal_budget_pct', np.nan),
+                'b3_side_quality_budget_pct': b3_side_meta.get('b3_side_quality_budget_pct', np.nan),
+                'b3_side_final_budget_pct': b3_side_meta.get('b3_side_final_budget_pct', np.nan),
+                'b3_side_budget_mult': b3_side_meta.get('b3_side_budget_mult', np.nan),
+                'b3_clean_vega_tilt_strength': b3_side_meta.get('b3_clean_vega_tilt_strength', np.nan),
+                'b3_clean_vega_score': b3_side_meta.get('b3_clean_vega_score', np.nan),
+                'b3_forward_variance_score': b3_side_meta.get('b3_forward_variance_score', np.nan),
+                'b3_vol_of_vol_score': b3_side_meta.get('b3_vol_of_vol_score', np.nan),
+                'b3_iv_shock_score': b3_side_meta.get('b3_iv_shock_score', np.nan),
+                'b3_joint_stress_score': b3_side_meta.get('b3_joint_stress_score', np.nan),
+                'b3_vomma_score': b3_side_meta.get('b3_vomma_score', np.nan),
+                'b3_skew_stability_score': b3_side_meta.get('b3_skew_stability_score', np.nan),
+            })
+        b4_side_meta = (product_meta.get('b4_side_meta') or {}).get(option_type, {})
+        if b4_side_meta:
+            meta.update({
+                'budget_mult': b4_side_meta.get('b4_side_budget_mult', 1.0),
+                'b4_product_side_score': b4_side_meta.get('b4_product_side_score', np.nan),
+                'b4_side_equal_budget_pct': b4_side_meta.get('b4_side_equal_budget_pct', np.nan),
+                'b4_side_quality_budget_pct': b4_side_meta.get('b4_side_quality_budget_pct', np.nan),
+                'b4_side_final_budget_pct': b4_side_meta.get('b4_side_final_budget_pct', np.nan),
+                'b4_side_budget_mult': b4_side_meta.get('b4_side_budget_mult', np.nan),
+                'b4_product_tilt_strength': b4_side_meta.get('b4_product_tilt_strength', np.nan),
+                'b4_side_vov_penalty_mult': b4_side_meta.get('b4_side_vov_penalty_mult', np.nan),
+                'b4_premium_to_iv10_score': b4_side_meta.get('b4_premium_to_iv10_score', np.nan),
+                'b4_premium_to_stress_score': b4_side_meta.get('b4_premium_to_stress_score', np.nan),
+                'b4_premium_yield_margin_score': b4_side_meta.get('b4_premium_yield_margin_score', np.nan),
+                'b4_gamma_rent_score': b4_side_meta.get('b4_gamma_rent_score', np.nan),
+                'b4_vomma_score': b4_side_meta.get('b4_vomma_score', np.nan),
+                'b4_breakeven_cushion_score': b4_side_meta.get('b4_breakeven_cushion_score', np.nan),
+                'b4_vol_of_vol_score': b4_side_meta.get('b4_vol_of_vol_score', np.nan),
+            })
+        if 'b6_product_score' in product_meta:
+            meta.update({
+                'b6_product_score': product_meta.get('b6_product_score', np.nan),
+                'b6_product_equal_budget_pct': product_meta.get('b6_product_equal_budget_pct', np.nan),
+                'b6_product_quality_budget_pct': product_meta.get('b6_product_quality_budget_pct', np.nan),
+                'b6_product_final_budget_pct': product_meta.get('b6_product_final_budget_pct', np.nan),
+                'b6_product_budget_mult': product_meta.get('b6_product_budget_mult', np.nan),
+                'b6_product_tilt_strength': product_meta.get('b6_product_tilt_strength', np.nan),
+            })
+        b6_side_meta = (product_meta.get('b6_side_meta') or {}).get(option_type, {})
+        if b6_side_meta:
+            meta.update({
+                'budget_mult': b6_side_meta.get('b6_side_budget_mult', 1.0),
+                'b6_product_side_score': b6_side_meta.get('b6_product_side_score', np.nan),
+                'b6_side_equal_budget_pct': b6_side_meta.get('b6_side_equal_budget_pct', np.nan),
+                'b6_side_quality_budget_pct': b6_side_meta.get('b6_side_quality_budget_pct', np.nan),
+                'b6_side_final_budget_pct': b6_side_meta.get('b6_side_final_budget_pct', np.nan),
+                'b6_side_budget_mult': b6_side_meta.get('b6_side_budget_mult', np.nan),
+                'b6_side_tilt_strength': b6_side_meta.get('b6_side_tilt_strength', np.nan),
+                'b6_side_direction_penalty_mult': b6_side_meta.get(
+                    'b6_side_direction_penalty_mult', np.nan
+                ),
+            })
+        return meta
+
+    def _build_s1_side_items_for_expiry(
+        self,
+        *,
+        prod_df,
+        ef,
+        product,
+        exp,
+        mult,
+        mr,
+        exchange,
+        date_str,
+        nav,
+        iv_state,
+        b2_meta,
+        b2_candidate_cache,
+    ):
+        if self.config.get('s1_side_selection_enabled', False):
+            return self._select_s1_side_items(
+                ef, product, mult, mr, exchange, date_str,
+                iv_state=iv_state,
+            )
+
+        side_items = []
+        record_universe_today = (
+            self._s1_candidate_universe_enabled()
+            and self._s1_candidate_signal_in_scope(date_str)
+        )
+        term_features = (
+            self._b3_term_structure_features(prod_df, exp)
+            if record_universe_today
+            else {}
+        )
+        for ot in ['P', 'C']:
+            preselected = b2_candidate_cache.get((product, exp, ot))
+            side_meta = self._s1_side_meta_from_product_budget(b2_meta, ot)
+            if record_universe_today:
+                min_abs_delta, delta_cap = self._s1_delta_bounds(None)
+                record_candidates = self._select_s1_candidate_universe_frame(
+                    ef, product, ot, mult, mr, exchange,
+                    min_abs_delta, delta_cap,
+                    iv_state=iv_state,
+                    side_meta=side_meta,
+                    term_features=term_features,
+                )
+                self._append_s1_candidate_universe(
+                    date_str,
+                    nav,
+                    product,
+                    exp,
+                    ot,
+                    record_candidates,
+                    side_meta=side_meta,
+                )
+                if preselected is None:
+                    preselected = record_candidates
+            side_items.append((ot, preselected, side_meta))
+        return side_items
+
+    def _prepare_open_product_scan(self, daily_df, product_pool, baseline_mode, scan_top_n, date_str):
+        filtered_daily = daily_df[daily_df['product'].isin(product_pool)]
+        if filtered_daily.empty:
+            self._bump_s1_funnel('skip_empty_filtered_daily')
+            return None
+
+        product_frames = {
+            product: frame
+            for product, frame in filtered_daily.groupby('product', sort=False)
+            if not frame.empty
+        }
+        if not product_frames:
+            self._bump_s1_funnel('skip_no_product_frames')
+            return None
+        self._bump_s1_funnel('loaded_products', len(product_frames))
+        self._update_product_first_trade_dates(list(product_frames), date_str)
+
+        if baseline_mode:
+            sorted_products = self._baseline_product_order(product_frames)
+        else:
+            prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
+            prod_volume = prod_volume.sort_values(
+                ['volume', 'product'],
+                ascending=[False, True],
+                kind='mergesort',
+            )
+            sorted_products = self._diversify_product_order(prod_volume['product'].tolist())
+            sorted_products = self._prioritize_products_by_regime(sorted_products)
+        candidate_products = sorted_products if scan_top_n <= 0 else sorted_products[:scan_top_n]
+        return product_frames, candidate_products
+
+    def _resolve_s1_product_budget_maps(
+        self,
+        *,
+        baseline_mode,
+        candidate_products,
+        product_frames,
+        margin_cap,
+        s1_cap,
+        date_str,
+        nav,
+    ):
+        baseline_product_margin_per = (
+            float(s1_cap or margin_cap or 0.0) / max(len(candidate_products), 1)
+            if baseline_mode and self.config.get('s1_baseline_equal_weight_products', True)
+            else None
+        )
+        b2_product_budget_map = {}
+        b2_product_budget_meta = {}
+        b2_candidate_cache = {}
+        if (
+            baseline_mode
+            and (
+                self.config.get('s1_b2_product_tilt_enabled', False)
+                or self.config.get('s1_b4_product_side_tilt_enabled', False)
+                or self.config.get('s1_b6_product_tilt_enabled', False)
+                or self.config.get('s1_b6_side_tilt_enabled', False)
+            )
+            and self.config.get('s1_baseline_equal_weight_products', True)
+        ):
+            (
+                b2_product_budget_map,
+                b2_product_budget_meta,
+                b2_candidate_cache,
+            ) = self._b2_product_budget_map(
+                product_frames,
+                candidate_products,
+                float(s1_cap or margin_cap or 0.0),
+                date_str,
+                nav,
+            )
+        return (
+            baseline_product_margin_per,
+            b2_product_budget_map,
+            b2_product_budget_meta,
+            b2_candidate_cache,
+        )
+
+    def _open_position_state(self):
+        return {
+            'product_expiries': {(p.product, p.expiry) for p in self.positions},
+            's1_sell_sides': {
+                (p.product, p.opt_type)
+                for p in self.positions
+                if p.strat == 'S1' and p.role == 'sell'
+            },
+            's3_sell_sides': {
+                (p.product, p.opt_type)
+                for p in self.positions
+                if p.strat == 'S3' and p.role == 'sell'
+            },
+            's4_products': {
+                p.product
+                for p in self.positions
+                if p.strat == 'S4'
+            },
+        }
+
+    def _s1_product_open_context(
+        self,
+        *,
+        product,
+        baseline_mode,
+        product_iv_pcts,
+        iv_open_thr,
+        baseline_product_margin_per,
+        b2_product_budget_map,
+        b2_product_budget_meta,
+        margin_per,
+    ):
+        cfg = self.config
+        iv_pct = product_iv_pcts.get(product, np.nan)
+        iv_state = self._current_iv_state.get(product, {})
+        if not baseline_mode and should_pause_open(iv_pct, iv_open_thr):
+            self._bump_s1_funnel('skip_iv_pause')
+            return None
+
+        low_iv_threshold = cfg.get('iv_low_skip_threshold', 20)
+        low_iv_allowed = should_allow_open_low_iv_product(
+            product,
+            iv_pct,
+            iv_state,
+            enabled=cfg.get('low_iv_exception_enabled', False),
+            low_iv_allowed_products=cfg.get('low_iv_allowed_products', []),
+            iv_low_skip_threshold=low_iv_threshold,
+            min_iv_rv_spread=cfg.get('low_iv_min_iv_rv_spread', 0.02),
+            min_iv_rv_ratio=cfg.get('low_iv_min_iv_rv_ratio', 1.10),
+            max_rv_trend=cfg.get('low_iv_max_rv_trend', None),
+        )
+        if (
+            cfg.get('vol_regime_sizing_enabled', False) and
+            cfg.get('vol_regime_allow_low_iv_rich', True) and
+            self._current_vol_regimes.get(product) == 'low_stable_vol'
+        ):
+            low_iv_allowed = True
+        if self._is_structural_low_iv_product(product, iv_state):
+            low_iv_allowed = True
+        if not baseline_mode and pd.notna(iv_pct) and iv_pct < low_iv_threshold and not low_iv_allowed:
+            self._bump_s1_funnel('skip_low_iv')
+            return None
+
+        iv_scale = 1.0 if baseline_mode else get_iv_scale(iv_pct, cfg.get('iv_threshold', 75))
+        regime_mult = 1.0 if baseline_mode else self._product_margin_per_multiplier(product)
+        if regime_mult <= 0:
+            self._bump_s1_funnel('skip_regime_budget_zero')
+            return None
+        if baseline_product_margin_per is not None:
+            product_margin_per = (
+                b2_product_budget_map.get(product, baseline_product_margin_per)
+                if b2_product_budget_map
+                else baseline_product_margin_per
+            )
+        else:
+            product_margin_per = margin_per * regime_mult
+        return {
+            'iv_pct': iv_pct,
+            'iv_state': iv_state,
+            'iv_scale': iv_scale,
+            'product_margin_per': product_margin_per,
+            'b2_meta': b2_product_budget_meta.get(product, {}),
+        }
+
     def _queue_new_opens(self, daily_df, date_str, product_pool, product_iv_pcts):
         """收盘后生成下一交易日待开仓指令。"""
         cfg = self.config
@@ -4393,84 +4685,33 @@ class ToolkitMinuteEngine:
         iv_open_thr = cfg.get('iv_open_threshold', 80)
         scan_top_n = int(cfg.get('daily_scan_top_n', 0) or 0)
 
-        filtered_daily = daily_df[daily_df['product'].isin(product_pool)].copy()
-        if filtered_daily.empty:
-            self._bump_s1_funnel('skip_empty_filtered_daily')
-            self._finish_s1_candidate_funnel(date_str, nav)
-            return
-
-        product_frames = {
-            product: frame
-            for product, frame in filtered_daily.groupby('product', sort=False)
-            if not frame.empty
-        }
-        if not product_frames:
-            self._bump_s1_funnel('skip_no_product_frames')
-            self._finish_s1_candidate_funnel(date_str, nav)
-            return
-        self._bump_s1_funnel('loaded_products', len(product_frames))
-
-        self._update_product_first_trade_dates(list(product_frames), date_str)
-        if baseline_mode:
-            sorted_products = self._baseline_product_order(product_frames)
-        else:
-            prod_volume = filtered_daily.groupby('product', as_index=False)['volume'].sum()
-            prod_volume = prod_volume.sort_values(
-                ['volume', 'product'],
-                ascending=[False, True],
-                kind='mergesort',
-            )
-            sorted_products = self._diversify_product_order(prod_volume['product'].tolist())
-            sorted_products = self._prioritize_products_by_regime(sorted_products)
-
-        candidate_products = sorted_products if scan_top_n <= 0 else sorted_products[:scan_top_n]
-        baseline_product_margin_per = (
-            float(s1_cap or margin_cap or 0.0) / max(len(candidate_products), 1)
-            if baseline_mode and cfg.get('s1_baseline_equal_weight_products', True)
-            else None
+        product_scan = self._prepare_open_product_scan(
+            daily_df,
+            product_pool,
+            baseline_mode,
+            scan_top_n,
+            date_str,
         )
-        b2_product_budget_map = {}
-        b2_product_budget_meta = {}
-        b2_candidate_cache = {}
-        if (
-            baseline_mode
-            and (
-                cfg.get('s1_b2_product_tilt_enabled', False)
-                or cfg.get('s1_b4_product_side_tilt_enabled', False)
-                or cfg.get('s1_b6_product_tilt_enabled', False)
-                or cfg.get('s1_b6_side_tilt_enabled', False)
-            )
-            and cfg.get('s1_baseline_equal_weight_products', True)
-        ):
-            total_budget_pct = float(s1_cap or margin_cap or 0.0)
-            (
-                b2_product_budget_map,
-                b2_product_budget_meta,
-                b2_candidate_cache,
-            ) = self._b2_product_budget_map(
-                product_frames,
-                candidate_products,
-                total_budget_pct,
-                date_str,
-                nav,
-            )
+        if product_scan is None:
+            self._finish_s1_candidate_funnel(date_str, nav)
+            return
+        product_frames, candidate_products = product_scan
+        (
+            baseline_product_margin_per,
+            b2_product_budget_map,
+            b2_product_budget_meta,
+            b2_candidate_cache,
+        ) = self._resolve_s1_product_budget_maps(
+            baseline_mode=baseline_mode,
+            candidate_products=candidate_products,
+            product_frames=product_frames,
+            margin_cap=margin_cap,
+            s1_cap=s1_cap,
+            date_str=date_str,
+            nav=nav,
+        )
         self._bump_s1_funnel('candidate_products', len(candidate_products))
-        open_product_expiries = {(p.product, p.expiry) for p in self.positions}
-        open_s1_sell_sides = {
-            (p.product, p.opt_type)
-            for p in self.positions
-            if p.strat == 'S1' and p.role == 'sell'
-        }
-        open_s3_sell_sides = {
-            (p.product, p.opt_type)
-            for p in self.positions
-            if p.strat == 'S3' and p.role == 'sell'
-        }
-        open_s4_products = {
-            p.product
-            for p in self.positions
-            if p.strat == 'S4'
-        }
+        open_state = self._open_position_state()
 
         for product in candidate_products:
             prod_df = product_frames.get(product)
@@ -4482,70 +4723,37 @@ class ToolkitMinuteEngine:
                 continue
             self._bump_s1_funnel('product_entry_pass')
 
-            open_expiries = should_open_new(
-                prod_df,
-                dte_target=cfg.get('dte_target', 35),
-                dte_min=cfg.get('dte_min', 15),
-                dte_max=cfg.get('dte_max', 90),
-                mode=cfg.get('s1_expiry_mode', 'dte'),
-                expiry_rank=cfg.get('s1_expiry_rank', 2),
-            )
+            open_expiries = self._select_s1_open_expiries(prod_df, product)
             if not open_expiries:
                 self._bump_s1_funnel('skip_no_open_expiry')
                 continue
             self._bump_s1_funnel('open_expiry_candidates', len(open_expiries))
 
+            product_context = self._s1_product_open_context(
+                product=product,
+                baseline_mode=baseline_mode,
+                product_iv_pcts=product_iv_pcts,
+                iv_open_thr=iv_open_thr,
+                baseline_product_margin_per=baseline_product_margin_per,
+                b2_product_budget_map=b2_product_budget_map,
+                b2_product_budget_meta=b2_product_budget_meta,
+                margin_per=margin_per,
+            )
+            if product_context is None:
+                continue
+            iv_state = product_context['iv_state']
+            iv_scale = product_context['iv_scale']
+            product_margin_per = product_context['product_margin_per']
+            b2_meta = product_context['b2_meta']
+
             for exp in open_expiries:
-                expiry_has_position = (product, exp) in open_product_expiries
+                expiry_has_position = (product, exp) in open_state['product_expiries']
 
                 ef = prod_df[prod_df['expiry_date'] == exp]
                 if ef.empty:
                     self._bump_s1_funnel('skip_empty_expiry_frame')
                     continue
                 self._bump_s1_funnel('product_expiry_frames')
-
-                iv_pct = product_iv_pcts.get(product, np.nan)
-                iv_state = self._current_iv_state.get(product, {})
-                if not baseline_mode and should_pause_open(iv_pct, iv_open_thr):
-                    self._bump_s1_funnel('skip_iv_pause')
-                    continue
-                low_iv_threshold = cfg.get('iv_low_skip_threshold', 20)
-                low_iv_allowed = should_allow_open_low_iv_product(
-                    product,
-                    iv_pct,
-                    iv_state,
-                    enabled=cfg.get('low_iv_exception_enabled', False),
-                    low_iv_allowed_products=cfg.get('low_iv_allowed_products', []),
-                    iv_low_skip_threshold=low_iv_threshold,
-                    min_iv_rv_spread=cfg.get('low_iv_min_iv_rv_spread', 0.02),
-                    min_iv_rv_ratio=cfg.get('low_iv_min_iv_rv_ratio', 1.10),
-                    max_rv_trend=cfg.get('low_iv_max_rv_trend', None),
-                )
-                if (
-                    cfg.get('vol_regime_sizing_enabled', False) and
-                    cfg.get('vol_regime_allow_low_iv_rich', True) and
-                    self._current_vol_regimes.get(product) == 'low_stable_vol'
-                ):
-                    low_iv_allowed = True
-                if self._is_structural_low_iv_product(product, iv_state):
-                    low_iv_allowed = True
-                if not baseline_mode and pd.notna(iv_pct) and iv_pct < low_iv_threshold and not low_iv_allowed:
-                    self._bump_s1_funnel('skip_low_iv')
-                    continue
-                iv_scale = 1.0 if baseline_mode else get_iv_scale(iv_pct, cfg.get('iv_threshold', 75))
-                regime_mult = 1.0 if baseline_mode else self._product_margin_per_multiplier(product)
-                if regime_mult <= 0:
-                    self._bump_s1_funnel('skip_regime_budget_zero')
-                    continue
-                if baseline_product_margin_per is not None:
-                    product_margin_per = (
-                        b2_product_budget_map.get(product, baseline_product_margin_per)
-                        if b2_product_budget_map
-                        else baseline_product_margin_per
-                    )
-                else:
-                    product_margin_per = margin_per * regime_mult
-                b2_meta = b2_product_budget_meta.get(product, {})
 
                 if total_m / nav >= margin_cap:
                     self._bump_s1_funnel('break_total_margin_cap')
@@ -4575,150 +4783,20 @@ class ToolkitMinuteEngine:
                         self._bump_s1_funnel('skip_s1_falling_framework')
                         continue
                     self._bump_s1_funnel('s1_framework_pass')
-                    if cfg.get('s1_side_selection_enabled', False):
-                        s1_side_items = self._select_s1_side_items(
-                            ef, product, mult, mr, exchange, date_str,
-                            iv_state=iv_state,
-                        )
-                    else:
-                        s1_side_items = []
-                        record_universe_today = (
-                            self._s1_candidate_universe_enabled()
-                            and self._s1_candidate_signal_in_scope(date_str)
-                        )
-                        term_features = (
-                            self._b3_term_structure_features(prod_df, exp)
-                            if record_universe_today
-                            else {}
-                        )
-                        for ot in ['P', 'C']:
-                            preselected = b2_candidate_cache.get((product, exp, ot))
-                            side_meta = {}
-                            if b2_meta:
-                                side_meta.update({
-                                    'b2_product_score': b2_meta.get('product_score', np.nan),
-                                    'b2_product_equal_budget_pct': b2_meta.get('equal_budget_pct', np.nan),
-                                    'b2_product_quality_budget_pct': b2_meta.get('quality_budget_pct', np.nan),
-                                    'b2_product_final_budget_pct': b2_meta.get('final_budget_pct', np.nan),
-                                    'b2_product_budget_mult': b2_meta.get('budget_mult', np.nan),
-                                })
-                                b3_side_meta = (b2_meta.get('b3_side_meta') or {}).get(ot, {})
-                                if b3_side_meta:
-                                    side_meta.update({
-                                        'budget_mult': b3_side_meta.get('b3_side_budget_mult', 1.0),
-                                        'b3_product_side_score': b3_side_meta.get('b3_product_side_score', np.nan),
-                                        'b3_side_equal_budget_pct': b3_side_meta.get('b3_side_equal_budget_pct', np.nan),
-                                        'b3_side_quality_budget_pct': b3_side_meta.get('b3_side_quality_budget_pct', np.nan),
-                                        'b3_side_final_budget_pct': b3_side_meta.get('b3_side_final_budget_pct', np.nan),
-                                        'b3_side_budget_mult': b3_side_meta.get('b3_side_budget_mult', np.nan),
-                                        'b3_clean_vega_tilt_strength': b3_side_meta.get(
-                                            'b3_clean_vega_tilt_strength', np.nan
-                                        ),
-                                        'b3_clean_vega_score': b3_side_meta.get('b3_clean_vega_score', np.nan),
-                                        'b3_forward_variance_score': b3_side_meta.get(
-                                            'b3_forward_variance_score', np.nan
-                                        ),
-                                        'b3_vol_of_vol_score': b3_side_meta.get('b3_vol_of_vol_score', np.nan),
-                                        'b3_iv_shock_score': b3_side_meta.get('b3_iv_shock_score', np.nan),
-                                        'b3_joint_stress_score': b3_side_meta.get('b3_joint_stress_score', np.nan),
-                                        'b3_vomma_score': b3_side_meta.get('b3_vomma_score', np.nan),
-                                        'b3_skew_stability_score': b3_side_meta.get(
-                                            'b3_skew_stability_score', np.nan
-                                        ),
-                                    })
-                                b4_side_meta = (b2_meta.get('b4_side_meta') or {}).get(ot, {})
-                                if b4_side_meta:
-                                    side_meta.update({
-                                        'budget_mult': b4_side_meta.get('b4_side_budget_mult', 1.0),
-                                        'b4_product_side_score': b4_side_meta.get('b4_product_side_score', np.nan),
-                                        'b4_side_equal_budget_pct': b4_side_meta.get('b4_side_equal_budget_pct', np.nan),
-                                        'b4_side_quality_budget_pct': b4_side_meta.get('b4_side_quality_budget_pct', np.nan),
-                                        'b4_side_final_budget_pct': b4_side_meta.get('b4_side_final_budget_pct', np.nan),
-                                        'b4_side_budget_mult': b4_side_meta.get('b4_side_budget_mult', np.nan),
-                                        'b4_product_tilt_strength': b4_side_meta.get(
-                                            'b4_product_tilt_strength', np.nan
-                                        ),
-                                        'b4_side_vov_penalty_mult': b4_side_meta.get(
-                                            'b4_side_vov_penalty_mult', np.nan
-                                        ),
-                                        'b4_premium_to_iv10_score': b4_side_meta.get(
-                                            'b4_premium_to_iv10_score', np.nan
-                                        ),
-                                        'b4_premium_to_stress_score': b4_side_meta.get(
-                                            'b4_premium_to_stress_score', np.nan
-                                        ),
-                                        'b4_premium_yield_margin_score': b4_side_meta.get(
-                                            'b4_premium_yield_margin_score', np.nan
-                                        ),
-                                        'b4_gamma_rent_score': b4_side_meta.get('b4_gamma_rent_score', np.nan),
-                                        'b4_vomma_score': b4_side_meta.get('b4_vomma_score', np.nan),
-                                        'b4_breakeven_cushion_score': b4_side_meta.get(
-                                            'b4_breakeven_cushion_score', np.nan
-                                        ),
-                                        'b4_vol_of_vol_score': b4_side_meta.get('b4_vol_of_vol_score', np.nan),
-                                    })
-                                if 'b6_product_score' in b2_meta:
-                                    side_meta.update({
-                                        'b6_product_score': b2_meta.get('b6_product_score', np.nan),
-                                        'b6_product_equal_budget_pct': b2_meta.get(
-                                            'b6_product_equal_budget_pct', np.nan
-                                        ),
-                                        'b6_product_quality_budget_pct': b2_meta.get(
-                                            'b6_product_quality_budget_pct', np.nan
-                                        ),
-                                        'b6_product_final_budget_pct': b2_meta.get(
-                                            'b6_product_final_budget_pct', np.nan
-                                        ),
-                                        'b6_product_budget_mult': b2_meta.get('b6_product_budget_mult', np.nan),
-                                        'b6_product_tilt_strength': b2_meta.get(
-                                            'b6_product_tilt_strength', np.nan
-                                        ),
-                                    })
-                                b6_side_meta = (b2_meta.get('b6_side_meta') or {}).get(ot, {})
-                                if b6_side_meta:
-                                    side_meta.update({
-                                        'budget_mult': b6_side_meta.get('b6_side_budget_mult', 1.0),
-                                        'b6_product_side_score': b6_side_meta.get(
-                                            'b6_product_side_score', np.nan
-                                        ),
-                                        'b6_side_equal_budget_pct': b6_side_meta.get(
-                                            'b6_side_equal_budget_pct', np.nan
-                                        ),
-                                        'b6_side_quality_budget_pct': b6_side_meta.get(
-                                            'b6_side_quality_budget_pct', np.nan
-                                        ),
-                                        'b6_side_final_budget_pct': b6_side_meta.get(
-                                            'b6_side_final_budget_pct', np.nan
-                                        ),
-                                        'b6_side_budget_mult': b6_side_meta.get('b6_side_budget_mult', np.nan),
-                                        'b6_side_tilt_strength': b6_side_meta.get(
-                                            'b6_side_tilt_strength', np.nan
-                                        ),
-                                        'b6_side_direction_penalty_mult': b6_side_meta.get(
-                                            'b6_side_direction_penalty_mult', np.nan
-                                        ),
-                                    })
-                            if record_universe_today:
-                                min_abs_delta, delta_cap = self._s1_delta_bounds(None)
-                                record_candidates = self._select_s1_candidate_universe_frame(
-                                    ef, product, ot, mult, mr, exchange,
-                                    min_abs_delta, delta_cap,
-                                    iv_state=iv_state,
-                                    side_meta=side_meta,
-                                    term_features=term_features,
-                                )
-                                self._append_s1_candidate_universe(
-                                    date_str,
-                                    nav,
-                                    product,
-                                    exp,
-                                    ot,
-                                    record_candidates,
-                                    side_meta=side_meta,
-                                )
-                                if preselected is None:
-                                    preselected = record_candidates
-                            s1_side_items.append((ot, preselected, side_meta))
+                    s1_side_items = self._build_s1_side_items_for_expiry(
+                        prod_df=prod_df,
+                        ef=ef,
+                        product=product,
+                        exp=exp,
+                        mult=mult,
+                        mr=mr,
+                        exchange=exchange,
+                        date_str=date_str,
+                        nav=nav,
+                        iv_state=iv_state,
+                        b2_meta=b2_meta,
+                        b2_candidate_cache=b2_candidate_cache,
+                    )
                     self._bump_s1_funnel('s1_selected_side_items', len(s1_side_items))
                     if (
                         self._s1_candidate_universe_enabled()
@@ -4729,7 +4807,7 @@ class ToolkitMinuteEngine:
                     for ot, preselected_candidates, side_meta in s1_side_items:
                         if (
                             not cfg.get('s1_allow_add_same_side', False) and
-                            (product, ot) in open_s1_sell_sides
+                            (product, ot) in open_state['s1_sell_sides']
                         ):
                             self._bump_s1_funnel('skip_same_side_position')
                             continue
@@ -4752,7 +4830,7 @@ class ToolkitMinuteEngine:
 
                 if cfg.get('enable_s3', True) and s3_m / nav < s3_cap and not expiry_has_position:
                     for ot in ['P', 'C']:
-                        if (product, ot) in open_s3_sell_sides:
+                        if (product, ot) in open_state['s3_sell_sides']:
                             continue
                         if self._is_reentry_blocked('S3', product, ot, date_str):
                             continue
@@ -4762,7 +4840,7 @@ class ToolkitMinuteEngine:
                                           reentry_plan=s3_plan,
                                           margin_cap=margin_cap, strategy_cap=s3_cap)
 
-                if cfg.get('enable_s4', True) and product not in open_s4_products:
+                if cfg.get('enable_s4', True) and product not in open_state['s4_products']:
                     self._try_open_s4(ef, product, mult, mr, exchange, exp, nav, date_str)
         self._finish_s1_candidate_funnel(date_str, nav)
 
@@ -5243,18 +5321,13 @@ class ToolkitMinuteEngine:
                 self._bump_s1_funnel('open_skip_no_candidates_after_b6')
                 return
         self._bump_s1_funnel('open_candidates_considered', len(candidates))
-        if baseline_mode:
-            if max_candidates > 0:
-                candidates = candidates.head(max_candidates)
-        elif split_enabled and max_candidates > 1:
-            if max_delta_gap > 0 and 'abs_delta' in candidates.columns:
-                center_delta = float(candidates['abs_delta'].iloc[0])
-                candidates = candidates[
-                    (pd.to_numeric(candidates['abs_delta'], errors='coerce') - center_delta).abs() <= max_delta_gap
-                ].copy()
-            candidates = candidates.head(max_candidates)
-        else:
-            candidates = candidates.head(1)
+        candidates = self._trim_s1_open_candidates(
+            candidates,
+            baseline_mode=baseline_mode,
+            split_enabled=split_enabled,
+            max_candidates=max_candidates,
+            max_delta_gap=max_delta_gap,
+        )
         if candidates.empty:
             self._bump_s1_funnel('open_skip_ladder_filter')
             return
@@ -5319,7 +5392,7 @@ class ToolkitMinuteEngine:
             return lo
 
         opened_any = False
-        for rank, (_, c) in enumerate(candidates.iterrows(), start=1):
+        for rank, c in enumerate(candidates.to_dict('records'), start=1):
             m = estimate_margin(c['spot_close'], c['strike'], ot,
                                 c['option_close'], mult, mr, 0.5,
                                 exchange=exchange, product=product)
@@ -5357,202 +5430,35 @@ class ToolkitMinuteEngine:
             open_fee_per_contract = self._option_fee_per_contract(product, ot, action='open')
             close_fee_per_contract = self._option_fee_per_contract(product, ot, action='close')
             roundtrip_fee_per_contract = open_fee_per_contract + close_fee_per_contract
-            pending_item = {
-                'strat': 'S1', 'product': product, 'code': c['option_code'],
-                'opt_type': ot, 'strike': c['strike'], 'ref_price': c['option_close'],
-                'n': nn, 'mult': mult, 'expiry': exp, 'mr': mr, 'role': 'sell',
-                'spot': c['spot_close'], 'exchange': exchange, 'group_id': group_id,
-                'underlying_code': c.get('underlying_code'),
-                'signal_date': date_str,
-                'margin': m * nn,
-                'cash_vega': new_greeks['cash_vega'],
-                'cash_gamma': new_greeks['cash_gamma'],
-                'one_contract_stress_loss': one_stress_loss,
-                'stress_loss': total_stress_loss,
-                'one_contract_margin': m,
-                'gross_premium_cash': self._safe_float(c.get('option_close', np.nan), np.nan) * float(mult) * nn,
-                'net_premium_cash': self._safe_float(c.get('net_premium_cash', np.nan), np.nan) * nn,
-                'premium_stress': self._safe_float(c.get('premium_stress', np.nan), np.nan),
-                'theta_stress': self._safe_float(c.get('theta_stress', np.nan), np.nan),
-                'premium_margin': self._safe_float(c.get('premium_margin', np.nan), np.nan),
-                'premium_yield_margin': self._safe_float(c.get('premium_yield_margin', np.nan), np.nan),
-                'premium_yield_notional': self._safe_float(c.get('premium_yield_notional', np.nan), np.nan),
-                'rv_ref': self._safe_float(c.get('rv_ref', np.nan), np.nan),
-                'iv_rv_spread_candidate': self._safe_float(c.get('iv_rv_spread_candidate', np.nan), np.nan),
-                'iv_rv_ratio_candidate': self._safe_float(c.get('iv_rv_ratio_candidate', np.nan), np.nan),
-                'variance_carry': self._safe_float(c.get('variance_carry', np.nan), np.nan),
-                'breakeven_price': self._safe_float(c.get('breakeven_price', np.nan), np.nan),
-                'breakeven_cushion_abs': self._safe_float(c.get('breakeven_cushion_abs', np.nan), np.nan),
-                'breakeven_cushion_iv': self._safe_float(c.get('breakeven_cushion_iv', np.nan), np.nan),
-                'breakeven_cushion_rv': self._safe_float(c.get('breakeven_cushion_rv', np.nan), np.nan),
-                'iv_shock_loss_5_cash': self._safe_float(c.get('iv_shock_loss_5_cash', np.nan), np.nan),
-                'iv_shock_loss_10_cash': self._safe_float(c.get('iv_shock_loss_10_cash', np.nan), np.nan),
-                'premium_to_iv5_loss': self._safe_float(c.get('premium_to_iv5_loss', np.nan), np.nan),
-                'premium_to_iv10_loss': self._safe_float(c.get('premium_to_iv10_loss', np.nan), np.nan),
-                'premium_to_stress_loss': self._safe_float(c.get('premium_to_stress_loss', np.nan), np.nan),
-                'theta_vega_efficiency': self._safe_float(c.get('theta_vega_efficiency', np.nan), np.nan),
-                'gamma_rent_cash': self._safe_float(c.get('gamma_rent_cash', np.nan), np.nan),
-                'gamma_rent_penalty': self._safe_float(c.get('gamma_rent_penalty', np.nan), np.nan),
-                'fee_ratio': self._safe_float(c.get('fee_ratio', np.nan), np.nan),
-                'slippage_ratio': self._safe_float(c.get('slippage_ratio', np.nan), np.nan),
-                'friction_ratio': self._safe_float(c.get('friction_ratio', np.nan), np.nan),
-                'premium_quality_score': self._safe_float(c.get('premium_quality_score', np.nan), np.nan),
-                'premium_quality_rank_in_side': self._safe_float(c.get('premium_quality_rank_in_side', np.nan), np.nan),
-                'iv_rv_carry_score': self._safe_float(c.get('iv_rv_carry_score', np.nan), np.nan),
-                'breakeven_cushion_score': self._safe_float(c.get('breakeven_cushion_score', np.nan), np.nan),
-                'premium_to_iv_shock_score': self._safe_float(c.get('premium_to_iv_shock_score', np.nan), np.nan),
-                'premium_to_stress_loss_score': self._safe_float(c.get('premium_to_stress_loss_score', np.nan), np.nan),
-                'theta_vega_efficiency_score': self._safe_float(c.get('theta_vega_efficiency_score', np.nan), np.nan),
-                'cost_liquidity_score': self._safe_float(c.get('cost_liquidity_score', np.nan), np.nan),
-                'b3_forward_variance_pressure': self._safe_float(
-                    c.get('b3_forward_variance_pressure', np.nan), np.nan
-                ),
-                'b3_vol_of_vol_proxy': self._safe_float(c.get('b3_vol_of_vol_proxy', np.nan), np.nan),
-                'b3_vov_trend': self._safe_float(c.get('b3_vov_trend', np.nan), np.nan),
-                'b3_iv_shock_coverage': self._safe_float(c.get('b3_iv_shock_coverage', np.nan), np.nan),
-                'b3_joint_stress_coverage': self._safe_float(c.get('b3_joint_stress_coverage', np.nan), np.nan),
-                'b3_vomma_cash': self._safe_float(c.get('b3_vomma_cash', np.nan), np.nan),
-                'b3_vomma_loss_ratio': self._safe_float(c.get('b3_vomma_loss_ratio', np.nan), np.nan),
-                'b3_skew_steepening': self._safe_float(c.get('b3_skew_steepening', np.nan), np.nan),
-                'b3_clean_vega_score': side_meta.get('b3_clean_vega_score', np.nan),
-                'b3_forward_variance_score': side_meta.get('b3_forward_variance_score', np.nan),
-                'b3_vol_of_vol_score': side_meta.get('b3_vol_of_vol_score', np.nan),
-                'b3_iv_shock_score': side_meta.get('b3_iv_shock_score', np.nan),
-                'b3_joint_stress_score': side_meta.get('b3_joint_stress_score', np.nan),
-                'b3_vomma_score': side_meta.get('b3_vomma_score', np.nan),
-                'b3_skew_stability_score': side_meta.get('b3_skew_stability_score', np.nan),
-                'open_fee_per_contract': open_fee_per_contract,
-                'close_fee_per_contract': close_fee_per_contract,
-                'roundtrip_fee_per_contract': roundtrip_fee_per_contract,
-                'liquidity_score': self._safe_float(c.get('liquidity_score', np.nan), np.nan),
-                'volume': self._safe_float(c.get('volume', np.nan), np.nan),
-                'open_interest': self._safe_float(c.get('open_interest', np.nan), np.nan),
-                'moneyness': self._safe_float(c.get('moneyness', np.nan), np.nan),
-                'abs_delta': self._safe_float(c.get('abs_delta', np.nan), np.nan),
-                'delta': self._safe_float(c.get('delta', np.nan), np.nan),
-                'gamma': self._safe_float(c.get('gamma', np.nan), np.nan),
-                'vega': self._safe_float(c.get('vega', np.nan), np.nan),
-                'theta': self._safe_float(c.get('theta', np.nan), np.nan),
-                'selection_score': float(c.get('quality_score', np.nan)) if pd.notna(c.get('quality_score', np.nan)) else np.nan,
-                'selection_rank': rank,
-                'vol_regime': self._current_vol_regimes.get(product, ''),
-                'entry_atm_iv': iv_state.get('atm_iv', np.nan),
-                'entry_iv_pct': iv_state.get('iv_pct', np.nan),
-                'entry_iv_trend': iv_state.get('iv_trend', np.nan),
-                'entry_rv_trend': iv_state.get('rv_trend', np.nan),
-                'entry_iv_rv_spread': iv_state.get('iv_rv_spread', np.nan),
-                'entry_iv_rv_ratio': iv_state.get('iv_rv_ratio', np.nan),
-                'contract_iv': c.get('contract_iv', np.nan),
-                'contract_iv_change_1d': c.get('contract_iv_change_1d', np.nan),
-                'contract_iv_change_3d': c.get('contract_iv_change_3d', np.nan),
-                'contract_iv_change_5d': c.get('contract_iv_change_5d', np.nan),
-                'contract_iv_change_for_vega': c.get('contract_iv_change_for_vega', np.nan),
-                'contract_iv_skew_to_atm': c.get('contract_iv_skew_to_atm', np.nan),
-                'contract_skew_change_for_vega': c.get('contract_skew_change_for_vega', np.nan),
-                'contract_price_change_1d': c.get('contract_price_change_1d', np.nan),
-                'trend_state': side_meta.get('trend_state', c.get('trend_state', '')),
-                'trend_score': side_meta.get('trend_score', c.get('trend_score', np.nan)),
-                'trend_confidence': side_meta.get('trend_confidence', c.get('trend_confidence', np.nan)),
-                'trend_range_position': side_meta.get(
-                    'trend_range_position',
-                    c.get('trend_range_position', np.nan),
-                ),
-                'trend_range_pressure': side_meta.get(
-                    'trend_range_pressure',
-                    c.get('trend_range_pressure', ''),
-                ),
-                'trend_role': side_meta.get('trend_role', c.get('trend_role', '')),
-                'side_score_mult': side_meta.get('score_mult', c.get('side_score_mult', np.nan)),
-                'side_budget_mult': side_budget_mult,
-                'side_delta_cap': side_meta.get('delta_cap', np.nan),
-                'ladder_candidate_count': max_candidates,
-                'ladder_delta_gap': max_delta_gap,
-                'effective_s1_stress_max_qty': max_qty,
-                'b2_product_score': side_meta.get('b2_product_score', np.nan),
-                'b2_product_equal_budget_pct': side_meta.get('b2_product_equal_budget_pct', np.nan),
-                'b2_product_quality_budget_pct': side_meta.get('b2_product_quality_budget_pct', np.nan),
-                'b2_product_final_budget_pct': side_meta.get('b2_product_final_budget_pct', np.nan),
-                'b2_product_budget_mult': side_meta.get('b2_product_budget_mult', np.nan),
-                'b3_product_side_score': side_meta.get('b3_product_side_score', np.nan),
-                'b3_side_equal_budget_pct': side_meta.get('b3_side_equal_budget_pct', np.nan),
-                'b3_side_quality_budget_pct': side_meta.get('b3_side_quality_budget_pct', np.nan),
-                'b3_side_final_budget_pct': side_meta.get('b3_side_final_budget_pct', np.nan),
-                'b3_side_budget_mult': side_meta.get('b3_side_budget_mult', np.nan),
-                'b3_clean_vega_tilt_strength': side_meta.get('b3_clean_vega_tilt_strength', np.nan),
-                'b4_contract_score': self._safe_float(c.get('b4_contract_score', np.nan), np.nan),
-                'b4_product_side_score': side_meta.get('b4_product_side_score', np.nan),
-                'b4_side_equal_budget_pct': side_meta.get('b4_side_equal_budget_pct', np.nan),
-                'b4_side_quality_budget_pct': side_meta.get('b4_side_quality_budget_pct', np.nan),
-                'b4_side_final_budget_pct': side_meta.get('b4_side_final_budget_pct', np.nan),
-                'b4_side_budget_mult': side_meta.get('b4_side_budget_mult', np.nan),
-                'b4_product_tilt_strength': side_meta.get('b4_product_tilt_strength', np.nan),
-                'b4_side_vov_penalty_mult': side_meta.get('b4_side_vov_penalty_mult', np.nan),
-                'b4_premium_to_iv10_score': side_meta.get(
-                    'b4_premium_to_iv10_score',
-                    self._safe_float(c.get('b4_premium_to_iv10_score', np.nan), np.nan),
-                ),
-                'b4_premium_to_stress_score': side_meta.get(
-                    'b4_premium_to_stress_score',
-                    self._safe_float(c.get('b4_premium_to_stress_score', np.nan), np.nan),
-                ),
-                'b4_premium_yield_margin_score': side_meta.get(
-                    'b4_premium_yield_margin_score',
-                    self._safe_float(c.get('b4_premium_yield_margin_score', np.nan), np.nan),
-                ),
-                'b4_gamma_rent_score': side_meta.get(
-                    'b4_gamma_rent_score',
-                    self._safe_float(c.get('b4_gamma_rent_score', np.nan), np.nan),
-                ),
-                'b4_vomma_score': side_meta.get(
-                    'b4_vomma_score',
-                    self._safe_float(c.get('b4_vomma_score', np.nan), np.nan),
-                ),
-                'b4_breakeven_cushion_score': side_meta.get(
-                    'b4_breakeven_cushion_score',
-                    self._safe_float(c.get('b4_breakeven_cushion_score', np.nan), np.nan),
-                ),
-                'b4_vol_of_vol_score': side_meta.get(
-                    'b4_vol_of_vol_score',
-                    self._safe_float(c.get('b4_vol_of_vol_score', np.nan), np.nan),
-                ),
-                'b6_contract_score': self._safe_float(c.get('b6_contract_score', np.nan), np.nan),
-                'b6_product_score': side_meta.get('b6_product_score', np.nan),
-                'b6_product_side_score': side_meta.get('b6_product_side_score', np.nan),
-                'b6_product_equal_budget_pct': side_meta.get('b6_product_equal_budget_pct', np.nan),
-                'b6_product_quality_budget_pct': side_meta.get('b6_product_quality_budget_pct', np.nan),
-                'b6_product_final_budget_pct': side_meta.get('b6_product_final_budget_pct', np.nan),
-                'b6_product_budget_mult': side_meta.get('b6_product_budget_mult', np.nan),
-                'b6_side_equal_budget_pct': side_meta.get('b6_side_equal_budget_pct', np.nan),
-                'b6_side_quality_budget_pct': side_meta.get('b6_side_quality_budget_pct', np.nan),
-                'b6_side_final_budget_pct': side_meta.get('b6_side_final_budget_pct', np.nan),
-                'b6_side_budget_mult': side_meta.get('b6_side_budget_mult', np.nan),
-                'b6_product_tilt_strength': side_meta.get('b6_product_tilt_strength', np.nan),
-                'b6_side_tilt_strength': side_meta.get('b6_side_tilt_strength', np.nan),
-                'b6_side_direction_penalty_mult': side_meta.get(
-                    'b6_side_direction_penalty_mult', np.nan
-                ),
-                'b6_premium_to_stress_score': self._safe_float(
-                    c.get('b6_premium_to_stress_score', np.nan), np.nan
-                ),
-                'b6_premium_to_iv10_score': self._safe_float(
-                    c.get('b6_premium_to_iv10_score', np.nan), np.nan
-                ),
-                'b6_theta_per_vega_score': self._safe_float(
-                    c.get('b6_theta_per_vega_score', np.nan), np.nan
-                ),
-                'b6_theta_per_gamma_score': self._safe_float(
-                    c.get('b6_theta_per_gamma_score', np.nan), np.nan
-                ),
-                'b6_tail_move_coverage_score': self._safe_float(
-                    c.get('b6_tail_move_coverage_score', np.nan), np.nan
-                ),
-                'b6_vomma_score': self._safe_float(c.get('b6_vomma_score', np.nan), np.nan),
-                'b6_premium_yield_margin_score': self._safe_float(
-                    c.get('b6_premium_yield_margin_score', np.nan), np.nan
-                ),
-            }
-            pending_item.update(self._pending_budget_fields(product_budget, effective_strategy_cap))
-            pending_item['effective_s1_stress_budget_pct'] = stress_budget_pct
+            pending_item = build_s1_sell_pending_item(
+                row=c,
+                product=product,
+                option_type=ot,
+                mult=mult,
+                expiry=exp,
+                mr=mr,
+                exchange=exchange,
+                date_str=date_str,
+                group_id=group_id,
+                quantity=nn,
+                single_margin=m,
+                new_greeks=new_greeks,
+                one_stress_loss=one_stress_loss,
+                total_stress_loss=total_stress_loss,
+                open_fee_per_contract=open_fee_per_contract,
+                close_fee_per_contract=close_fee_per_contract,
+                roundtrip_fee_per_contract=roundtrip_fee_per_contract,
+                iv_state=iv_state,
+                side_meta=side_meta,
+                side_budget_mult=side_budget_mult,
+                max_candidates=max_candidates,
+                max_delta_gap=max_delta_gap,
+                max_qty=max_qty,
+                current_vol_regime=self._current_vol_regimes.get(product, ''),
+                effective_strategy_cap=effective_strategy_cap,
+                product_budget_fields=self._pending_budget_fields(product_budget, effective_strategy_cap),
+                stress_budget_pct=stress_budget_pct,
+            )
             self._pending_opens.append(pending_item)
             self._bump_s1_funnel('open_sell_legs')
             self._bump_s1_funnel('open_sell_lots', nn)
@@ -5702,6 +5608,149 @@ class ToolkitMinuteEngine:
             })
 
     # ── 平仓 ─────────────────────────────────────────────────────────────────
+
+    def _close_positions(self, positions, date_str, reason, fee_per_hand, exec_time='', close_qty_by_pos=None):
+        """Close or partially close an explicit list of positions."""
+        to_close = []
+        seen = set()
+        for pos in positions:
+            if pos not in self.positions:
+                continue
+            key = id(pos)
+            if key in seen:
+                continue
+            seen.add(key)
+            to_close.append(pos)
+        if exec_time and self.config.get('skip_same_day_exit_for_vwap_opens', True):
+            to_close = [p for p in to_close if p.open_date != date_str]
+            if not to_close:
+                return
+        if reason.startswith('sl_') and self.config.get('reentry_plan_enabled', True):
+            for pos in to_close:
+                if pos.role == 'sell':
+                    self._register_reentry_plan(pos, date_str)
+                    break
+
+        fully_closed = set()
+        close_qty_by_pos = close_qty_by_pos or {}
+        for pos in to_close:
+            original_n = int(pos.n)
+            if original_n <= 0:
+                fully_closed.add(pos)
+                continue
+            close_qty = int(close_qty_by_pos.get(pos, original_n))
+            close_qty = min(max(close_qty, 1), original_n)
+            is_partial = close_qty < original_n
+
+            original_stress_loss = float(pos.stress_loss or 0.0)
+            original_n_value = pos.n
+            original_cur_price = pos.cur_price
+            if is_partial:
+                pos.n = close_qty
+                pos.stress_loss = original_stress_loss * close_qty / original_n
+
+            raw_execution_price = pos.cur_price
+            close_action = 'sell_close' if pos.role in ('buy', 'protect') else 'buy_close'
+            pos.cur_price, execution_slippage = apply_execution_slippage(
+                raw_execution_price,
+                close_action,
+                self.config,
+                reason=reason,
+            )
+            slippage_cash = float(execution_slippage) * float(pos.mult) * float(pos.n)
+            if pos.role in ('buy', 'protect'):
+                pnl = (pos.cur_price - pos.prev_price) * pos.mult * pos.n
+            else:
+                pnl = (pos.prev_price - pos.cur_price) * pos.mult * pos.n
+            pa = pos.pnl_attribution(total_pnl=pnl)
+            for k, v in pa.items():
+                if k.endswith('_pnl') and k in self._day_attr_realized:
+                    self._day_attr_realized[k] += float(v)
+            fee_action = 'close'
+            if reason == 'expiry':
+                if float(pos.cur_price or 0.0) <= 0.0:
+                    fee_per_contract = 0.0
+                    fee_action = 'expire_otm'
+                elif pos.role in ('buy', 'protect'):
+                    fee_action = 'exercise'
+                    fee_per_contract = self._position_fee_per_contract(
+                        pos, action='exercise', default=fee_per_hand,
+                    )
+                else:
+                    fee_action = 'assign'
+                    fee_per_contract = self._position_fee_per_contract(
+                        pos, action='assign', default=fee_per_hand,
+                    )
+            else:
+                if pos.open_date == date_str:
+                    fee_action = 'close_today'
+                fee_per_contract = self._position_fee_per_contract(
+                    pos, action=fee_action, default=fee_per_hand,
+                )
+            fee = fee_per_contract * pos.n
+            self._day_realized['pnl'] += pnl
+            self._day_realized['fee'] += fee
+            strat_key = pos.strat.lower()
+            if strat_key in self._day_realized:
+                self._day_realized[strat_key] += pnl
+
+            if pos.role in ('buy', 'protect'):
+                order_pnl = (pos.cur_price - pos.open_price) * pos.mult * pos.n
+            else:
+                order_pnl = (pos.open_price - pos.cur_price) * pos.mult * pos.n
+
+            open_premium_cash = float(pos.open_price) * float(pos.mult) * float(pos.n)
+            close_value_cash = float(pos.cur_price) * float(pos.mult) * float(pos.n)
+            premium_retained_cash = (
+                open_premium_cash - close_value_cash
+                if pos.role == 'sell'
+                else np.nan
+            )
+            premium_retained_pct = (
+                premium_retained_cash / open_premium_cash
+                if pos.role == 'sell' and open_premium_cash > 0
+                else np.nan
+            )
+            order_record = {
+                'date': date_str, 'action': reason,
+                'time': exec_time or '',
+                'strategy': pos.strat, 'product': pos.product,
+                'code': pos.code, 'option_type': pos.opt_type,
+                'strike': pos.strike, 'expiry': str(pos.expiry)[:10],
+                'price': round(pos.cur_price, 4), 'quantity': pos.n,
+                'raw_execution_price': round(raw_execution_price, 4),
+                'execution_slippage': round(execution_slippage, 6),
+                'execution_slippage_cash': round(slippage_cash, 2),
+                'fee': round(fee, 2),
+                'fee_per_contract': fee_per_contract,
+                'fee_action': fee_action,
+                'pnl': round(order_pnl, 2),
+                'stress_loss': round(float(pos.stress_loss or 0.0), 2),
+                'margin_at_close': round(pos.cur_margin() if pos.role == 'sell' else 0.0, 2),
+                'open_premium_cash': round(open_premium_cash, 2),
+                'close_value_cash': round(close_value_cash, 2),
+                'premium_retained_cash': round(premium_retained_cash, 2)
+                if np.isfinite(premium_retained_cash) else np.nan,
+                'premium_retained_pct': premium_retained_pct,
+                'position_close_qty': int(close_qty),
+                'position_remaining_qty': int(original_n - close_qty),
+            }
+            for key, value in getattr(pos, 'entry_meta', {}).items():
+                order_record.setdefault(key, value)
+            self.orders.append(order_record)
+
+            if is_partial:
+                remaining_n = original_n - close_qty
+                pos.n = remaining_n
+                pos.stress_loss = original_stress_loss * remaining_n / original_n
+                pos.cur_price = original_cur_price
+            else:
+                pos.n = original_n_value
+                pos.stress_loss = original_stress_loss
+                fully_closed.add(pos)
+
+        if fully_closed:
+            self.positions = [p for p in self.positions if p not in fully_closed]
 
     def _close_group(self, trigger_pos, date_str, reason, fee_per_hand, exec_time=''):
         """平仓整组"""

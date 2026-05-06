@@ -1,0 +1,6 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_stop25.json",
+  "strategy_version": "s1_baseline_b2_product_tilt075_nostop",
+  "premium_stop_multiple": 0.0,
+  "premium_stop_requires_daily_iv_non_decrease": false
+}

@@ -1,113 +1,92 @@
-# 服务器部署包 — 逐分钟回测引擎 v3
+# S1 期权卖权策略回测与研究工程
 
-从 Parquet 分钟线数据源（64亿行期权+2.3亿行期货+3.6亿行ETF）直接读取数据，
-逐分钟处理事件循环，盘中止盈/Greeks风控/应急保护。
+本目录是当前 S1 卖权策略的主要代码仓库。当前生产级回测入口是 `src/toolkit_minute_engine.py`，历史 `true_minute_engine.py`、Parquet 直读引擎和早期试验脚本已经归档到 `archive/`。
 
-## 运行方式
-
-```bash
-# 标准运行
-python src/true_minute_engine.py --start-date 2024-01-01
-
-# 指定结束日期
-python src/true_minute_engine.py --start-date 2024-01-01 --end-date 2026-03-31
-
-# 详细日志
-python src/true_minute_engine.py --start-date 2024-01-01 --verbose
-
-# 自定义配置
-python src/true_minute_engine.py --start-date 2024-01-01 --config /path/to/config.json
-```
-
-## 集成测试
+## 当前主入口
 
 ```bash
-python tests/test_integration.py          # 基础测试
-python tests/test_integration.py --full   # 含多日连续测试
+python3 src/toolkit_minute_engine.py \
+  --config config_s1_baseline_b2_product_tilt075_stop15.json \
+  --start-date 2022-01-01 \
+  --end-date 2026-05-06 \
+  --tag s1_example
 ```
 
-## 数据源
+常用参数：
 
-Parquet 文件（Spark 导出，所有列为 string 类型）：
+| 参数 | 说明 |
+|---|---|
+| `--config` | 回测配置文件，当前多数实验配置仍放在仓库根目录。 |
+| `--start-date` / `--end-date` | 回测日期范围。 |
+| `--tag` | 输出目录和日志识别标签。 |
+| `--verbose` | 输出更详细日志。 |
 
-| 文件 | 大小 | 内容 |
-|------|------|------|
-| OPTION1MINRESULT.parquet | 32GB | 期权分钟K线（64亿行） |
-| FUTURE1MINRESULT.parquet | 5GB | 期货分钟K线（2.3亿行） |
-| ETF1MINRESULT.parquet | 4.5GB | ETF分钟K线（3.6亿行） |
-| CONTRACTINFORESULT.parquet | 1.9MB | 合约属性（19.5万行） |
+## 目录结构
 
-默认路径：`/macro/home/lxy/yy_2_lxy_20260415/`
-可通过环境变量 `PARQUET_DATA_DIR` 或 config.json 的 `parquet_data_dir` 覆盖。
+| 目录 | 当前用途 | 整理原则 |
+|---|---|---|
+| `src/` | 回测引擎和可复用业务模块。 | 只保留当前主路径会调用的代码。历史引擎、一次性脚本不再放这里。 |
+| `scripts/` | 实验启动、结果分析、报告生成、autoresearch 辅助脚本。 | 保留，但必须在 `scripts/README.md` 中登记用途。 |
+| `docs/` | 策略设计、实验方案、审计报告、结构整理记录。 | 研究结论和实验设计统一沉淀在这里。 |
+| `experiments/` | 自动研究系统、审计、scorecard、review 输出。 | 作为实验元数据和自动研究工作区。 |
+| `output/` | 回测落盘结果、图表、报告中间产物。 | 不应作为核心代码依赖来源。 |
+| `logs/` | 本地运行日志。 | 可清理，但不要影响正在运行的远端实验。 |
+| `skills/` | 项目内报告或研究 skills。 | 用于复用报告写作和研究范式。 |
+| `archive/` | 历史引擎、旧脚本、数据维护脚本和 scratch。 | 只读追溯，不作为当前主路径。 |
+| `tests/` | 当前主路径待补测试清单。 | 旧 true-minute 集成测试已归档，后续每轮结构性改动都应补最小测试。 |
 
-## 文件清单
+## 当前核心模块
 
-### 引擎核心
+| 模块 | 职责 |
+|---|---|
+| `toolkit_minute_engine.py` | 当前主回测调度器：日循环、开仓、盘中止损、估值、输出。 |
+| `strategy_rules.py` | S1 策略规则、候选评分、预算倾斜、止损/开仓参数读取。 |
+| `portfolio_risk.py` | 板块、相关组、Greeks、stress budget、保证金上限。 |
+| `budget_model.py` | 开仓预算和分配逻辑。 |
+| `vol_regime.py` | 波动率状态、冷却期、重开规则、低波/降波判断。 |
+| `margin_model.py` | 交易所保证金估算。 |
+| `broker_costs.py` | 手续费和券商成本表。 |
+| `execution_model.py` | 开平仓滑点和成交口径。 |
+| `intraday_execution.py` | 盘中止损成交价、下一分钟价格、持仓索引等执行辅助。 |
+| `open_execution.py` | 待开仓成交、全日成交量约束、延期成交拆分。 |
+| `s1_pending_open.py` | S1 待开仓记录构造。 |
+| `stop_policy.py` | S1 止损范围、分层止损和同组/单合约止损规则。 |
+| `option_calc.py` | Black76/IV/Greeks 计算。 |
+| `spot_provider.py` | 真实标的价格映射。 |
+| `contract_provider.py` | 合约基础信息和乘数。 |
+| `day_loader.py` | Toolkit 数据读取。 |
+| `daily_aggregation.py` | 日频聚合。 |
+| `iv_warmup.py` | IV 预热逻辑。 |
+| `result_output.py` | NAV、订单、诊断和图表原始数据输出。 |
+| `product_taxonomy.py` | 品种板块、相关组、分类。 |
+| `product_lifecycle.py` | 上市观察期和品种生命周期。 |
 
-| 文件 | 说明 |
-|------|------|
-| `src/true_minute_engine.py` | 主引擎：逐分钟事件循环、持仓管理、开仓决策、NAV输出 |
-| `src/parquet_loader.py` | 数据加载：ContractMaster + ParquetDayLoader + DaySlice |
-| `src/iv_surface.py` | IV Smile 曲线：二次多项式拟合 + IV_Residual 选腿增强 |
-| `src/intraday_monitor.py` | 盘中监控：Greeks汇总/阈值检查/止盈/应急保护/买卖价差 |
+## 脚本管理
 
-### 复用模块
+脚本清单见 `scripts/README.md`。新增脚本必须满足：
 
-| 文件 | 说明 |
-|------|------|
-| `src/option_calc.py` | IV反推 + Greeks计算（BSM，含numpy向量化版本） |
-| `src/strategy_rules.py` | 策略规则纯函数（选腿/手数/止盈/应急保护） |
-| `src/backtest_fast.py` | 保证金计算（按交易所区分公式） |
-| `src/exp_product_count.py` | 品种映射 PRODUCT_MAP + 动态排名 |
+1. 能说明用途：实验启动、结果分析、报告生成、审计、数据维护或 scratch。
+2. 如果是一次性脚本，完成后应移动到 `archive/src_scratch/` 或合并进正式分析脚本。
+3. 如果是实验启动脚本，必须写清楚依赖的配置文件和输出 tag。
+4. 如果会修改核心配置或远端任务，必须先确认没有正在运行的冲突实验。
 
-### 配置与测试
+## 当前整理原则
 
-| 文件 | 说明 |
-|------|------|
-| `config.json` | 策略参数（含 intraday_greeks_interval=15、spread_mode 等） |
-| `tests/test_integration.py` | 集成测试（7个用例） |
+根目录仍保留大量 `config_*.json`，这是为了兼容远端启动脚本和历史实验记录。后续可以逐步迁移到 `configs/`，但需要同步修改 launch 脚本、autoresearch 队列和文档引用后再做。
 
-## 盘中处理频率
+当前优先级：
 
-| 检查项 | 频率 | 说明 |
-|--------|------|------|
-| 持仓价格更新 | 每分钟 | 用 Minute_Bar close 更新 cur_price/cur_spot |
-| 应急保护 | 每分钟 | S3 卖腿 OTM% 阈值检查，时效性最高 |
-| 止盈检查 | 每15分钟 | 扣手续费后净利润率，可配置 |
-| IV/Greeks更新 | 每15分钟 | 反推IV → 更新delta/gamma/vega/theta |
-| Greeks风控 | 每15分钟 | cash_delta/vega 超限触发**整组**减仓 |
+1. 继续把 `toolkit_minute_engine.py` 中的长函数拆成可测试的小模块。
+2. 保持远端正在运行实验的核心代码稳定，不在实验中途改远端引擎。
+3. 把所有新实验先登记到 `docs/`，再写配置和启动脚本。
+4. 把报告生成、因子分析、实验审计统一放在 `scripts/` 和 `skills/` 中，避免散落在根目录。
 
-## Greeks 风控参数（config.json）
+## 验证
 
-| 参数 | 值 | 说明 |
-|------|------|------|
-| `greeks_delta_hard` | 10% | Cash Delta 硬限，超过触发平整组减仓 |
-| `greeks_delta_target` | 7% | 减仓目标，平到此值以下停止 |
-| `greeks_vega_hard` | 1% | Cash Vega 硬限 |
-| `greeks_vega_target` | 0.7% | Vega 减仓目标 |
-| `greeks_vega_warn` | 0.8% | Vega 预警，暂停新开仓 |
+结构性改动后至少执行：
 
-### Delta 超限处理逻辑
-1. 按卖腿 |Cash Delta| 降序排序
-2. 对每个卖腿，找同 group_id 的所有腿（卖+买+保护）一起平掉
-3. 逐组平仓直到组合 Delta 降至 target（7%）以下
-4. 开仓时 Delta 感知：根据净 Delta 方向决定 Put/Call 优先级（`get_delta_preferred_order`）
-5. 接近 target 时跳过会加剧偏离的方向（`should_skip_direction`）
-
-## 依赖
-
-```
-python >= 3.10
-numpy
-pandas
-pyarrow
-scipy
-py_vollib
-py_vollib_vectorized  # 可选，加速IV反推
+```bash
+python -m py_compile src/*.py scripts/*.py
 ```
 
-## 服务器环境
-
-- Ubuntu 22.04, Python 3.10
-- H200 256GB RAM
-- 峰值内存 ~3GB（远低于限制）
+如果改动涉及主回测逻辑，还需要在远端或本地做小样本 smoke backtest，并对比关键字段：NAV、持仓数、止损数、保证金、权利金、Greeks 和 PnL attribution。

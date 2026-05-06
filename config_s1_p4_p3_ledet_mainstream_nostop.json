@@ -1,0 +1,4 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_nostop.json",
+  "strategy_version": "s1_p4_p3_ledet_mainstream_nostop"
+}

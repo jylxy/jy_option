@@ -1,5 +1,5 @@
 """
-IV Smile 曲线构建模块
+Archived legacy engine dependency: IV Smile 曲线构建模块
 
 每日收盘时为每个品种的每个到期月构建 IV Smile 曲线（沿 moneyness 方向拟合），
 计算 IV_Residual 作为选腿附加因子。

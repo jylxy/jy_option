@@ -1,0 +1,8 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_stop15_ledet_term_pref.json",
+  "strategy_version": "s1_p5_p3b_a0_group_stop15",
+  "premium_stop_multiple": 1.5,
+  "s1_stop_close_scope": "group",
+  "s1_layered_stop_enabled": false,
+  "s1_layered_stop_levels": []
+}

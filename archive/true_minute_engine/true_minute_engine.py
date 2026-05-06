@@ -1,5 +1,5 @@
 """
-逐分钟回测引擎 — True Minute Backtest Engine
+Archived legacy engine: 逐分钟回测引擎 — True Minute Backtest Engine
 
 直接从 Parquet 分钟线数据源读取数据，逐分钟处理事件循环。
 

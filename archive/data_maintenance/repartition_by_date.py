@@ -1,5 +1,5 @@
 """
-按日期重分区 Parquet — 一次性脚本
+Archived data-maintenance script: 按日期重分区 Parquet — 一次性脚本
 
 用 DuckDB 将按品种分区的大 Parquet 文件重写为按日期分区的小文件。
 

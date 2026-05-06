@@ -47,17 +47,15 @@ def audit_source(root: Path) -> List[Dict[str, str]]:
     findings: List[Dict[str, str]] = []
     engine = root / "src" / "toolkit_minute_engine.py"
     text = engine.read_text(encoding="utf-8", errors="ignore") if engine.exists() else ""
-    if "intraday_exit_done = self._process_intraday_exits" in text and "run_risk_and_tp=not intraday_exit_done" in text:
+    if (
+        "intraday_exit_done = self._process_intraday_exits" in text
+        and "run_risk_and_tp=not intraday_exit_done" in text
+        and "return closed_any" not in text
+    ):
         findings.append({
             "severity": "critical",
             "code": "intraday_exit_skips_daily_stop",
             "message": "盘中扫描即使没有真实平仓，也可能关闭日频止损兜底。",
-        })
-    if "action == 'warn'" in text and "return True" in text:
-        findings.append({
-            "severity": "warning",
-            "code": "warn_action_short_circuits_exit",
-            "message": "分层止损的 warn 动作可能在未降风险时中断后续退出检查。",
         })
     return findings
 

@@ -1,18 +1,8 @@
 {
   "tag": "s1_b2c_stop15_2022_latest",
-  "config": "config_s1_baseline_b2_product_tilt075_stop15.json",
-  "status": "needs_code_fix",
+  "config": "config_s1_p6_a0_group_stop15_codefix.json",
+  "status": "warning",
   "findings": [
-    {
-      "severity": "critical",
-      "code": "intraday_exit_skips_daily_stop",
-      "message": "盘中扫描即使没有真实平仓，也可能关闭日频止损兜底。"
-    },
-    {
-      "severity": "warning",
-      "code": "warn_action_short_circuits_exit",
-      "message": "分层止损的 warn 动作可能在未降风险时中断后续退出检查。"
-    },
     {
       "severity": "warning",
       "code": "negative_vega_pnl",

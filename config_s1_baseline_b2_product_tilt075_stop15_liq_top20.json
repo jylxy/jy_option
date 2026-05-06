@@ -1,0 +1,6 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_stop15.json",
+  "strategy_version": "s1_b2c_stop15_liquidity_top20",
+  "s1_baseline_product_ranking_mode": "liquidity_oi",
+  "daily_scan_top_n": 20
+}

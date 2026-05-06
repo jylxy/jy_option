@@ -1,0 +1,14 @@
+{
+  "extends": "config_s1_baseline_b2_product_tilt075_stop20.json",
+  "strategy_version": "s1_p4_p3b_ledet_term_pref_stop20",
+  "s1_product_expiry_overrides": {
+    "AU": {"mode": "allowed_contract_months", "months": [2, 4, 6, 8, 10], "selection_mode": "nth_expiry", "expiry_rank": 1, "respect_dte_bounds": true},
+    "AG": {"mode": "nth_expiry", "expiry_rank": 1, "respect_dte_bounds": true},
+    "I": {"mode": "nth_expiry", "expiry_rank": 1, "respect_dte_bounds": true},
+    "RB": {"mode": "main_month", "respect_dte_bounds": true},
+    "M": {"mode": "main_month", "respect_dte_bounds": true},
+    "RM": {"mode": "main_month", "respect_dte_bounds": true},
+    "B": {"mode": "main_month", "respect_dte_bounds": true},
+    "P": {"mode": "main_month", "respect_dte_bounds": true}
+  }
+}

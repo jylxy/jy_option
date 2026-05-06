@@ -1,5 +1,5 @@
 """
-Parquet 数据加载模块 — 逐分钟回测引擎的数据层
+Archived legacy engine dependency: Parquet 数据加载模块 — 逐分钟回测引擎的数据层
 
 从 Parquet 分钟线数据源按日分片加载，管理内存。
 所有 Parquet 列为 string 类型（Spark 导出），需要显式类型转换。

@@ -1,0 +1,7 @@
+{
+  "extends": "config_s1_p5_p3b_a0_group_stop15.json",
+  "strategy_version": "s1_p6_a0_next_minute_high",
+  "intraday_stop_execution_price_mode": "next_minute_high",
+  "execution_stop_slippage_pct": 0.0,
+  "execution_slippage_min_abs": 0.0
+}

@@ -31,6 +31,7 @@ DEFAULT_CANDIDATE = (
 DEFAULT_OUTCOMES = (
     "output/s1_candidate_outcomes_s1_b5_full_shadow_v1_2022_latest.csv"
 )
+DEFAULT_PRODUCT_PANEL = None
 
 
 def _num(frame: pd.DataFrame, column: str, default: float = np.nan) -> pd.Series:
@@ -60,6 +61,21 @@ def _clip100(series: pd.Series) -> pd.Series:
 
 def _safe_divide(a: pd.Series, b: pd.Series) -> pd.Series:
     return pd.to_numeric(a, errors="coerce") / pd.to_numeric(b, errors="coerce").replace(0, np.nan)
+
+
+def _safe_cv(std: pd.Series, center: pd.Series) -> pd.Series:
+    denom = pd.to_numeric(center, errors="coerce").abs().replace(0, np.nan)
+    return _safe_divide(std, denom)
+
+
+def _q75(values: pd.Series) -> float:
+    clean = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(clean.quantile(0.75)) if len(clean) else np.nan
+
+
+def _median_abs(values: pd.Series) -> float:
+    clean = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(clean.abs().median()) if len(clean) else np.nan
 
 
 def _weighted_score(parts: dict[str, tuple[pd.Series, float]]) -> pd.Series:
@@ -132,6 +148,7 @@ def _aggregate_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
         "gross_premium_cash_1lot",
         "premium_yield_margin",
         "b5_premium_per_capital_day",
+        "rv_ref",
         "variance_carry",
         "b5_variance_carry_forward",
         "iv_rv_spread_candidate",
@@ -142,11 +159,23 @@ def _aggregate_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
         "b5_premium_per_vega",
         "premium_to_stress_loss",
         "b5_premium_to_tail_move_loss",
+        "b5_tail_move_pct",
+        "b5_tail_move_loss_cash",
         "b5_premium_to_mae20_loss",
+        "b5_mae20_move_pct",
+        "b5_mae20_loss_cash",
         "b5_premium_to_expected_move_loss",
+        "b5_expected_move_pct",
+        "b5_expected_move_loss_cash",
         "gamma_rent_penalty",
         "b3_vomma_loss_ratio",
+        "b3_vol_of_vol_proxy",
         "b5_range_expansion_proxy_20d",
+        "b5_atm_iv_mom_5d",
+        "b5_atm_iv_mom_20d",
+        "b5_atm_iv_accel",
+        "b5_iv_zscore_60d",
+        "b5_iv_reversion_score",
         "b5_product_stop_count_20d",
         "b5_cooldown_penalty_score",
         "option_price",
@@ -251,7 +280,67 @@ def _aggregate_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
     grouped = grouped.join(product_side_count, how="left")
     grouped["avg_candidates_per_day"] = _safe_divide(grouped["candidate_count"], grouped["signal_days"])
     grouped["both_side_day_ratio_proxy"] = (grouped["avg_sides_per_day"] / 2.0).clip(0.0, 1.0)
+
+    stability = c.groupby("product", dropna=False).agg(
+        contract_iv_median=("contract_iv", "median"),
+        contract_iv_std=("contract_iv", "std"),
+        rv_ref_median=("rv_ref", "median"),
+        rv_ref_std=("rv_ref", "std"),
+        iv_rv_spread_std=("iv_rv_spread_candidate", "std"),
+        iv_rv_ratio_std=("iv_rv_ratio_candidate", "std"),
+        variance_carry_std=("variance_carry", "std"),
+        variance_carry_forward_std=("b5_variance_carry_forward", "std"),
+        tail_move_pct_median=("b5_tail_move_pct", "median"),
+        tail_move_pct_p75=("b5_tail_move_pct", _q75),
+        mae20_move_pct_median=("b5_mae20_move_pct", "median"),
+        mae20_move_pct_p75=("b5_mae20_move_pct", _q75),
+        expected_move_pct_median=("b5_expected_move_pct", "median"),
+        expected_move_pct_p75=("b5_expected_move_pct", _q75),
+        range_expansion_p75=("b5_range_expansion_proxy_20d", _q75),
+        range_expansion_std=("b5_range_expansion_proxy_20d", "std"),
+        vol_of_vol_median=("b3_vol_of_vol_proxy", "median"),
+        vol_of_vol_p75=("b3_vol_of_vol_proxy", _q75),
+        atm_iv_abs_mom5_median=("b5_atm_iv_mom_5d", _median_abs),
+        atm_iv_abs_accel_median=("b5_atm_iv_accel", _median_abs),
+        iv_reversion_score_median=("b5_iv_reversion_score", "median"),
+    )
+    stability["contract_iv_cv"] = _safe_cv(stability["contract_iv_std"], stability["contract_iv_median"])
+    stability["rv_ref_cv"] = _safe_cv(stability["rv_ref_std"], stability["rv_ref_median"])
+    grouped = grouped.join(stability, how="left")
     return grouped.reset_index()
+
+
+def _aggregate_product_panel(product_panel: pd.DataFrame) -> pd.DataFrame:
+    if product_panel is None or product_panel.empty:
+        return pd.DataFrame(columns=["product"])
+    p = product_panel.copy()
+    for column in (
+        "b5_empirical_lower_tail_dependence_95",
+        "b5_empirical_upper_tail_dependence_95",
+        "b5_lower_tail_dependence_excess",
+        "b5_upper_tail_dependence_excess",
+        "b5_lower_tail_beta",
+        "b5_upper_tail_beta",
+        "b5_tail_window_days_used",
+    ):
+        p[column] = _num(p, column)
+    p["product_tail_dependence_max"] = p[
+        ["b5_empirical_lower_tail_dependence_95", "b5_empirical_upper_tail_dependence_95"]
+    ].max(axis=1, skipna=True)
+    p["product_tail_dependence_excess_max"] = p[
+        ["b5_lower_tail_dependence_excess", "b5_upper_tail_dependence_excess"]
+    ].max(axis=1, skipna=True)
+    p["product_tail_beta_abs_max"] = p[["b5_lower_tail_beta", "b5_upper_tail_beta"]].abs().max(axis=1, skipna=True)
+    out = p.groupby("product", dropna=False).agg(
+        product_tail_dependence_max_median=("product_tail_dependence_max", "median"),
+        product_tail_dependence_max_p75=("product_tail_dependence_max", _q75),
+        product_tail_dependence_excess_max_median=("product_tail_dependence_excess_max", "median"),
+        product_tail_dependence_excess_max_p75=("product_tail_dependence_excess_max", _q75),
+        product_tail_beta_abs_max_median=("product_tail_beta_abs_max", "median"),
+        product_tail_beta_abs_max_p75=("product_tail_beta_abs_max", _q75),
+        product_tail_window_days_used_median=("b5_tail_window_days_used", "median"),
+    )
+    return out.reset_index()
 
 
 def _aggregate_outcomes(outcomes: pd.DataFrame) -> pd.DataFrame:
@@ -356,13 +445,38 @@ def _score_products(product_frame: pd.DataFrame, min_signal_days: int) -> pd.Dat
             "cooldown": (_clip100(_rank_low(p["cooldown_penalty_median"])), 0.04),
         }
     )
+    tail_dependence_p75 = p.get(
+        "product_tail_dependence_max_p75",
+        pd.Series(np.nan, index=p.index),
+    )
+    tail_beta_p75 = p.get(
+        "product_tail_beta_abs_max_p75",
+        pd.Series(np.nan, index=p.index),
+    )
+    p["stability_score"] = _weighted_score(
+        {
+            "tail_move": (_clip100(_rank_low(p["tail_move_pct_p75"])), 0.16),
+            "mae20": (_clip100(_rank_low(p["mae20_move_pct_p75"])), 0.10),
+            "expected_move": (_clip100(_rank_low(p["expected_move_pct_p75"])), 0.08),
+            "range_p75": (_clip100(_rank_low(p["range_expansion_p75"])), 0.10),
+            "range_std": (_clip100(_rank_low(p["range_expansion_std"])), 0.06),
+            "iv_cv": (_clip100(_rank_low(p["contract_iv_cv"])), 0.12),
+            "rv_cv": (_clip100(_rank_low(p["rv_ref_cv"])), 0.10),
+            "carry_std": (_clip100(_rank_low(p["variance_carry_forward_std"])), 0.10),
+            "iv_mom": (_clip100(_rank_low(p["atm_iv_abs_mom5_median"])), 0.06),
+            "vov": (_clip100(_rank_low(p["vol_of_vol_p75"])), 0.06),
+            "tail_dep": (_clip100(_rank_low(tail_dependence_p75)), 0.04),
+            "tail_beta": (_clip100(_rank_low(tail_beta_p75)), 0.02),
+        }
+    )
     p["ex_ante_score"] = _weighted_score(
         {
-            "data": (p["data_score"], 0.15),
-            "liquidity": (p["liquidity_score_pss"], 0.20),
-            "premium": (p["premium_pool_score"], 0.20),
-            "carry": (p["carry_score"], 0.20),
-            "tail": (p["tail_safety_score"], 0.25),
+            "data": (p["data_score"], 0.12),
+            "liquidity": (p["liquidity_score_pss"], 0.18),
+            "premium": (p["premium_pool_score"], 0.18),
+            "carry": (p["carry_score"], 0.17),
+            "tail": (p["tail_safety_score"], 0.20),
+            "stability": (p["stability_score"], 0.15),
         }
     )
 
@@ -387,6 +501,7 @@ def _score_products(product_frame: pd.DataFrame, min_signal_days: int) -> pd.Dat
     p["low_liquidity_flag"] = p["liquidity_score_pss"] < 30.0
     p["low_premium_pool_flag"] = p["premium_pool_score"] < 30.0
     p["tail_fragile_flag"] = p["tail_safety_score"] < 30.0
+    p["unstable_vol_tail_flag"] = p["stability_score"] < 30.0
     p["microstructure_bad_flag"] = (
         (p["low_price_rate"].fillna(0.0) > 0.80)
         | (p["friction_ratio_p75"].fillna(0.0) > 0.30)
@@ -414,7 +529,11 @@ def _score_products(product_frame: pd.DataFrame, min_signal_days: int) -> pd.Dat
             return "Observe"
         if row["low_liquidity_flag"] or row["microstructure_bad_flag"]:
             return "Exclude"
+        if row["tail_fragile_flag"] and row["unstable_vol_tail_flag"]:
+            return "Exclude"
         if row["tail_fragile_flag"]:
+            return "Observe"
+        if row["unstable_vol_tail_flag"]:
             return "Observe"
         score = row["ex_ante_score"]
         if score >= 70:
@@ -456,6 +575,8 @@ def _reason_text(row: pd.Series) -> str:
         reasons.append("thin_premium_pool")
     if row.get("tail_fragile_flag", False):
         reasons.append("tail_fragile")
+    if row.get("unstable_vol_tail_flag", False):
+        reasons.append("unstable_vol_tail")
     if row.get("microstructure_bad_flag", False):
         reasons.append("microstructure_bad")
     if row.get("validation_bad_flag", False):
@@ -507,9 +628,14 @@ def _write_report(scored: pd.DataFrame, output_path: Path, tag: str, filter_desc
         "premium_pool_score",
         "carry_score",
         "tail_safety_score",
+        "stability_score",
         "outcome_validation_score",
         "signal_days",
         "monthly_premium_pool_median",
+        "tail_move_pct_p75",
+        "contract_iv_cv",
+        "rv_ref_cv",
+        "variance_carry_forward_std",
         "stop_rate",
         "retention_ratio_mean",
         "main_reason",
@@ -527,6 +653,7 @@ def _write_report(scored: pd.DataFrame, output_path: Path, tag: str, filter_desc
     lines.append("- `premium_pool_score`: monthly available premium pool, premium/margin, premium/vega and capital-day efficiency.")
     lines.append("- `carry_score`: IV/RV and variance-carry style compensation plus theta/vega and premium/stress.")
     lines.append("- `tail_safety_score`: premium coverage of tail/MAE/stress, gamma/vomma/range/cooldown fragility.")
+    lines.append("- `stability_score`: lower realized tail move, MAE, range expansion, IV/RV dispersion, vol-of-vol and tail-dependence risk.")
     lines.append("- `outcome_validation_score`: retained premium, stop rate, left-tail labels and stop clustering.")
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -535,6 +662,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", default=DEFAULT_CANDIDATE)
     parser.add_argument("--outcomes", default=DEFAULT_OUTCOMES)
+    parser.add_argument("--product-panel", default=DEFAULT_PRODUCT_PANEL)
     parser.add_argument("--output-dir", default="output/product_suitability")
     parser.add_argument("--tag", default="s1_b5_full_shadow_v1_2022_latest")
     parser.add_argument("--min-signal-days", type=int, default=120)
@@ -552,6 +680,9 @@ def main() -> None:
     args = parse_args()
     candidate_path = Path(args.candidate)
     outcomes_path = Path(args.outcomes)
+    product_panel_path = Path(args.product_panel) if args.product_panel else Path(
+        f"output/s1_b5_product_panel_{args.tag}.csv"
+    )
     if not candidate_path.exists():
         raise FileNotFoundError(f"candidate file not found: {candidate_path}")
 
@@ -565,6 +696,10 @@ def main() -> None:
     product_candidates = _aggregate_candidates(candidates)
     product_outcomes = _aggregate_outcomes(outcomes)
     merged = product_candidates.merge(product_outcomes, on="product", how="left")
+    if product_panel_path.exists():
+        product_panel = pd.read_csv(product_panel_path, low_memory=False)
+        product_panel_agg = _aggregate_product_panel(product_panel)
+        merged = merged.merge(product_panel_agg, on="product", how="left")
     scored = _score_products(merged, min_signal_days=args.min_signal_days)
 
     out_dir = Path(args.output_dir)
@@ -588,6 +723,7 @@ def main() -> None:
         "premium_pool_score",
         "carry_score",
         "tail_safety_score",
+        "stability_score",
         "outcome_validation_score",
         "main_reason",
     ]

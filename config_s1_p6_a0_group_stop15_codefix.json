@@ -1,0 +1,4 @@
+{
+  "extends": "config_s1_p5_p3b_a0_group_stop15.json",
+  "strategy_version": "s1_p6_a0_group_stop15_codefix"
+}
