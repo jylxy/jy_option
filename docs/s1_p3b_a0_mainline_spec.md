@@ -21,7 +21,30 @@ config_s1_p5_p3b_a0_group_stop15.json
 -> config_s1_baseline_b0_all_products_stop25.json
 ```
 
-因此，P3B/A0 不是最早的裸 B0，而是目前被选为主线的“朴素卖权 + 可交易性排序 + 品种预算倾斜 + 乐得期限偏好 + 组级 1.5x 止损”版本。
+因此，P3B/A0 不是最早的裸 B0，而是目前被选为主线的“全品种朴素卖权基准 + 流动性/OI 排序 + 品种预算倾斜 + 乐得期限/合约月份偏好 + 组级 1.5x 权利金止损”版本。
+
+这条主线必须由两部分共同定义：
+
+- 配置文件：`config_s1_p5_p3b_a0_group_stop15.json`。
+- 固定品种池：`AG, AL, AO, AU, B, CU, EB, EG, FG, I, M, MA, NI, P, RB, RM, RU, SA, SC, SH, SN, TA, ZN`。
+
+品种池已经固化在 `config_s1_p5_p3b_a0_group_stop15.json` 的 `product_pool` 字段里。命令行 `--products` 仍可临时覆盖，但正式主线对比不应随意覆盖。若配置文件和运行时品种池不一致，该次结果不应被标记为 P3B/A0 主线结果。
+
+固定运行命令模板如下：
+
+```bash
+python3 src/toolkit_minute_engine.py \
+  --config config_s1_p5_p3b_a0_group_stop15.json \
+  --start-date 2022-01-01 \
+  --end-date 2026-05-06 \
+  --tag <tag>
+```
+
+如需显式校验品种池，也可以附加同一组 `--products`：
+
+```bash
+--products AG,AL,AO,AU,B,CU,EB,EG,FG,I,M,MA,NI,P,RB,RM,RU,SA,SC,SH,SN,TA,ZN
+```
 
 ## 2. 交易目标
 
@@ -48,6 +71,13 @@ P3B/A0 继续服务于 S1 的核心目标：
   - `AU`：只选 2/4/6/8/10 月，且仍尊重 DTE 边界。
   - `AG`、`I`：近月偏好，仍尊重 DTE 边界。
   - `RB`、`M`、`RM`、`B`、`P`：主力月偏好，仍尊重 DTE 边界。
+
+这里需要特别区分“乐得期限偏好”和“期限结构因子”：
+
+- 当前 P3B/A0 已经实现的是乐得访谈口径下的期限/合约月份偏好，也就是对特定品种覆盖开仓到期选择。
+- 当前 P3B/A0 没有启用 B3/B4 中的 term structure slope、near/far IV pressure 或期限结构打分。
+- 因此，如果“期限结构”指近远月 IV 曲线斜率、期限价差或 forward variance pressure，那么它没有进入当前主线；如果“期限结构”指 AU 双月、AG/I 近月、部分品种主力月这样的合约月份偏好，那么它已经进入当前主线。
+- 后续若要重新引入真正的期限结构因子，应作为独立控制变量实验，不应和 P3B/A0 基准混在一起。
 
 ## 4. 当前主线退出与止损
 
@@ -121,4 +151,3 @@ Premium Pool × Deployment Ratio × Retention Rate
 - Tail / Stop Loss
 - Cost / Slippage
 ```
-

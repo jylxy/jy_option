@@ -1267,9 +1267,18 @@ class ToolkitMinuteEngine:
 
         logger.info("回测 %d 天: %s ~ %s", len(dates), dates[0], dates[-1])
 
-        # 确定品种池
+        # 确定品种池：命令行优先，其次使用配置固化的主线品种池。
         if products:
             product_pool = set(p.upper() for p in products)
+        elif self.config.get('product_pool') or self.config.get('products'):
+            configured_products = self.config.get('product_pool') or self.config.get('products')
+            if isinstance(configured_products, str):
+                configured_products = configured_products.split(',')
+            product_pool = {
+                str(product).strip().upper()
+                for product in configured_products
+                if str(product).strip()
+            }
         else:
             product_pool = self._get_default_product_pool()
         self._ensure_product_first_trade_dates(product_pool)
