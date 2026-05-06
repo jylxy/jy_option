@@ -84,6 +84,12 @@
 
 主引擎中的 `_update_contract_iv_history` 与 `_contract_trend_state` 已改为调用该模块，并增加 `(option_code, history_length, last_date)` 缓存。该路径会被 P3B/A0 的 S1 选腿使用，因此这是主线性能优化；计算口径保持与原实现一致，但避免为每个候选合约反复构造小 pandas Series。
 
+## 4.5 第六轮 strategy_rules 分层
+
+已新增 `src/s3_rules.py`，承接 S3 比例价差的买腿、卖腿、保护腿以及 OTM% 选腿函数。
+
+`strategy_rules.py` 继续 re-export 这些函数，外部调用路径保持兼容。这样做的目的不是改变 S3 逻辑，而是把 S1 主线规则、S3 结构规则和通用保证金/筛选规则逐步分层，降低 `strategy_rules.py` 的体积和误读风险。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：
