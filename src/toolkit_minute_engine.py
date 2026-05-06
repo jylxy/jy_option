@@ -101,6 +101,7 @@ from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
 from result_output import write_backtest_outputs
+from portfolio_diagnostics import build_portfolio_diagnostics_records
 from day_loader import ToolkitDayLoader
 from config_loader import load_engine_config
 from iv_warmup import (
@@ -3000,6 +3001,10 @@ class ToolkitMinuteEngine:
                 pos.dte = dte
 
         position_index = index_intraday_positions(eligible_positions)
+        threshold_by_code = {
+            code: self._intraday_stop_threshold(code, position_index.positions_by_code)
+            for code in position_index.positions_by_code
+        }
         price_context = build_intraday_price_context(
             price_df,
             execution_mode=self.config.get('intraday_stop_execution_price_mode', 'current_close'),
@@ -3075,18 +3080,30 @@ class ToolkitMinuteEngine:
                     code = row.ths_code
                     price = float(row.close)
                     volume = float(getattr(row, 'volume', 0.0) or 0.0)
-                    threshold = self._intraday_stop_threshold(code, position_index.positions_by_code)
+                    threshold = threshold_by_code.get(code, np.nan)
                     stop_candidate = np.isfinite(threshold) and threshold > 0 and price >= threshold
-                    if not self._confirm_intraday_stop_price(
-                        code,
-                        price,
-                        volume,
-                        tm,
-                        stop_pending,
-                        position_index.positions_by_code,
-                        position_index.quantity_by_code,
-                    ):
+                    if not stop_candidate and not take_profit_enabled:
+                        pending = stop_pending.get(code)
+                        if pending and np.isfinite(threshold) and threshold > 0:
+                            revert_ratio = float(
+                                self.config.get(
+                                    'intraday_stop_confirmation_revert_ratio', 0.98
+                                ) or 0.98
+                            )
+                            if price < threshold * revert_ratio:
+                                stop_pending.pop(code, None)
                         continue
+                    if stop_candidate:
+                        if not self._confirm_intraday_stop_price(
+                            code,
+                            price,
+                            volume,
+                            tm,
+                            stop_pending,
+                            position_index.positions_by_code,
+                            position_index.quantity_by_code,
+                        ):
+                            continue
                     if not (stop_candidate or take_profit_enabled):
                         continue
                     confirmed_stop_this_minute = confirmed_stop_this_minute or stop_candidate
@@ -6007,183 +6024,21 @@ class ToolkitMinuteEngine:
     def _record_daily_diagnostics(self, date_str, nav):
         if not self.config.get('portfolio_diagnostics_enabled', True):
             return
-        nav = max(float(nav), 1.0)
         budget = self._current_open_budget or self._get_effective_open_budget()
-        bucket_max_active = int(self.config.get('portfolio_bucket_max_active_products', 3) or 0)
-        corr_max_active = int(self.config.get('portfolio_corr_group_max_active_products', 2) or 0)
-        bucket_margin_cap = float(budget.get('bucket_margin_cap', 0.0) or 0.0)
-        bucket_stress_cap = float(budget.get('portfolio_bucket_stress_loss_cap', 0.0) or 0.0)
-        corr_group_margin_cap = float(budget.get('corr_group_margin_cap', 0.0) or 0.0)
-        corr_group_stress_cap = float(budget.get('corr_group_stress_loss_cap', 0.0) or 0.0)
-        product_side_margin_cap = float(budget.get('product_side_margin_cap', 0.0) or 0.0)
-        product_side_stress_cap = float(budget.get('product_side_stress_loss_cap', 0.0) or 0.0)
-        contract_lot_cap = int(self.config.get('portfolio_contract_lot_cap', 0) or 0)
-        contract_stress_cap = float(budget.get('contract_stress_loss_cap', 0.0) or 0.0)
-        bucket_state = defaultdict(lambda: {
-            'margin': 0.0,
-            'cash_vega': 0.0,
-            'cash_gamma': 0.0,
-            'stress_loss': 0.0,
-            'products': set(),
-            'positions': 0,
-        })
-        corr_state = defaultdict(lambda: {
-            'margin': 0.0,
-            'cash_vega': 0.0,
-            'cash_gamma': 0.0,
-            'stress_loss': 0.0,
-            'products': set(),
-            'positions': 0,
-        })
-        s1_product_side_state = defaultdict(lambda: {
-            'margin': 0.0,
-            'cash_vega': 0.0,
-            'cash_gamma': 0.0,
-            'cash_theta': 0.0,
-            'stress_loss': 0.0,
-            'contracts': set(),
-            'contract_lots': defaultdict(float),
-            'contract_stress_loss': defaultdict(float),
-            'lots': 0.0,
-            'open_premium': 0.0,
-            'liability': 0.0,
-        })
-        for pos in self.positions:
-            bucket = self._get_product_bucket(pos.product)
-            corr_group = self._get_product_corr_group(pos.product)
-            margin = pos.cur_margin() if pos.role == 'sell' else 0.0
-            cv = pos.cash_vega()
-            cg = pos.cash_gamma()
-            stress_loss = float(getattr(pos, 'stress_loss', 0.0) or 0.0)
-            for state, key in ((bucket_state, bucket), (corr_state, corr_group)):
-                state[key]['margin'] += margin
-                state[key]['cash_vega'] += cv
-                state[key]['cash_gamma'] += cg
-                state[key]['stress_loss'] += stress_loss
-                state[key]['products'].add(self._normalize_product_key(pos.product))
-                state[key]['positions'] += 1
-            if pos.strat == 'S1' and pos.role == 'sell':
-                side = str(pos.opt_type or '').upper()[:1]
-                product = self._normalize_product_key(pos.product)
-                data = s1_product_side_state[(product, side)]
-                data['margin'] += margin
-                data['cash_vega'] += cv
-                data['cash_gamma'] += cg
-                data['cash_theta'] += pos.cash_theta()
-                data['stress_loss'] += stress_loss
-                data['contracts'].add(pos.code)
-                lots = float(pos.n or 0.0)
-                data['lots'] += lots
-                data['contract_lots'][pos.code] += lots
-                data['contract_stress_loss'][pos.code] += stress_loss
-                data['open_premium'] += float(pos.open_price) * float(pos.mult) * float(pos.n or 0.0)
-                data['liability'] += float(pos.cur_price) * float(pos.mult) * float(pos.n or 0.0)
-        for bucket, data in bucket_state.items():
-            self.diagnostics_records.append({
-                'date': date_str,
-                'scope': 'bucket',
-                'name': bucket,
-                'margin_pct': data['margin'] / nav,
-                'cash_vega_pct': data['cash_vega'] / nav,
-                'cash_gamma_pct': data['cash_gamma'] / nav,
-                'stress_loss_pct': data['stress_loss'] / nav,
-                'margin_cap': bucket_margin_cap,
-                'stress_loss_cap': bucket_stress_cap,
-                'margin_cap_used': (
-                    data['margin'] / nav / bucket_margin_cap if bucket_margin_cap > 0 else np.nan
-                ),
-                'stress_cap_used': (
-                    data['stress_loss'] / nav / bucket_stress_cap if bucket_stress_cap > 0 else np.nan
-                ),
-                'n_products': len(data['products']),
-                'n_positions': data['positions'],
-                'max_active_products': bucket_max_active,
-                'active_product_cap_used': (
-                    len(data['products']) / bucket_max_active if bucket_max_active > 0 else np.nan
-                ),
-                'portfolio_vol_regime': self._current_portfolio_regime,
-            })
-        for (product, side), data in s1_product_side_state.items():
-            bucket = self._get_product_bucket(product)
-            corr_group = self._get_product_corr_group(product)
-            unrealized_premium = data['open_premium'] - data['liability']
-            max_contract_lots = max(data['contract_lots'].values()) if data['contract_lots'] else 0.0
-            max_contract_stress = (
-                max(data['contract_stress_loss'].values())
-                if data['contract_stress_loss'] else 0.0
+        self.diagnostics_records.extend(
+            build_portfolio_diagnostics_records(
+                positions=self.positions,
+                config=self.config,
+                budget=budget,
+                date_str=date_str,
+                nav=nav,
+                current_vol_regimes=self._current_vol_regimes,
+                current_portfolio_regime=self._current_portfolio_regime,
+                normalize_product_key=self._normalize_product_key,
+                get_product_bucket=self._get_product_bucket,
+                get_product_corr_group=self._get_product_corr_group,
             )
-            self.diagnostics_records.append({
-                'date': date_str,
-                'scope': 's1_product_side',
-                'name': f'{product}:{side}',
-                'product': product,
-                'option_type': side,
-                'bucket': bucket,
-                'corr_group': corr_group,
-                'product_vol_regime': self._current_vol_regimes.get(product, ''),
-                'lots': data['lots'],
-                'n_contracts': len(data['contracts']),
-                'max_contract_lots': max_contract_lots,
-                'margin_pct': data['margin'] / nav,
-                'cash_vega_pct': data['cash_vega'] / nav,
-                'cash_gamma_pct': data['cash_gamma'] / nav,
-                'cash_theta_pct': data['cash_theta'] / nav,
-                'stress_loss_pct': data['stress_loss'] / nav,
-                'max_contract_stress_loss_pct': max_contract_stress / nav,
-                'margin_cap': product_side_margin_cap,
-                'stress_loss_cap': product_side_stress_cap,
-                'contract_lot_cap': contract_lot_cap,
-                'contract_stress_loss_cap': contract_stress_cap,
-                'margin_cap_used': (
-                    data['margin'] / nav / product_side_margin_cap
-                    if product_side_margin_cap > 0 else np.nan
-                ),
-                'stress_cap_used': (
-                    data['stress_loss'] / nav / product_side_stress_cap
-                    if product_side_stress_cap > 0 else np.nan
-                ),
-                'max_contract_lot_cap_used': (
-                    max_contract_lots / contract_lot_cap if contract_lot_cap > 0 else np.nan
-                ),
-                'max_contract_stress_cap_used': (
-                    max_contract_stress / nav / contract_stress_cap
-                    if contract_stress_cap > 0 else np.nan
-                ),
-                'open_premium': data['open_premium'],
-                'current_liability': data['liability'],
-                'unrealized_premium': unrealized_premium,
-                'open_premium_pct': data['open_premium'] / nav,
-                'current_liability_pct': data['liability'] / nav,
-                'unrealized_premium_pct': unrealized_premium / nav,
-                'portfolio_vol_regime': self._current_portfolio_regime,
-            })
-        for group, data in corr_state.items():
-            self.diagnostics_records.append({
-                'date': date_str,
-                'scope': 'corr_group',
-                'name': group,
-                'margin_pct': data['margin'] / nav,
-                'cash_vega_pct': data['cash_vega'] / nav,
-                'cash_gamma_pct': data['cash_gamma'] / nav,
-                'stress_loss_pct': data['stress_loss'] / nav,
-                'margin_cap': corr_group_margin_cap,
-                'stress_loss_cap': corr_group_stress_cap,
-                'margin_cap_used': (
-                    data['margin'] / nav / corr_group_margin_cap
-                    if corr_group_margin_cap > 0 else np.nan
-                ),
-                'stress_cap_used': (
-                    data['stress_loss'] / nav / corr_group_stress_cap
-                    if corr_group_stress_cap > 0 else np.nan
-                ),
-                'n_products': len(data['products']),
-                'n_positions': data['positions'],
-                'max_active_products': corr_max_active,
-                'active_product_cap_used': (
-                    len(data['products']) / corr_max_active if corr_max_active > 0 else np.nan
-                ),
-                'portfolio_vol_regime': self._current_portfolio_regime,
-            })
+        )
 
     def _update_nav_snapshot(self, date_str):
         """记录每日NAV"""
