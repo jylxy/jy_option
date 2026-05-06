@@ -1,0 +1,15 @@
+{
+  "id": "example_p5_fix",
+  "hypothesis": "Fix intraday stop fallback before accepting layered stop experiments.",
+  "formula_variable": "Tail / Stop Loss",
+  "sample_role": "stress",
+  "base_config": "config_s1_p5_p3b_a0_group_stop15.json",
+  "config_patch": {},
+  "tag": "s1_autoresearch_example_p5_fix",
+  "start_date": "2022-01-01",
+  "end_date": null,
+  "products": "CU,AL,ZN,SN,NI,AU,AG,EG,TA,MA,EB,SH,SA,FG,AO,SC,M,RM,B,P,RB,I,RU",
+  "baseline_tag": "s1_p5_p3b_a0_group_stop15_2022_latest",
+  "expected_effect": "Reduce false tail retention and avoid accepting B1/B3 before code-fix rerun.",
+  "risk_notes": "This is a documentation template; core engine code changes require manual audit before launch."
+}

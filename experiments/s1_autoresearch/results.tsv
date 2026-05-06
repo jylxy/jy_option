@@ -1,0 +1,1 @@
+timestamp	experiment_id	tag	status	formula_variable	sample_role	start_date	end_date	total_return	annual_return	max_drawdown	sharpe	calmar	vega_pnl	theta_pnl	gamma_pnl	delta_pnl	residual_pnl	stop_count	stop_pnl	avg_margin_ratio	max_margin_ratio	excess_return_vs_baseline	excess_mdd_vs_baseline	decision	notes
