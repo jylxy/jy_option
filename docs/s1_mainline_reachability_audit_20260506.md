@@ -54,6 +54,12 @@
 
 这一步只改变脚本组织和入口路径，不改变交易逻辑。
 
+## 4.1 第二轮小步抽离
+
+已新增 `src/s1_shadow_universe.py`，先承接 B5/full shadow 的字段定义和后续面板输出辅助函数。当前主引擎先引用 `S1_B5_CANDIDATE_FIELDS`，交易逻辑不变。
+
+后续应继续把 `toolkit_minute_engine.py` 中的 `_write_s1_b5_candidate_panels`、tail dependence panel、B6 评分等调用迁出，使 shadow 研究层真正变成显式启用的实验模块。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：
@@ -82,4 +88,3 @@
 ## 7. 下一步建议
 
 下一步优先拆 `toolkit_minute_engine.py` 的 shadow / experimental scoring 逻辑。原因是这些代码体量大、字段多、主线默认不用，且容易让后续审计误以为 P3B/A0 使用了复杂因子。
-

@@ -98,6 +98,7 @@ from stop_policy import (
 )
 from s1_pending_open import build_s1_sell_pending_item
 from s1_budget_tilt import compute_b2_product_budget_map
+from s1_shadow_universe import S1_B5_CANDIDATE_FIELDS, write_b5_candidate_panels
 from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
@@ -241,36 +242,7 @@ class ToolkitMinuteEngine:
         'b6_premium_yield_margin_score',
     )
 
-    _S1_B5_CANDIDATE_FIELDS = (
-        'b5_delta_bucket', 'b5_delta_to_cap', 'b5_delta_ratio_to_cap',
-        'b5_rank_in_delta_bucket', 'b5_delta_bucket_candidate_count',
-        'b5_premium_share_delta_bucket', 'b5_stress_share_delta_bucket',
-        'b5_theta_per_gamma', 'b5_gamma_theta_ratio',
-        'b5_theta_per_vega', 'b5_premium_per_vega',
-        'b5_expected_move_pct', 'b5_expected_move_loss_cash',
-        'b5_premium_to_expected_move_loss',
-        'b5_mae20_move_pct', 'b5_mae20_loss_cash',
-        'b5_premium_to_mae20_loss',
-        'b5_tail_move_pct', 'b5_tail_move_loss_cash',
-        'b5_premium_to_tail_move_loss',
-        'b5_mom_5d', 'b5_mom_20d', 'b5_mom_60d',
-        'b5_trend_z_20d',
-        'b5_breakout_distance_up_60d',
-        'b5_breakout_distance_down_60d',
-        'b5_up_day_ratio_20d', 'b5_down_day_ratio_20d',
-        'b5_range_expansion_proxy_20d',
-        'b5_atm_iv_mom_5d', 'b5_atm_iv_mom_20d',
-        'b5_atm_iv_accel', 'b5_iv_zscore_60d',
-        'b5_iv_reversion_score',
-        'b5_days_since_product_stop', 'b5_product_stop_count_20d',
-        'b5_days_since_product_side_stop',
-        'b5_product_side_stop_count_20d',
-        'b5_cooldown_blocked', 'b5_cooldown_penalty_score',
-        'b5_cooldown_release_score',
-        'b5_tick_value_ratio', 'b5_low_price_flag',
-        'b5_variance_carry_forward',
-        'b5_capital_lockup_days', 'b5_premium_per_capital_day',
-    )
+    _S1_B5_CANDIDATE_FIELDS = S1_B5_CANDIDATE_FIELDS
 
     def _entry_meta_from_item(self, item):
         return {key: item.get(key, np.nan) for key in self._ENTRY_META_FIELDS}
