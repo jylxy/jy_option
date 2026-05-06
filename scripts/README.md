@@ -2,10 +2,24 @@
 
 本目录只放当前仍可能复用的实验、分析、报告和自动研究脚本。一次性排查脚本完成后应归档到 `archive/src_scratch/`，不要长期留在根目录或 `src/`。
 
+## 统一入口
+
+优先使用统一入口查看和调用脚本：
+
+```bash
+python scripts/s1_cli.py --list
+python scripts/s1_cli.py --list --category reports
+python scripts/s1_cli.py analyze-backtest --help
+python scripts/s1_cli.py report-s1 --help
+```
+
+现有单脚本入口仍保留，方便兼容历史命令和远端 launch 脚本。后续如果把脚本移动到 `analysis/`、`reports/`、`launchers/`、`autoresearch/` 子目录，只需要维护 `s1_cli.py` 的注册表。
+
 ## 实验运行与自动研究
 
 | 脚本 | 用途 |
 |---|---|
+| `s1_cli.py` | 统一脚本入口和命令注册表。 |
 | `s1_autoresearch_runner.py` | S1 自动研究队列执行器，读取 experiment queue，生成 scorecard、audit 和 review。 |
 | `s1_experiment_scorecard.py` | 对单个回测结果生成核心绩效卡：NAV、年化、回撤、Sharpe、Calmar、Greeks、止损等。 |
 | `s1_experiment_audit.py` | 对实验结果做审计，标记可能的未来函数、异常成交、数据缺失和逻辑风险。 |
