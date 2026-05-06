@@ -33,18 +33,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from toolkit.selector import select_bars_sql
 from option_calc import calc_iv_single, calc_greeks_single, calc_iv_batch, RISK_FREE_RATE
 from strategy_rules import (
-    select_s1_sell, select_s1_protect,
+    select_s1_protect,
     select_s3_buy_by_otm, select_s3_sell_by_otm,
     select_s4,
-    calc_s1_size, calc_s1_stress_size, calc_s3_size_v2, calc_s4_size,
     extract_atm_iv_series, calc_iv_percentile, calc_iv_rv_features, get_iv_scale,
     should_pause_open, should_close_expiry, should_open_new, can_reopen,
     should_allow_open_low_iv_product, calc_stats,
     choose_s1_option_sides, choose_s1_trend_confidence_sides,
     classify_s1_trend_confidence, s1_trend_side_adjustment,
-    s1_forward_vega_quality_filter,
     DEFAULT_PARAMS,
 )
+from s1_contract_scoring import select_s1_sell, s1_forward_vega_quality_filter
+from strategy_sizing import calc_s1_size, calc_s1_stress_size, calc_s3_size_v2, calc_s4_size
 from margin_model import estimate_margin, resolve_margin_ratio
 from contract_provider import ContractInfo
 from spot_provider import spot_tables_for_codes
@@ -158,6 +158,8 @@ class ToolkitMinuteEngine:
         self._contract_iv_history = defaultdict(lambda: {'dates': [], 'ivs': [], 'prices': []})
         self._contract_trend_state_cache = {}
         self._contract_iv_vov_cache = {}
+        self._product_return_series_cache = {}
+        self._recent_product_corr_cache = {}
         self._day_realized = {'pnl': 0.0, 'fee': 0.0, 's1': 0.0, 's3': 0.0, 's4': 0.0}
         self._day_attr_realized = self._zero_attr_bucket()
         self._current_date_str = ''
@@ -459,6 +461,10 @@ class ToolkitMinuteEngine:
                 code,
             )
         return dict(self._contract_trend_state_cache[key])
+
+    def _reset_market_series_caches(self):
+        self._product_return_series_cache.clear()
+        self._recent_product_corr_cache.clear()
 
     def _prepare_s1_selection_frame(self, ef, option_type):
         side = ef[ef['option_type'] == option_type].copy()
@@ -1555,22 +1561,63 @@ class ToolkitMinuteEngine:
         )
 
     def _get_product_return_series(self, product, current_date=None):
-        return port_risk.product_return_series(
+        product_key = self._normalize_product_key(product)
+        hist = self._spot_history.get(product_key, {})
+        dates = hist.get('dates', []) or []
+        spots = hist.get('spots', []) or []
+        last_date = dates[-1] if dates else ''
+        last_spot = spots[-1] if spots else np.nan
+        try:
+            last_spot = float(last_spot)
+        except (TypeError, ValueError):
+            last_spot = np.nan
+        cache_key = (
+            product_key,
+            str(current_date) if current_date is not None else None,
+            len(spots),
+            str(last_date),
+            last_spot if np.isfinite(last_spot) else None,
+        )
+        cached = self._product_return_series_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        series = port_risk.product_return_series(
             self._spot_history,
             self._normalize_product_key,
-            product,
+            product_key,
             current_date=current_date,
         )
+        self._product_return_series_cache[cache_key] = series
+        return series
 
     def _get_recent_product_corr(self, product, peer_product, current_date):
-        return port_risk.recent_product_corr(
-            self.config,
-            self._spot_history,
-            self._normalize_product_key,
-            product,
-            peer_product,
-            current_date,
+        window = int(self.config.get('portfolio_corr_window', 60) or 0)
+        min_periods = int(self.config.get('portfolio_corr_min_periods', 20) or 0)
+        if window <= 1:
+            return np.nan
+        left_key = self._normalize_product_key(product)
+        right_key = self._normalize_product_key(peer_product)
+        cache_key = (
+            min(left_key, right_key),
+            max(left_key, right_key),
+            str(current_date),
+            window,
+            min_periods,
+            len(self._spot_history.get(left_key, {}).get('spots', []) or []),
+            len(self._spot_history.get(right_key, {}).get('spots', []) or []),
         )
+        cached = self._recent_product_corr_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        left = self._get_product_return_series(left_key, current_date=current_date).tail(window)
+        right = self._get_product_return_series(right_key, current_date=current_date).tail(window)
+        if left.empty or right.empty:
+            corr = np.nan
+        else:
+            aligned = pd.concat([left.rename('x'), right.rename('y')], axis=1, join='inner').dropna()
+            corr = np.nan if len(aligned) < max(min_periods, 2) else float(aligned['x'].corr(aligned['y']))
+        self._recent_product_corr_cache[cache_key] = corr
+        return corr
 
     def _recent_product_momentum(self, product, date_str, lookback):
         returns = self._get_product_return_series(product, current_date=date_str)
@@ -2224,6 +2271,7 @@ class ToolkitMinuteEngine:
         self._update_contract_iv_history(daily_df, date_str)
         self._current_iv_pcts = product_iv_pcts
         self._current_iv_state = product_iv_state
+        self._reset_market_series_caches()
         self._refresh_vol_regime_state(date_str)
         return product_iv_pcts
 
