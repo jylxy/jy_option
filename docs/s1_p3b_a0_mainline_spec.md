@@ -46,6 +46,39 @@ python3 src/toolkit_minute_engine.py \
 --products AG,AL,AO,AU,B,CU,EB,EG,FG,I,M,MA,NI,P,RB,RM,RU,SA,SC,SH,SN,TA,ZN
 ```
 
+## 1.1 A0 与 P3B 的等价边界
+
+`P3B/A0` 的准确含义是：
+
+```text
+B2C 品种预算倾斜
++ 乐得期限/合约月份偏好
++ 固定 23 个主流商品品种池
++ 组级 1.5x 权利金止损
+```
+
+因此，以下两种结果应当完全一致：
+
+- `config_s1_p5_p3b_a0_group_stop15.json`。
+- `config_s1_baseline_b2_product_tilt075_stop15_ledet_term_pref.json` 加同一组 23 品种池，且默认 `s1_stop_close_scope = group`。
+
+以下结果不应被视为 A0 的等价结果：
+
+- `config_s1_p4_p3b_ledet_term_pref_stop20.json`、`stop25.json`、`stop30.json`，因为止损倍数不同。
+- 只包含进行中 `nav_*.csv`、但没有最终 `orders_*.csv` 的历史中断回测文件。该类文件可做过程参考，但不能作为最终现金账校验基准。
+
+主线结果必须能通过订单现金账校验：
+
+```text
+累计PnL
+= 累计卖出开仓权利金
+- 累计平仓/止损买回成本
+- 当前未平仓义务方负债
+- 累计手续费
+```
+
+若 NAV 与上述现金账重构不一致，应优先视为回测口径或中断文件问题，而不是策略收益变化。
+
 ## 2. 交易目标
 
 P3B/A0 继续服务于 S1 的核心目标：
