@@ -11,10 +11,15 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from s1_experimental_scoring import (  # noqa: E402
+    add_b3_candidate_fields,
     apply_s1_b6_candidate_ranking,
+    b3_product_side_budget_overlay,
+    b4_product_side_budget_overlay,
     b6_product_budget_overlay,
     b6_product_side_budget_overlay,
+    contract_iv_vov_from_history,
     s1_b6_enabled,
+    term_structure_features,
 )
 
 
@@ -85,6 +90,110 @@ class S1ExperimentalScoringTest(unittest.TestCase):
         )
 
         self.assertEqual(filtered["option_code"].tolist(), ["B"])
+
+    def test_b3_candidate_fields_and_term_structure(self):
+        prod_df = pd.DataFrame([
+            {"expiry_date": "2025-06-20", "dte": 20, "moneyness": 1.00, "implied_vol": 0.20},
+            {"expiry_date": "2025-07-20", "dte": 50, "moneyness": 1.01, "implied_vol": 0.24},
+        ])
+        term = term_structure_features(prod_df, "2025-06-20")
+        self.assertIn("b3_term_structure_pressure", term)
+
+        history = {
+            "OPT1": {"ivs": [0.20, 0.21, 0.23, 0.22, 0.26, 0.27]},
+        }
+        self.assertGreater(contract_iv_vov_from_history(history, "OPT1", lookback=5), 0.0)
+
+        candidates = pd.DataFrame([{
+            "option_code": "OPT1",
+            "entry_iv_trend": 0.01,
+            "contract_iv_change_1d": 0.02,
+            "contract_iv_change_5d": 0.03,
+            "premium_to_iv5_loss": 1.5,
+            "premium_to_iv10_loss": 1.0,
+            "premium_to_stress_loss": 0.8,
+            "iv_shock_loss_5_cash": 20.0,
+            "iv_shock_loss_10_cash": 60.0,
+            "net_premium_cash": 100.0,
+        }])
+        out = add_b3_candidate_fields(
+            candidates,
+            "CU",
+            "P",
+            config={},
+            current_iv_state={},
+            contract_iv_vov=lambda code, lookback: contract_iv_vov_from_history(history, code, lookback),
+            term_features=term,
+        )
+
+        self.assertIn("b3_forward_variance_pressure", out.columns)
+        self.assertIn("b3_vol_of_vol_proxy", out.columns)
+        self.assertGreater(float(out.loc[0, "b3_iv_shock_coverage"]), 0.0)
+        self.assertGreaterEqual(float(out.loc[0, "b3_vomma_cash"]), 0.0)
+
+    def test_b3_and_b4_overlays_return_diagnostics(self):
+        side_df = pd.DataFrame([
+            {
+                "product": "CU",
+                "option_type": "P",
+                "b2_side_score": 80.0,
+                "b3_forward_variance_pressure": 0.01,
+                "b3_vol_of_vol_proxy": 0.01,
+                "b3_iv_shock_coverage": 2.0,
+                "b3_joint_stress_coverage": 1.5,
+                "b3_vomma_loss_ratio": 0.1,
+                "b3_skew_steepening": 0.0,
+                "premium_to_iv10_loss": 2.0,
+                "premium_to_stress_loss": 1.5,
+                "premium_yield_margin": 0.5,
+                "gamma_rent_penalty": 0.1,
+                "breakeven_cushion_iv": 0.03,
+                "breakeven_cushion_rv": 0.04,
+            },
+            {
+                "product": "AL",
+                "option_type": "C",
+                "b2_side_score": 60.0,
+                "b3_forward_variance_pressure": 0.04,
+                "b3_vol_of_vol_proxy": 0.04,
+                "b3_iv_shock_coverage": 0.5,
+                "b3_joint_stress_coverage": 0.4,
+                "b3_vomma_loss_ratio": 0.5,
+                "b3_skew_steepening": 0.02,
+                "premium_to_iv10_loss": 0.5,
+                "premium_to_stress_loss": 0.4,
+                "premium_yield_margin": 0.2,
+                "gamma_rent_penalty": 0.5,
+                "breakeven_cushion_iv": 0.01,
+                "breakeven_cushion_rv": 0.01,
+            },
+        ])
+
+        b3 = b3_product_side_budget_overlay(
+            side_df,
+            {"CU": 0.2, "AL": 0.2},
+            0.4,
+            "2025-05-06",
+            10000.0,
+            config={"s1_b3_weight_forward_variance": 0.2},
+            rank_high=rank_high,
+            rank_low=rank_low,
+        )
+        self.assertEqual(len(b3["diagnostics"]), 2)
+        self.assertIn("CU", b3["product_budget_map"])
+
+        b4 = b4_product_side_budget_overlay(
+            side_df,
+            {"CU": 0.2, "AL": 0.2},
+            0.4,
+            "2025-05-06",
+            10000.0,
+            config={},
+            rank_high=rank_high,
+            rank_low=rank_low,
+        )
+        self.assertEqual(len(b4["diagnostics"]), 2)
+        self.assertIn("AL", b4["side_meta_map"])
 
     def test_b6_product_budget_overlay_returns_diagnostics(self):
         side_df = pd.DataFrame([

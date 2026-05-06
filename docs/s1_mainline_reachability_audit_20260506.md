@@ -70,6 +70,14 @@
 
 性能侧，本轮把 B5 shadow 中 `expected_move_loss`、`mae20_loss`、`tail_move_loss` 三个逐行损失估算改为向量化计算。该优化只影响 B5/B6/full-shadow 实验路径；P3B/A0 默认交易路径不启用这些 shadow 字段，因此不会改变当前主线回测口径。
 
+## 4.3 第四轮实验评分抽离与缓存
+
+已将 B3 的 term structure、forward variance、vol-of-vol、vomma、skew steepening 候选字段构造迁入 `src/s1_experimental_scoring.py`。
+
+已将 B3 clean-vega product-side overlay 与 B4 product-side overlay 迁入 `src/s1_experimental_scoring.py`。主引擎仅保留 wrapper，负责注入当前 IV 状态、合约 IV 历史、rank 函数和诊断记录。
+
+性能侧，本轮为合约级 IV vol-of-vol 估算增加 `(option_code, lookback, history_length, last_date)` 缓存，避免同一天同一合约在 B3/B4/B6 实验路径里重复构造历史序列。该缓存会在每日合约 IV 历史更新时清空。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：
