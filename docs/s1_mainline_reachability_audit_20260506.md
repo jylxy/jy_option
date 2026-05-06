@@ -56,9 +56,11 @@
 
 ## 4.1 第二轮小步抽离
 
-已新增 `src/s1_shadow_universe.py`，先承接 B5/full shadow 的字段定义和后续面板输出辅助函数。当前主引擎先引用 `S1_B5_CANDIDATE_FIELDS`，交易逻辑不变。
+已新增 `src/s1_shadow_universe.py`，承接 B5/full shadow 的字段定义和后续面板输出辅助函数。当前主引擎通过包装方法调用该模块，交易逻辑不变。
 
-后续应继续把 `toolkit_minute_engine.py` 中的 `_write_s1_b5_candidate_panels`、tail dependence panel、B6 评分等调用迁出，使 shadow 研究层真正变成显式启用的实验模块。
+已新增 `src/s1_experimental_scoring.py`，承接 B6 实验评分开关和合约排序函数。P3B/A0 默认不启用 B6，但历史 B6 配置仍可复现。
+
+后续应继续把 `toolkit_minute_engine.py` 中的 B5 单合约字段构造、B6 product/side overlay 等调用迁出，使 shadow 研究层真正变成显式启用的实验模块。
 
 ## 5. 待抽离主引擎逻辑
 

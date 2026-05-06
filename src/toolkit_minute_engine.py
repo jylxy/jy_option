@@ -98,6 +98,7 @@ from stop_policy import (
 )
 from s1_pending_open import build_s1_sell_pending_item
 from s1_budget_tilt import compute_b2_product_budget_map
+from s1_experimental_scoring import apply_s1_b6_candidate_ranking, s1_b6_enabled
 from s1_shadow_universe import S1_B5_CANDIDATE_FIELDS, write_b5_candidate_panels
 from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
@@ -693,13 +694,7 @@ class ToolkitMinuteEngine:
         return bool(self.config.get('s1_b5_shadow_factor_extension_enabled', False))
 
     def _s1_b6_enabled(self):
-        mode = str(self.config.get('s1_ranking_mode', '') or '').lower()
-        return (
-            mode in {'b6', 'b6_residual_quality', 'b6_contract', 'b6_role'}
-            or bool(self.config.get('s1_b6_contract_rank_enabled', False))
-            or bool(self.config.get('s1_b6_side_tilt_enabled', False))
-            or bool(self.config.get('s1_b6_product_tilt_enabled', False))
-        )
+        return s1_b6_enabled(self.config)
 
     @staticmethod
     def _safe_divide(numerator, denominator):
@@ -1000,86 +995,12 @@ class ToolkitMinuteEngine:
         return c
 
     def _apply_s1_b6_candidate_ranking(self, candidates):
-        if candidates is None or candidates.empty:
-            return candidates
-        c = candidates.copy()
-        cfg = self.config
-        if bool(cfg.get('s1_b6_hard_filter_enabled', False)):
-            min_net = float(cfg.get('s1_b6_min_net_premium_cash', 0.0) or 0.0)
-            max_friction = cfg.get('s1_b6_max_friction_ratio', 0.20)
-            if min_net > 0 and 'net_premium_cash' in c.columns:
-                net = pd.to_numeric(c['net_premium_cash'], errors='coerce')
-                c = c[net >= min_net].copy()
-            if max_friction is not None and 'friction_ratio' in c.columns:
-                try:
-                    max_friction = float(max_friction)
-                except (TypeError, ValueError):
-                    max_friction = np.nan
-                if np.isfinite(max_friction):
-                    friction = pd.to_numeric(c['friction_ratio'], errors='coerce')
-                    c = c[friction.isna() | (friction <= max_friction)].copy()
-            if c.empty:
-                return c
-
-        def col(name):
-            return c[name] if name in c.columns else pd.Series(np.nan, index=c.index, dtype=float)
-
-        c['b6_premium_to_stress_score'] = 100.0 * self._b2_rank_high(col('premium_to_stress_loss'))
-        c['b6_premium_to_iv10_score'] = 100.0 * self._b2_rank_high(col('premium_to_iv10_loss'))
-        c['b6_theta_per_vega_score'] = 100.0 * self._b2_rank_high(
-            c['b5_theta_per_vega'] if 'b5_theta_per_vega' in c.columns else col('theta_vega_efficiency')
+        return apply_s1_b6_candidate_ranking(
+            candidates,
+            config=self.config,
+            rank_high=self._b2_rank_high,
+            rank_low=self._b2_rank_low,
         )
-        c['b6_theta_per_gamma_score'] = 100.0 * self._b2_rank_high(col('b5_theta_per_gamma'))
-        c['b6_tail_move_coverage_score'] = 100.0 * self._b2_rank_high(
-            col('b5_premium_to_tail_move_loss')
-        )
-        c['b6_vomma_score'] = 100.0 * self._b2_rank_low(col('b3_vomma_loss_ratio'))
-        c['b6_premium_yield_margin_score'] = 100.0 * self._b2_rank_high(col('premium_yield_margin'))
-        weights = {
-            'b6_premium_to_stress_score': float(cfg.get('s1_b6_weight_premium_to_stress', 0.24) or 0.0),
-            'b6_premium_to_iv10_score': float(cfg.get('s1_b6_weight_premium_to_iv10', 0.22) or 0.0),
-            'b6_theta_per_vega_score': float(cfg.get('s1_b6_weight_theta_per_vega', 0.22) or 0.0),
-            'b6_theta_per_gamma_score': float(cfg.get('s1_b6_weight_theta_per_gamma', 0.12) or 0.0),
-            'b6_tail_move_coverage_score': float(cfg.get('s1_b6_weight_tail_move_coverage', 0.10) or 0.0),
-            'b6_vomma_score': float(cfg.get('s1_b6_weight_vomma', 0.06) or 0.0),
-            'b6_premium_yield_margin_score': float(
-                cfg.get('s1_b6_weight_premium_yield_margin', 0.04) or 0.0
-            ),
-        }
-        weight_sum = sum(max(0.0, v) for v in weights.values())
-        missing = float(cfg.get('s1_b6_missing_factor_score', 50.0) or 50.0)
-        if weight_sum <= 0:
-            c['b6_contract_score'] = pd.to_numeric(
-                c.get('quality_score', pd.Series(missing, index=c.index)),
-                errors='coerce',
-            ).fillna(missing)
-        else:
-            score = pd.Series(0.0, index=c.index, dtype=float)
-            for column, weight in weights.items():
-                weight = max(0.0, float(weight or 0.0))
-                if weight <= 0:
-                    continue
-                score += weight * pd.to_numeric(c[column], errors='coerce').fillna(missing)
-            c['b6_contract_score'] = (score / weight_sum).clip(0.0, 100.0)
-        c['quality_score'] = c['b6_contract_score']
-        sort_cols = [
-            col for col in (
-                'b6_contract_score',
-                'b6_theta_per_vega_score',
-                'b6_premium_to_stress_score',
-                'b6_premium_to_iv10_score',
-                'b6_theta_per_gamma_score',
-                'b6_tail_move_coverage_score',
-                'open_interest',
-                'volume',
-                'option_code',
-            )
-            if col in c.columns
-        ]
-        ascending = [False] * len(sort_cols)
-        if sort_cols and sort_cols[-1] == 'option_code':
-            ascending[-1] = True
-        return c.sort_values(sort_cols, ascending=ascending, kind='mergesort') if sort_cols else c
 
     def _prepare_s1_b6_selection_candidates(self, candidates, date_str, product, exp, option_type,
                                             term_features=None):
@@ -1476,222 +1397,16 @@ class ToolkitMinuteEngine:
                 })
         self._s1_shadow_candidates = []
 
-    @staticmethod
-    def _b5_effective_count(values):
-        arr = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
-        arr = arr[arr > 0]
-        if arr.empty:
-            return 0.0
-        total = float(arr.sum())
-        denom = float((arr ** 2).sum())
-        return total * total / denom if denom > 0 else 0.0
-
-    @staticmethod
-    def _b5_hhi(values):
-        arr = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
-        arr = arr[arr > 0]
-        if arr.empty:
-            return np.nan
-        shares = arr / float(arr.sum())
-        return float((shares ** 2).sum())
-
-    def _b5_tail_dependence_product_panel(self, candidates_df):
-        if not self.config.get('s1_b5_tail_dependence_enabled', True):
-            return pd.DataFrame()
-        if candidates_df.empty or not self._spot_history:
-            return pd.DataFrame()
-        series_map = {}
-        for product in sorted(candidates_df['product'].dropna().astype(str).unique()):
-            s = self._history_series(self._spot_history, product, 'spots')
-            if not s.empty:
-                series_map[product] = s
-        if not series_map:
-            return pd.DataFrame()
-        spot_df = pd.DataFrame(series_map).sort_index()
-        returns = spot_df.pct_change(fill_method=None)
-        window_days = int(self.config.get('s1_b5_tail_window_days', 120) or 120)
-        min_days = int(self.config.get('s1_b5_min_history_days', 60) or 60)
-        q = float(self.config.get('s1_b5_tail_quantile', 0.05) or 0.05)
-        q = min(max(q, 0.01), 0.49)
-        rows = []
-        for date_str, group in candidates_df.groupby('signal_date', sort=False):
-            dt = pd.Timestamp(date_str)
-            products = [
-                p for p in sorted(group['product'].dropna().astype(str).unique())
-                if p in returns.columns
-            ]
-            if len(products) < 2:
-                continue
-            window = returns.loc[returns.index <= dt, products].tail(window_days)
-            window = window.dropna(how='all')
-            if len(window) < min_days:
-                continue
-            port = window[products].mean(axis=1, skipna=True).dropna()
-            if len(port) < min_days:
-                continue
-            lower_mask = port <= port.quantile(q)
-            upper_mask = port >= port.quantile(1.0 - q)
-            lower_n = int(lower_mask.sum())
-            upper_n = int(upper_mask.sum())
-            port_lower = port[lower_mask]
-            port_upper = port[upper_mask]
-            for product in products:
-                x = window[product].reindex(port.index).dropna()
-                if len(x) < min_days:
-                    continue
-                lower_dep = np.nan
-                upper_dep = np.nan
-                lower_beta = np.nan
-                upper_beta = np.nan
-                if lower_n > 0:
-                    x_lower_q = float(x.quantile(q))
-                    lower_dep = float((x.reindex(port_lower.index) <= x_lower_q).mean())
-                    if len(port_lower) > 1 and float(port_lower.var()) > 0:
-                        x_lower = x.reindex(port_lower.index).dropna()
-                        aligned = port_lower.reindex(x_lower.index)
-                        if len(x_lower) > 1 and float(aligned.var()) > 0:
-                            lower_beta = float(np.cov(x_lower, aligned)[0, 1] / aligned.var())
-                if upper_n > 0:
-                    x_upper_q = float(x.quantile(1.0 - q))
-                    upper_dep = float((x.reindex(port_upper.index) >= x_upper_q).mean())
-                    if len(port_upper) > 1 and float(port_upper.var()) > 0:
-                        x_upper = x.reindex(port_upper.index).dropna()
-                        aligned = port_upper.reindex(x_upper.index)
-                        if len(x_upper) > 1 and float(aligned.var()) > 0:
-                            upper_beta = float(np.cov(x_upper, aligned)[0, 1] / aligned.var())
-                rows.append({
-                    'signal_date': date_str,
-                    'product': product,
-                    'b5_empirical_lower_tail_dependence_95': lower_dep,
-                    'b5_empirical_upper_tail_dependence_95': upper_dep,
-                    'b5_lower_tail_beta': lower_beta,
-                    'b5_upper_tail_beta': upper_beta,
-                    'b5_lower_tail_dependence_excess': lower_dep - q if np.isfinite(lower_dep) else np.nan,
-                    'b5_upper_tail_dependence_excess': upper_dep - q if np.isfinite(upper_dep) else np.nan,
-                    'b5_tail_window_days_used': len(window),
-                })
-        return pd.DataFrame(rows)
-
     def _write_s1_b5_candidate_panels(self, candidates_df, tag):
-        if not self._s1_b5_shadow_enabled() or candidates_df.empty:
-            return
-        df = candidates_df.copy()
-        for col in (
-            'net_premium_cash_1lot', 'stress_loss', 'margin_estimate',
-            'cash_vega', 'cash_gamma', 'cash_theta', 'abs_delta',
-            'contract_iv_skew_to_atm', 'b4_contract_score',
-            'b5_theta_per_gamma', 'b5_premium_to_tail_move_loss',
-            'b5_cooldown_penalty_score', 'b5_delta_ratio_to_cap',
-        ):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            else:
-                df[col] = np.nan
-        df['product_side_key'] = df['product'].astype(str) + '_' + df['option_type'].astype(str)
-
-        product_panel = df.groupby(['signal_date', 'product'], sort=False).agg(
-            product_candidate_count=('candidate_id', 'count'),
-            product_side_count=('option_type', 'nunique'),
-            product_premium_sum=('net_premium_cash_1lot', 'sum'),
-            product_stress_sum=('stress_loss', 'sum'),
-            product_margin_sum=('margin_estimate', 'sum'),
-            product_cash_vega_sum=('cash_vega', 'sum'),
-            product_cash_gamma_sum=('cash_gamma', 'sum'),
-            product_cash_theta_sum=('cash_theta', 'sum'),
-            product_avg_delta_ratio_to_cap=('b5_delta_ratio_to_cap', 'mean'),
-            product_avg_tail_coverage=('b5_premium_to_tail_move_loss', 'mean'),
-            product_cooldown_penalty=('b5_cooldown_penalty_score', 'mean'),
-        ).reset_index()
-        total_stress = product_panel.groupby('signal_date')['product_stress_sum'].transform('sum')
-        total_margin = product_panel.groupby('signal_date')['product_margin_sum'].transform('sum')
-        product_panel['product_stress_share'] = product_panel['product_stress_sum'] / total_stress.replace(0, np.nan)
-        product_panel['product_margin_share'] = product_panel['product_margin_sum'] / total_margin.replace(0, np.nan)
-        tail_panel = self._b5_tail_dependence_product_panel(df)
-        if not tail_panel.empty:
-            product_panel = product_panel.merge(tail_panel, on=['signal_date', 'product'], how='left')
-        product_path = os.path.join(OUTPUT_DIR, f"s1_b5_product_panel_{tag}.csv")
-        product_panel.to_csv(product_path, index=False)
-        logger.info("S1 B5 product panel: %s (%d rows)", product_path, len(product_panel))
-
-        side_panel = df.groupby(['signal_date', 'product', 'option_type'], sort=False).agg(
-            side_candidate_count=('candidate_id', 'count'),
-            side_premium_sum=('net_premium_cash_1lot', 'sum'),
-            side_stress_sum=('stress_loss', 'sum'),
-            side_margin_sum=('margin_estimate', 'sum'),
-            side_cash_vega_sum=('cash_vega', 'sum'),
-            side_cash_gamma_sum=('cash_gamma', 'sum'),
-            side_cash_theta_sum=('cash_theta', 'sum'),
-            side_avg_abs_delta=('abs_delta', 'mean'),
-            side_avg_contract_iv_skew_to_atm=('contract_iv_skew_to_atm', 'mean'),
-            side_avg_tail_coverage=('b5_premium_to_tail_move_loss', 'mean'),
-            side_avg_theta_per_gamma=('b5_theta_per_gamma', 'mean'),
-            side_cooldown_penalty=('b5_cooldown_penalty_score', 'mean'),
-            b5_mom_20d=('b5_mom_20d', 'mean'),
-            b5_trend_z_20d=('b5_trend_z_20d', 'mean'),
-            b5_breakout_distance_up_60d=('b5_breakout_distance_up_60d', 'mean'),
-            b5_breakout_distance_down_60d=('b5_breakout_distance_down_60d', 'mean'),
-            b5_atm_iv_mom_5d=('b5_atm_iv_mom_5d', 'mean'),
-            b5_atm_iv_accel=('b5_atm_iv_accel', 'mean'),
-        ).reset_index()
-        side_path = os.path.join(OUTPUT_DIR, f"s1_b5_product_side_panel_{tag}.csv")
-        side_panel.to_csv(side_path, index=False)
-        logger.info("S1 B5 product-side panel: %s (%d rows)", side_path, len(side_panel))
-
-        ladder_cols = ['signal_date', 'product', 'option_type', 'expiry', 'b5_delta_bucket']
-        ladder_panel = df.groupby(ladder_cols, sort=False).agg(
-            bucket_candidate_count=('candidate_id', 'count'),
-            bucket_premium_sum=('net_premium_cash_1lot', 'sum'),
-            bucket_stress_sum=('stress_loss', 'sum'),
-            bucket_margin_sum=('margin_estimate', 'sum'),
-            bucket_avg_abs_delta=('abs_delta', 'mean'),
-            bucket_avg_tail_coverage=('b5_premium_to_tail_move_loss', 'mean'),
-            bucket_avg_theta_per_gamma=('b5_theta_per_gamma', 'mean'),
-            bucket_avg_b4_contract_score=('b4_contract_score', 'mean'),
-        ).reset_index()
-        ladder_path = os.path.join(OUTPUT_DIR, f"s1_b5_delta_ladder_panel_{tag}.csv")
-        ladder_panel.to_csv(ladder_path, index=False)
-        logger.info("S1 B5 delta-ladder panel: %s (%d rows)", ladder_path, len(ladder_panel))
-
-        rows = []
-        for date_str, group in df.groupby('signal_date', sort=False):
-            product_stress = group.groupby('product')['stress_loss'].sum()
-            sector_stress = group.groupby('bucket')['stress_loss'].sum()
-            product_margin = group.groupby('product')['margin_estimate'].sum()
-            product_vega = group.groupby('product')['cash_vega'].sum().abs()
-            product_gamma = group.groupby('product')['cash_gamma'].sum().abs()
-            stress_total = float(product_stress.sum())
-            top5_share = np.nan
-            top1_share = np.nan
-            if stress_total > 0:
-                shares = product_stress.sort_values(ascending=False) / stress_total
-                top1_share = float(shares.iloc[0]) if len(shares) else np.nan
-                top5_share = float(shares.head(5).sum())
-            rows.append({
-                'signal_date': date_str,
-                'candidate_count': int(len(group)),
-                'active_product_count': int(group['product'].nunique()),
-                'active_product_side_count': int(group['product_side_key'].nunique()),
-                'active_sector_count': int(group['bucket'].nunique()),
-                'portfolio_premium_sum': float(group['net_premium_cash_1lot'].sum()),
-                'portfolio_stress_sum': stress_total,
-                'portfolio_margin_sum': float(product_margin.sum()),
-                'portfolio_cash_vega_abs_sum': float(product_vega.sum()),
-                'portfolio_cash_gamma_abs_sum': float(product_gamma.sum()),
-                'effective_product_count_margin': self._b5_effective_count(product_margin),
-                'effective_product_count_stress': self._b5_effective_count(product_stress),
-                'effective_product_count_vega': self._b5_effective_count(product_vega),
-                'effective_product_count_gamma': self._b5_effective_count(product_gamma),
-                'top1_product_stress_share': top1_share,
-                'top5_product_stress_share': top5_share,
-                'hhi_product_stress': self._b5_hhi(product_stress),
-                'hhi_sector_stress': self._b5_hhi(sector_stress),
-                'portfolio_put_stress': float(group.loc[group['option_type'] == 'P', 'stress_loss'].sum()),
-                'portfolio_call_stress': float(group.loc[group['option_type'] == 'C', 'stress_loss'].sum()),
-            })
-        portfolio_panel = pd.DataFrame(rows)
-        portfolio_path = os.path.join(OUTPUT_DIR, f"s1_b5_portfolio_panel_{tag}.csv")
-        portfolio_panel.to_csv(portfolio_path, index=False)
-        logger.info("S1 B5 portfolio panel: %s (%d rows)", portfolio_path, len(portfolio_panel))
+        write_b5_candidate_panels(
+            candidates_df,
+            tag,
+            config=self.config,
+            spot_history=self._spot_history,
+            history_series=self._history_series,
+            output_dir=OUTPUT_DIR,
+            logger=logger,
+        )
 
     def _write_s1_candidate_outputs(self, tag):
         if not self._s1_candidate_universe_enabled():
