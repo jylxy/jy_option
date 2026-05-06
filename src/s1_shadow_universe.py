@@ -45,6 +45,325 @@ S1_B5_CANDIDATE_FIELDS = (
 )
 
 
+def product_history_features(
+    *,
+    product: str,
+    option_type: str,
+    config: dict,
+    spot_history,
+    history_series,
+) -> dict:
+    spots = history_series(spot_history, product, 'spots')
+    fields = {
+        'b5_mom_5d': np.nan,
+        'b5_mom_20d': np.nan,
+        'b5_mom_60d': np.nan,
+        'b5_trend_z_20d': np.nan,
+        'b5_breakout_distance_up_60d': np.nan,
+        'b5_breakout_distance_down_60d': np.nan,
+        'b5_up_day_ratio_20d': np.nan,
+        'b5_down_day_ratio_20d': np.nan,
+        'b5_range_expansion_proxy_20d': np.nan,
+        'b5_mae20_move_pct': np.nan,
+        'b5_tail_move_pct': np.nan,
+    }
+    if spots.empty:
+        return fields
+    spots = spots[spots > 0]
+    if spots.empty:
+        return fields
+    cur = float(spots.iloc[-1])
+    for lb in (5, 20, 60):
+        if len(spots) > lb and spots.iloc[-1 - lb] > 0:
+            fields[f'b5_mom_{lb}d'] = float(cur / spots.iloc[-1 - lb] - 1.0)
+
+    returns = spots.pct_change(fill_method=None).dropna()
+    if len(returns) >= 5:
+        recent_abs = returns.abs()
+        if len(recent_abs) >= 21:
+            denom = float(recent_abs.iloc[-21:-1].mean())
+            if denom > 0:
+                fields['b5_range_expansion_proxy_20d'] = float(recent_abs.iloc[-1] / denom)
+    if len(returns) >= 20:
+        r20 = returns.iloc[-20:]
+        fields['b5_up_day_ratio_20d'] = float((r20 > 0).mean())
+        fields['b5_down_day_ratio_20d'] = float((r20 < 0).mean())
+        vol20 = float(r20.std(ddof=0) * np.sqrt(20.0))
+        if vol20 > 0 and np.isfinite(fields['b5_mom_20d']):
+            fields['b5_trend_z_20d'] = float(fields['b5_mom_20d'] / vol20)
+        if str(option_type).upper() == 'P':
+            fields['b5_mae20_move_pct'] = float(max(-r20.min(), 0.0))
+        else:
+            fields['b5_mae20_move_pct'] = float(max(r20.max(), 0.0))
+    if len(returns) >= 60:
+        tail_q = float(config.get('s1_b5_tail_quantile', 0.05) or 0.05)
+        tail_q = min(max(tail_q, 0.01), 0.49)
+        r = returns.iloc[-int(config.get('s1_b5_tail_window_days', 120) or 120):]
+        if str(option_type).upper() == 'P':
+            fields['b5_tail_move_pct'] = float(max(-r.quantile(tail_q), 0.0))
+        else:
+            fields['b5_tail_move_pct'] = float(max(r.quantile(1.0 - tail_q), 0.0))
+
+    long_lb = int(config.get('s1_b5_trend_long_lookback_days', 60) or 60)
+    if len(spots) >= max(long_lb, 2):
+        window = spots.iloc[-long_lb:]
+        high = float(window.max())
+        low = float(window.min())
+        if cur > 0:
+            fields['b5_breakout_distance_up_60d'] = float(high / cur - 1.0)
+            fields['b5_breakout_distance_down_60d'] = float(1.0 - low / cur)
+    return fields
+
+
+def iv_history_features(*, product: str, iv_history, history_series) -> dict:
+    ivs = history_series(iv_history, product, 'ivs')
+    fields = {
+        'b5_atm_iv_mom_5d': np.nan,
+        'b5_atm_iv_mom_20d': np.nan,
+        'b5_atm_iv_accel': np.nan,
+        'b5_iv_zscore_60d': np.nan,
+        'b5_iv_reversion_score': np.nan,
+    }
+    if ivs.empty:
+        return fields
+    cur = float(ivs.iloc[-1])
+    if len(ivs) > 5:
+        fields['b5_atm_iv_mom_5d'] = float(cur - ivs.iloc[-6])
+    if len(ivs) > 20:
+        fields['b5_atm_iv_mom_20d'] = float(cur - ivs.iloc[-21])
+    if np.isfinite(fields['b5_atm_iv_mom_5d']) and np.isfinite(fields['b5_atm_iv_mom_20d']):
+        fields['b5_atm_iv_accel'] = float(
+            fields['b5_atm_iv_mom_5d'] - fields['b5_atm_iv_mom_20d'] * 0.25
+        )
+    if len(ivs) >= 60:
+        win = ivs.iloc[-60:]
+        std = float(win.std(ddof=0))
+        if std > 0:
+            z = float((cur - win.mean()) / std)
+            fields['b5_iv_zscore_60d'] = z
+            mom_penalty = max(float(fields.get('b5_atm_iv_mom_5d') or 0.0), 0.0)
+            fields['b5_iv_reversion_score'] = z - 10.0 * mom_penalty
+    return fields
+
+
+def stop_state_fields(
+    *,
+    product: str,
+    option_type: str,
+    date_str: str,
+    stop_history,
+    stop_side_history,
+    normalize_product,
+    is_reentry_blocked,
+    last_iv_trend,
+) -> dict:
+    product_key = normalize_product(product)
+    side_key = (product_key, str(option_type).upper())
+    current = pd.Timestamp(date_str)
+
+    def summarize_stop_dates(dates):
+        clean = [pd.Timestamp(d) for d in dates if str(d)]
+        clean = [d for d in clean if d <= current]
+        if not clean:
+            return np.nan, 0
+        last = max(clean)
+        count20 = sum((current - d).days <= 20 for d in clean)
+        return int((current - last).days), int(count20)
+
+    days_product, count_product = summarize_stop_dates(stop_history.get(product_key, []))
+    days_side, count_side = summarize_stop_dates(stop_side_history.get(side_key, []))
+    blocked = 1.0 if is_reentry_blocked('S1', product, option_type, date_str) else 0.0
+    penalty = 0.0
+    if np.isfinite(days_side):
+        penalty = max(penalty, max(0.0, 1.0 - float(days_side) / 20.0))
+    if np.isfinite(days_product):
+        penalty = max(penalty, 0.5 * max(0.0, 1.0 - float(days_product) / 20.0))
+    iv_trend = last_iv_trend(product)
+    release = 1.0
+    if blocked:
+        release = 0.0
+    elif np.isfinite(iv_trend) and iv_trend > 0:
+        release = max(0.0, 1.0 - min(iv_trend / 0.02, 1.0))
+    return {
+        'b5_days_since_product_stop': days_product,
+        'b5_product_stop_count_20d': count_product,
+        'b5_days_since_product_side_stop': days_side,
+        'b5_product_side_stop_count_20d': count_side,
+        'b5_cooldown_blocked': blocked,
+        'b5_cooldown_penalty_score': penalty,
+        'b5_cooldown_release_score': release,
+    }
+
+
+def delta_bucket(abs_delta, *, config: dict) -> str:
+    try:
+        abs_delta = float(abs_delta)
+    except (TypeError, ValueError):
+        return ''
+    if not np.isfinite(abs_delta):
+        return ''
+    raw_edges = config.get('s1_b5_delta_bucket_edges', [0, 0.02, 0.04, 0.06, 0.08, 0.10])
+    edges = []
+    for value in raw_edges:
+        try:
+            edges.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    edges = sorted(set(edges))
+    if len(edges) < 2:
+        edges = [0, 0.02, 0.04, 0.06, 0.08, 0.10]
+    for left, right in zip(edges[:-1], edges[1:]):
+        if abs_delta >= left and abs_delta <= right:
+            return f"{left:.2f}_{right:.2f}"
+    return 'above_cap' if abs_delta > edges[-1] else 'below_floor'
+
+
+def _numeric_column(frame: pd.DataFrame, *names: str, default=np.nan) -> pd.Series:
+    for name in names:
+        if name in frame.columns:
+            return pd.to_numeric(frame[name], errors='coerce')
+    return pd.Series(default, index=frame.index, dtype=float)
+
+
+def _loss_for_move_vectorized(frame: pd.DataFrame, move_pct) -> pd.Series:
+    move = pd.to_numeric(move_pct, errors='coerce')
+    if not isinstance(move, pd.Series):
+        move = pd.Series(move, index=frame.index)
+    move = move.reindex(frame.index)
+    spot = _numeric_column(frame, 'spot_close', 'spot')
+    mult = _numeric_column(frame, 'multiplier', 'mult')
+    delta = _numeric_column(frame, 'delta').abs().fillna(0.0)
+    gamma = _numeric_column(frame, 'gamma').abs().fillna(0.0)
+    valid = move.notna() & (move > 0) & spot.notna() & mult.notna() & (spot > 0) & (mult > 0)
+    d_spot = spot * move
+    loss = delta * d_spot * mult + 0.5 * gamma * d_spot * d_spot * mult
+    loss = loss.where(valid & (loss > 0), np.nan)
+    return loss.astype(float)
+
+
+def add_b5_shadow_fields(
+    candidates: pd.DataFrame,
+    *,
+    date_str: str,
+    product: str,
+    option_type: str,
+    config: dict,
+    spot_history,
+    iv_history,
+    stop_history,
+    stop_side_history,
+    history_series,
+    option_roundtrip_fee,
+    normalize_product,
+    is_reentry_blocked,
+    last_iv_trend,
+    force: bool = False,
+) -> pd.DataFrame:
+    if (
+        not force
+        and not config.get('s1_b5_shadow_factor_extension_enabled', False)
+    ) or candidates is None or candidates.empty:
+        return candidates
+
+    c = candidates.copy()
+    if 'abs_delta' in c.columns:
+        abs_delta = pd.to_numeric(c['abs_delta'], errors='coerce').abs()
+    elif 'delta' in c.columns:
+        abs_delta = pd.to_numeric(c['delta'], errors='coerce').abs()
+    else:
+        abs_delta = pd.Series(np.nan, index=c.index)
+    delta_cap = float(config.get('s1_sell_delta_cap', 0.10) or 0.10)
+    c['b5_delta_bucket'] = abs_delta.map(lambda value: delta_bucket(value, config=config))
+    c['b5_delta_to_cap'] = delta_cap - abs_delta
+    c['b5_delta_ratio_to_cap'] = abs_delta / delta_cap if delta_cap > 0 else np.nan
+    c['b5_rank_in_delta_bucket'] = c.groupby('b5_delta_bucket', sort=False).cumcount() + 1
+    c['b5_delta_bucket_candidate_count'] = c.groupby(
+        'b5_delta_bucket', sort=False
+    )['b5_delta_bucket'].transform('size')
+
+    mult = _numeric_column(c, 'multiplier', 'mult')
+    price = _numeric_column(c, 'option_close')
+    roundtrip_fee = option_roundtrip_fee(product, option_type)
+    net_premium = _numeric_column(c, 'net_premium_cash')
+    fallback_premium = price * mult - float(roundtrip_fee or 0.0)
+    net_premium = net_premium.where(net_premium.notna(), fallback_premium)
+    stress = _numeric_column(c, 'stress_loss').clip(lower=0)
+    bucket_premium = net_premium.groupby(c['b5_delta_bucket']).transform('sum')
+    bucket_stress = stress.groupby(c['b5_delta_bucket']).transform('sum')
+    total_premium = float(net_premium.sum()) if net_premium.notna().any() else np.nan
+    total_stress = float(stress.sum()) if stress.notna().any() else np.nan
+    c['b5_premium_share_delta_bucket'] = (
+        bucket_premium / total_premium if np.isfinite(total_premium) and total_premium != 0 else np.nan
+    )
+    c['b5_stress_share_delta_bucket'] = (
+        bucket_stress / total_stress if np.isfinite(total_stress) and total_stress != 0 else np.nan
+    )
+
+    spot = _numeric_column(c, 'spot_close', 'spot')
+    theta_cash = _numeric_column(c, 'theta').abs() * mult
+    vega_cash = _numeric_column(c, 'vega').abs() * mult
+    gamma_cash = _numeric_column(c, 'gamma').abs() * mult * spot * spot
+    c['b5_theta_per_gamma'] = theta_cash / gamma_cash.replace(0, np.nan)
+    c['b5_gamma_theta_ratio'] = gamma_cash / theta_cash.replace(0, np.nan)
+    c['b5_theta_per_vega'] = theta_cash / vega_cash.replace(0, np.nan)
+    c['b5_premium_per_vega'] = net_premium / vega_cash.replace(0, np.nan)
+
+    dte = _numeric_column(c, 'dte')
+    rv_ref = _numeric_column(c, 'rv_ref', 'entry_rv20')
+    c['b5_expected_move_pct'] = rv_ref * np.sqrt(dte.clip(lower=1) / 252.0)
+
+    hist_features = product_history_features(
+        product=product,
+        option_type=option_type,
+        config=config,
+        spot_history=spot_history,
+        history_series=history_series,
+    )
+    iv_features = iv_history_features(
+        product=product,
+        iv_history=iv_history,
+        history_series=history_series,
+    )
+    stop_features = stop_state_fields(
+        product=product,
+        option_type=option_type,
+        date_str=date_str,
+        stop_history=stop_history,
+        stop_side_history=stop_side_history,
+        normalize_product=normalize_product,
+        is_reentry_blocked=is_reentry_blocked,
+        last_iv_trend=last_iv_trend,
+    )
+    for key, value in {**hist_features, **iv_features, **stop_features}.items():
+        c[key] = value
+
+    c['b5_expected_move_loss_cash'] = _loss_for_move_vectorized(c, c['b5_expected_move_pct'])
+    c['b5_mae20_loss_cash'] = _loss_for_move_vectorized(c, c['b5_mae20_move_pct'])
+    c['b5_tail_move_loss_cash'] = _loss_for_move_vectorized(c, c['b5_tail_move_pct'])
+    c['b5_premium_to_expected_move_loss'] = (
+        net_premium / pd.to_numeric(c['b5_expected_move_loss_cash'], errors='coerce').replace(0, np.nan)
+    )
+    c['b5_premium_to_mae20_loss'] = (
+        net_premium / pd.to_numeric(c['b5_mae20_loss_cash'], errors='coerce').replace(0, np.nan)
+    )
+    c['b5_premium_to_tail_move_loss'] = (
+        net_premium / pd.to_numeric(c['b5_tail_move_loss_cash'], errors='coerce').replace(0, np.nan)
+    )
+
+    min_tick = float(config.get('s1_b5_min_tick', 1.0) or 1.0)
+    c['b5_tick_value_ratio'] = min_tick / price.replace(0, np.nan)
+    min_price = float(config.get('s1_min_option_price', 0.0) or 0.0)
+    c['b5_low_price_flag'] = (price < max(min_price, min_tick * 2.0)).astype(float)
+    c['b5_variance_carry_forward'] = (
+        _numeric_column(c, 'contract_iv', 'entry_atm_iv') ** 2
+        - rv_ref ** 2
+    )
+    margin = _numeric_column(c, 'margin')
+    c['b5_capital_lockup_days'] = margin * dte.clip(lower=1)
+    c['b5_premium_per_capital_day'] = net_premium / c['b5_capital_lockup_days'].replace(0, np.nan)
+    return c
+
+
 def effective_count(values) -> float:
     arr = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
     arr = arr[arr > 0]
@@ -284,4 +603,3 @@ def write_b5_candidate_panels(
     portfolio_path = os.path.join(output_dir, f"s1_b5_portfolio_panel_{tag}.csv")
     portfolio_panel.to_csv(portfolio_path, index=False)
     logger.info("S1 B5 portfolio panel: %s (%d rows)", portfolio_path, len(portfolio_panel))
-

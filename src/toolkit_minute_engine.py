@@ -98,8 +98,17 @@ from stop_policy import (
 )
 from s1_pending_open import build_s1_sell_pending_item
 from s1_budget_tilt import compute_b2_product_budget_map
-from s1_experimental_scoring import apply_s1_b6_candidate_ranking, s1_b6_enabled
-from s1_shadow_universe import S1_B5_CANDIDATE_FIELDS, write_b5_candidate_panels
+from s1_experimental_scoring import (
+    apply_s1_b6_candidate_ranking,
+    b6_product_budget_overlay,
+    b6_product_side_budget_overlay,
+    s1_b6_enabled,
+)
+from s1_shadow_universe import (
+    S1_B5_CANDIDATE_FIELDS,
+    add_b5_shadow_fields,
+    write_b5_candidate_panels,
+)
 from broker_costs import resolve_option_fee, resolve_option_roundtrip_fee
 from runtime_paths import OUTPUT_DIR, CONFIG_PATH, CACHE_DIR
 from data_tables import OPTION_MINUTE_TABLE, FUTURE_MINUTE_TABLE, ETF_MINUTE_TABLE
@@ -718,281 +727,25 @@ class ToolkitMinuteEngine:
         out = out[out.index.notna()].dropna()
         return out[~out.index.duplicated(keep='last')].sort_index()
 
-    def _b5_product_history_features(self, product, option_type, dte):
-        spots = self._history_series(self._spot_history, product, 'spots')
-        fields = {
-            'b5_mom_5d': np.nan,
-            'b5_mom_20d': np.nan,
-            'b5_mom_60d': np.nan,
-            'b5_trend_z_20d': np.nan,
-            'b5_breakout_distance_up_60d': np.nan,
-            'b5_breakout_distance_down_60d': np.nan,
-            'b5_up_day_ratio_20d': np.nan,
-            'b5_down_day_ratio_20d': np.nan,
-            'b5_range_expansion_proxy_20d': np.nan,
-            'b5_mae20_move_pct': np.nan,
-            'b5_tail_move_pct': np.nan,
-        }
-        if spots.empty:
-            return fields
-        spots = spots[spots > 0]
-        if spots.empty:
-            return fields
-        cur = float(spots.iloc[-1])
-        for lb in (5, 20, 60):
-            if len(spots) > lb and spots.iloc[-1 - lb] > 0:
-                fields[f'b5_mom_{lb}d'] = float(cur / spots.iloc[-1 - lb] - 1.0)
-
-        returns = spots.pct_change(fill_method=None).dropna()
-        if len(returns) >= 5:
-            recent_abs = returns.abs()
-            if len(recent_abs) >= 21:
-                denom = float(recent_abs.iloc[-21:-1].mean())
-                if denom > 0:
-                    fields['b5_range_expansion_proxy_20d'] = float(recent_abs.iloc[-1] / denom)
-        if len(returns) >= 20:
-            r20 = returns.iloc[-20:]
-            fields['b5_up_day_ratio_20d'] = float((r20 > 0).mean())
-            fields['b5_down_day_ratio_20d'] = float((r20 < 0).mean())
-            vol20 = float(r20.std(ddof=0) * np.sqrt(20.0))
-            if vol20 > 0 and np.isfinite(fields['b5_mom_20d']):
-                fields['b5_trend_z_20d'] = float(fields['b5_mom_20d'] / vol20)
-            if str(option_type).upper() == 'P':
-                fields['b5_mae20_move_pct'] = float(max(-r20.min(), 0.0))
-            else:
-                fields['b5_mae20_move_pct'] = float(max(r20.max(), 0.0))
-        if len(returns) >= 60:
-            tail_q = float(self.config.get('s1_b5_tail_quantile', 0.05) or 0.05)
-            tail_q = min(max(tail_q, 0.01), 0.49)
-            r = returns.iloc[-int(self.config.get('s1_b5_tail_window_days', 120) or 120):]
-            if str(option_type).upper() == 'P':
-                fields['b5_tail_move_pct'] = float(max(-r.quantile(tail_q), 0.0))
-            else:
-                fields['b5_tail_move_pct'] = float(max(r.quantile(1.0 - tail_q), 0.0))
-
-        long_lb = int(self.config.get('s1_b5_trend_long_lookback_days', 60) or 60)
-        if len(spots) >= max(long_lb, 2):
-            window = spots.iloc[-long_lb:]
-            high = float(window.max())
-            low = float(window.min())
-            if cur > 0:
-                fields['b5_breakout_distance_up_60d'] = float(high / cur - 1.0)
-                fields['b5_breakout_distance_down_60d'] = float(1.0 - low / cur)
-        return fields
-
-    def _b5_iv_history_features(self, product):
-        ivs = self._history_series(self._iv_history, product, 'ivs')
-        fields = {
-            'b5_atm_iv_mom_5d': np.nan,
-            'b5_atm_iv_mom_20d': np.nan,
-            'b5_atm_iv_accel': np.nan,
-            'b5_iv_zscore_60d': np.nan,
-            'b5_iv_reversion_score': np.nan,
-        }
-        if ivs.empty:
-            return fields
-        cur = float(ivs.iloc[-1])
-        if len(ivs) > 5:
-            fields['b5_atm_iv_mom_5d'] = float(cur - ivs.iloc[-6])
-        if len(ivs) > 20:
-            fields['b5_atm_iv_mom_20d'] = float(cur - ivs.iloc[-21])
-        if np.isfinite(fields['b5_atm_iv_mom_5d']) and np.isfinite(fields['b5_atm_iv_mom_20d']):
-            fields['b5_atm_iv_accel'] = float(fields['b5_atm_iv_mom_5d'] - fields['b5_atm_iv_mom_20d'] * 0.25)
-        if len(ivs) >= 60:
-            win = ivs.iloc[-60:]
-            std = float(win.std(ddof=0))
-            if std > 0:
-                z = float((cur - win.mean()) / std)
-                fields['b5_iv_zscore_60d'] = z
-                mom_penalty = max(float(fields.get('b5_atm_iv_mom_5d') or 0.0), 0.0)
-                fields['b5_iv_reversion_score'] = z - 10.0 * mom_penalty
-        return fields
-
-    def _b5_stop_state_fields(self, product, option_type, date_str):
-        product_key = self._normalize_product_key(product)
-        side_key = (product_key, str(option_type).upper())
-        current = pd.Timestamp(date_str)
-
-        def summarize_stop_dates(dates):
-            clean = [pd.Timestamp(d) for d in dates if str(d)]
-            clean = [d for d in clean if d <= current]
-            if not clean:
-                return np.nan, 0
-            last = max(clean)
-            count20 = sum((current - d).days <= 20 for d in clean)
-            return int((current - last).days), int(count20)
-
-        days_product, count_product = summarize_stop_dates(self._stop_history.get(product_key, []))
-        days_side, count_side = summarize_stop_dates(self._stop_side_history.get(side_key, []))
-        blocked = 1.0 if self._is_reentry_blocked('S1', product, option_type, date_str) else 0.0
-        penalty = 0.0
-        if np.isfinite(days_side):
-            penalty = max(penalty, max(0.0, 1.0 - float(days_side) / 20.0))
-        if np.isfinite(days_product):
-            penalty = max(penalty, 0.5 * max(0.0, 1.0 - float(days_product) / 20.0))
-        iv_trend = self._last_iv_trend(product)
-        release = 1.0
-        if blocked:
-            release = 0.0
-        elif np.isfinite(iv_trend) and iv_trend > 0:
-            release = max(0.0, 1.0 - min(iv_trend / 0.02, 1.0))
-        return {
-            'b5_days_since_product_stop': days_product,
-            'b5_product_stop_count_20d': count_product,
-            'b5_days_since_product_side_stop': days_side,
-            'b5_product_side_stop_count_20d': count_side,
-            'b5_cooldown_blocked': blocked,
-            'b5_cooldown_penalty_score': penalty,
-            'b5_cooldown_release_score': release,
-        }
-
-    @staticmethod
-    def _b5_loss_for_move(row, move_pct):
-        try:
-            move_pct = float(move_pct)
-        except (TypeError, ValueError):
-            return np.nan
-        if not np.isfinite(move_pct) or move_pct <= 0:
-            return np.nan
-        spot = pd.to_numeric(row.get('spot_close', row.get('spot', np.nan)), errors='coerce')
-        mult = pd.to_numeric(row.get('multiplier', row.get('mult', np.nan)), errors='coerce')
-        delta = abs(pd.to_numeric(row.get('delta', np.nan), errors='coerce'))
-        gamma = abs(pd.to_numeric(row.get('gamma', np.nan), errors='coerce'))
-        if not np.isfinite(spot) or not np.isfinite(mult) or spot <= 0 or mult <= 0:
-            return np.nan
-        d_spot = spot * move_pct
-        delta_loss = (delta if np.isfinite(delta) else 0.0) * d_spot * mult
-        gamma_loss = 0.5 * (gamma if np.isfinite(gamma) else 0.0) * d_spot * d_spot * mult
-        loss = float(delta_loss + gamma_loss)
-        return loss if loss > 0 else np.nan
-
-    def _s1_b5_delta_bucket(self, abs_delta):
-        try:
-            abs_delta = float(abs_delta)
-        except (TypeError, ValueError):
-            return ''
-        if not np.isfinite(abs_delta):
-            return ''
-        raw_edges = self.config.get('s1_b5_delta_bucket_edges', [0, 0.02, 0.04, 0.06, 0.08, 0.10])
-        edges = []
-        for value in raw_edges:
-            try:
-                edges.append(float(value))
-            except (TypeError, ValueError):
-                continue
-        edges = sorted(set(edges))
-        if len(edges) < 2:
-            edges = [0, 0.02, 0.04, 0.06, 0.08, 0.10]
-        for left, right in zip(edges[:-1], edges[1:]):
-            if abs_delta >= left and abs_delta <= right:
-                return f"{left:.2f}_{right:.2f}"
-        return 'above_cap' if abs_delta > edges[-1] else 'below_floor'
-
     def _add_s1_b5_shadow_fields(self, candidates, date_str, product, exp, option_type,
                                  force=False):
-        if (not force and not self._s1_b5_shadow_enabled()) or candidates is None or candidates.empty:
-            return candidates
-        c = candidates.copy()
-        if 'abs_delta' in c.columns:
-            abs_delta = pd.to_numeric(c['abs_delta'], errors='coerce').abs()
-        elif 'delta' in c.columns:
-            abs_delta = pd.to_numeric(c['delta'], errors='coerce').abs()
-        else:
-            abs_delta = pd.Series(np.nan, index=c.index)
-        delta_cap = float(self.config.get('s1_sell_delta_cap', 0.10) or 0.10)
-        c['b5_delta_bucket'] = abs_delta.map(self._s1_b5_delta_bucket)
-        c['b5_delta_to_cap'] = delta_cap - abs_delta
-        c['b5_delta_ratio_to_cap'] = abs_delta / delta_cap if delta_cap > 0 else np.nan
-        c['b5_rank_in_delta_bucket'] = (
-            c.groupby('b5_delta_bucket', sort=False).cumcount() + 1
+        return add_b5_shadow_fields(
+            candidates,
+            date_str=date_str,
+            product=product,
+            option_type=option_type,
+            config=self.config,
+            spot_history=self._spot_history,
+            iv_history=self._iv_history,
+            stop_history=self._stop_history,
+            stop_side_history=self._stop_side_history,
+            history_series=self._history_series,
+            option_roundtrip_fee=self._option_roundtrip_fee_per_contract,
+            normalize_product=self._normalize_product_key,
+            is_reentry_blocked=self._is_reentry_blocked,
+            last_iv_trend=self._last_iv_trend,
+            force=force,
         )
-        c['b5_delta_bucket_candidate_count'] = c.groupby(
-            'b5_delta_bucket', sort=False
-        )['b5_delta_bucket'].transform('size')
-
-        mult = pd.to_numeric(
-            c['multiplier'] if 'multiplier' in c.columns else c.get('mult', np.nan),
-            errors='coerce',
-        )
-        price = pd.to_numeric(c.get('option_close', np.nan), errors='coerce')
-        roundtrip_fee = self._option_roundtrip_fee_per_contract(product, option_type)
-        net_premium = pd.to_numeric(c.get('net_premium_cash', np.nan), errors='coerce')
-        fallback_premium = price * mult - float(roundtrip_fee or 0.0)
-        net_premium = net_premium.where(net_premium.notna(), fallback_premium)
-        stress = pd.to_numeric(c.get('stress_loss', np.nan), errors='coerce').clip(lower=0)
-        bucket_premium = net_premium.groupby(c['b5_delta_bucket']).transform('sum')
-        bucket_stress = stress.groupby(c['b5_delta_bucket']).transform('sum')
-        total_premium = float(net_premium.sum()) if net_premium.notna().any() else np.nan
-        total_stress = float(stress.sum()) if stress.notna().any() else np.nan
-        c['b5_premium_share_delta_bucket'] = (
-            bucket_premium / total_premium if np.isfinite(total_premium) and total_premium != 0 else np.nan
-        )
-        c['b5_stress_share_delta_bucket'] = (
-            bucket_stress / total_stress if np.isfinite(total_stress) and total_stress != 0 else np.nan
-        )
-
-        spot = pd.to_numeric(c.get('spot_close', c.get('spot', np.nan)), errors='coerce')
-        theta_cash = pd.to_numeric(c.get('theta', np.nan), errors='coerce').abs() * mult
-        vega_cash = pd.to_numeric(c.get('vega', np.nan), errors='coerce').abs() * mult
-        gamma_cash = (
-            pd.to_numeric(c.get('gamma', np.nan), errors='coerce').abs()
-            * mult
-            * spot
-            * spot
-        )
-        c['b5_theta_per_gamma'] = theta_cash / gamma_cash.replace(0, np.nan)
-        c['b5_gamma_theta_ratio'] = gamma_cash / theta_cash.replace(0, np.nan)
-        c['b5_theta_per_vega'] = theta_cash / vega_cash.replace(0, np.nan)
-        c['b5_premium_per_vega'] = net_premium / vega_cash.replace(0, np.nan)
-
-        dte = pd.to_numeric(c.get('dte', np.nan), errors='coerce')
-        rv_ref = pd.to_numeric(c.get('rv_ref', c.get('entry_rv20', np.nan)), errors='coerce')
-        c['b5_expected_move_pct'] = rv_ref * np.sqrt(dte.clip(lower=1) / 252.0)
-
-        hist_features = self._b5_product_history_features(
-            product,
-            option_type,
-            float(dte.dropna().median()) if dte.notna().any() else np.nan,
-        )
-        iv_features = self._b5_iv_history_features(product)
-        stop_features = self._b5_stop_state_fields(product, option_type, date_str)
-        for key, value in {**hist_features, **iv_features, **stop_features}.items():
-            c[key] = value
-
-        c['b5_expected_move_loss_cash'] = c.apply(
-            lambda row: self._b5_loss_for_move(row, row.get('b5_expected_move_pct', np.nan)),
-            axis=1,
-        )
-        c['b5_mae20_loss_cash'] = c.apply(
-            lambda row: self._b5_loss_for_move(row, row.get('b5_mae20_move_pct', np.nan)),
-            axis=1,
-        )
-        c['b5_tail_move_loss_cash'] = c.apply(
-            lambda row: self._b5_loss_for_move(row, row.get('b5_tail_move_pct', np.nan)),
-            axis=1,
-        )
-        c['b5_premium_to_expected_move_loss'] = (
-            net_premium / pd.to_numeric(c['b5_expected_move_loss_cash'], errors='coerce').replace(0, np.nan)
-        )
-        c['b5_premium_to_mae20_loss'] = (
-            net_premium / pd.to_numeric(c['b5_mae20_loss_cash'], errors='coerce').replace(0, np.nan)
-        )
-        c['b5_premium_to_tail_move_loss'] = (
-            net_premium / pd.to_numeric(c['b5_tail_move_loss_cash'], errors='coerce').replace(0, np.nan)
-        )
-
-        min_tick = float(self.config.get('s1_b5_min_tick', 1.0) or 1.0)
-        c['b5_tick_value_ratio'] = min_tick / price.replace(0, np.nan)
-        min_price = float(self.config.get('s1_min_option_price', 0.0) or 0.0)
-        c['b5_low_price_flag'] = (price < max(min_price, min_tick * 2.0)).astype(float)
-        c['b5_variance_carry_forward'] = (
-            pd.to_numeric(c.get('contract_iv', c.get('entry_atm_iv', np.nan)), errors='coerce') ** 2
-            - rv_ref ** 2
-        )
-        margin = pd.to_numeric(c.get('margin', np.nan), errors='coerce')
-        c['b5_capital_lockup_days'] = margin * dte.clip(lower=1)
-        c['b5_premium_per_capital_day'] = net_premium / c['b5_capital_lockup_days'].replace(0, np.nan)
-        return c
 
     def _apply_s1_b6_candidate_ranking(self, candidates):
         return apply_s1_b6_candidate_ranking(
@@ -3466,266 +3219,38 @@ class ToolkitMinuteEngine:
             'side_meta_map': side_meta_map,
         }
 
-    def _b6_score_from_weight_map(self, frame, weight_map):
-        weight_sum = sum(max(0.0, float(v or 0.0)) for v in weight_map.values())
-        missing = float(self.config.get('s1_b6_missing_factor_score', 50.0) or 50.0)
-        if weight_sum <= 0:
-            return pd.Series(missing, index=frame.index, dtype=float)
-        score = pd.Series(0.0, index=frame.index, dtype=float)
-        for column, weight in weight_map.items():
-            weight = max(0.0, float(weight or 0.0))
-            if weight <= 0:
-                continue
-            values = pd.to_numeric(
-                frame[column] if column in frame.columns else pd.Series(np.nan, index=frame.index),
-                errors='coerce',
-            ).fillna(missing)
-            score += weight * values
-        return (score / weight_sum).clip(0.0, 100.0)
-
     def _b6_product_budget_overlay(self, side_df, candidate_products, total_budget_pct,
                                    date_str, nav):
-        if side_df is None or side_df.empty or not candidate_products:
-            return None
-        b6 = side_df.copy()
-
-        def col(name):
-            return b6[name] if name in b6.columns else pd.Series(np.nan, index=b6.index, dtype=float)
-
-        b6['b6_product_theta_per_vega_score'] = 100.0 * self._b2_rank_high(col('b5_theta_per_vega'))
-        b6['b6_product_premium_to_stress_score'] = 100.0 * self._b2_rank_high(col('premium_to_stress_loss'))
-        b6['b6_product_theta_per_gamma_score'] = 100.0 * self._b2_rank_high(col('b5_theta_per_gamma'))
-        b6['b6_product_tail_beta_score'] = 100.0 * self._b2_rank_low(col('b5_range_expansion_proxy_20d'))
-        b6['b6_product_gamma_per_premium_score'] = 100.0 * self._b2_rank_low(col('gamma_rent_penalty'))
-        side_score = self._b6_score_from_weight_map(
-            b6,
-            {
-                'b6_product_theta_per_vega_score': self.config.get('s1_b6_product_weight_theta_per_vega', 0.45),
-                'b6_product_premium_to_stress_score': self.config.get('s1_b6_product_weight_premium_to_stress', 0.20),
-                'b6_product_theta_per_gamma_score': self.config.get('s1_b6_product_weight_theta_per_gamma', 0.15),
-                'b6_product_tail_beta_score': self.config.get('s1_b6_product_weight_tail_beta', 0.10),
-                'b6_product_gamma_per_premium_score': self.config.get('s1_b6_product_weight_gamma_per_premium', 0.10),
-            },
+        overlay = b6_product_budget_overlay(
+            side_df,
+            candidate_products,
+            total_budget_pct,
+            date_str,
+            nav,
+            config=self.config,
+            rank_high=self._b2_rank_high,
+            rank_low=self._b2_rank_low,
+            weighted_average=self._b2_weighted_average,
         )
-        b6['b6_side_for_product_score'] = side_score
-
-        product_rows = []
-        for product in candidate_products:
-            group = b6[b6['product'] == product]
-            if group.empty:
-                product_rows.append({'product': product, 'b6_product_score': np.nan})
-                continue
-            count_series = (
-                group['candidate_count']
-                if 'candidate_count' in group.columns
-                else pd.Series(1.0, index=group.index, dtype=float)
-            )
-            weights = pd.to_numeric(count_series, errors='coerce').fillna(1.0).clip(lower=1.0)
-            score = float((group['b6_side_for_product_score'] * weights).sum() / weights.sum())
-            product_candidate_count = (
-                pd.to_numeric(group['candidate_count'], errors='coerce').fillna(0.0).sum()
-                if 'candidate_count' in group.columns
-                else float(len(group))
-            )
-            product_rows.append({
-                'product': product,
-                'b6_product_score': score,
-                'b6_product_candidate_count': int(product_candidate_count),
-                'b6_product_theta_per_vega': self._b2_weighted_average(group, 'b5_theta_per_vega'),
-                'b6_product_premium_to_stress': self._b2_weighted_average(group, 'premium_to_stress_loss'),
-                'b6_product_theta_per_gamma': self._b2_weighted_average(group, 'b5_theta_per_gamma'),
-                'b6_product_range_expansion': self._b2_weighted_average(group, 'b5_range_expansion_proxy_20d'),
-                'b6_product_cooldown_penalty': self._b2_weighted_average(group, 'b5_cooldown_penalty_score'),
-            })
-        prod = pd.DataFrame(product_rows)
-        missing = float(self.config.get('s1_b6_missing_factor_score', 50.0) or 50.0)
-        prod['b6_product_score'] = pd.to_numeric(prod['b6_product_score'], errors='coerce').fillna(missing)
-
-        n_products = len(candidate_products)
-        total_budget_pct = float(total_budget_pct or 0.0)
-        equal_budget_pct = total_budget_pct / max(n_products, 1)
-        floor_weight = max(0.0, float(self.config.get('s1_b6_product_floor_weight', 0.80) or 0.80))
-        power = max(0.01, float(self.config.get('s1_b6_product_power', 1.25) or 1.25))
-        clip_low = float(self.config.get('s1_b6_score_clip_low', 5.0) or 5.0)
-        clip_high = float(self.config.get('s1_b6_score_clip_high', 95.0) or 95.0)
-        if clip_high < clip_low:
-            clip_low, clip_high = clip_high, clip_low
-        tilt_strength = float(np.clip(
-            float(self.config.get('s1_b6_product_tilt_strength', 0.15) or 0.0),
-            0.0,
-            1.0,
-        ))
-        raw = floor_weight + (prod['b6_product_score'].clip(clip_low, clip_high) / 100.0) ** power
-        quality = total_budget_pct * raw / float(raw.sum() if raw.sum() > 0 else len(raw))
-        final = (1.0 - tilt_strength) * equal_budget_pct + tilt_strength * quality
-        mult = final / equal_budget_pct if equal_budget_pct > 0 else np.nan
-        min_mult = float(self.config.get('s1_b6_product_multiplier_min', 0.80) or 0.80)
-        max_mult = float(self.config.get('s1_b6_product_multiplier_max', 1.20) or 1.20)
-        final = np.clip(mult, min_mult, max_mult) * equal_budget_pct
-        prod['b6_product_equal_budget_pct'] = equal_budget_pct
-        prod['b6_product_quality_budget_pct'] = quality
-        prod['b6_product_final_budget_pct'] = final
-        prod['b6_product_budget_mult'] = final / equal_budget_pct if equal_budget_pct > 0 else np.nan
-        prod['b6_product_tilt_strength'] = tilt_strength
-
-        budget_map = dict(zip(prod['product'], prod['b6_product_final_budget_pct']))
-        meta_map = {row['product']: dict(row) for row in prod.to_dict('records')}
-        if self.config.get('s1_b6_product_budget_diagnostics_enabled', True):
-            for row in prod.to_dict('records'):
-                self.diagnostics_records.append({
-                    'date': date_str,
-                    'scope': 's1_b6_product_budget',
-                    'name': row.get('product'),
-                    'product': row.get('product'),
-                    'nav': nav,
-                    **row,
-                })
-        return {'product_budget_map': budget_map, 'product_meta_map': meta_map}
+        if overlay:
+            self.diagnostics_records.extend(overlay.pop('diagnostics', []))
+        return overlay
 
     def _b6_product_side_budget_overlay(self, side_df, base_product_budget_map,
                                         total_budget_pct, date_str, nav):
-        if side_df is None or side_df.empty:
-            return None
-        b6 = side_df.copy()
-
-        def col(name):
-            return b6[name] if name in b6.columns else pd.Series(np.nan, index=b6.index, dtype=float)
-
-        b6['b6_side_theta_per_vega_score'] = 100.0 * self._b2_rank_high(col('b5_theta_per_vega'))
-        b6['b6_side_premium_to_stress_score'] = 100.0 * self._b2_rank_high(col('premium_to_stress_loss'))
-        b6['b6_side_theta_per_gamma_score'] = 100.0 * self._b2_rank_high(col('b5_theta_per_gamma'))
-        b6['b6_side_premium_to_margin_score'] = 100.0 * self._b2_rank_high(col('premium_yield_margin'))
-        b6['b6_side_vega_per_premium_score'] = 100.0 * self._b2_rank_high(col('b5_premium_per_vega'))
-        b6['b6_side_gamma_per_premium_score'] = 100.0 * self._b2_rank_low(col('gamma_rent_penalty'))
-        b6['b6_product_side_score'] = self._b6_score_from_weight_map(
-            b6,
-            {
-                'b6_side_theta_per_vega_score': self.config.get('s1_b6_side_weight_theta_per_vega', 0.35),
-                'b6_side_premium_to_stress_score': self.config.get('s1_b6_side_weight_premium_to_stress', 0.25),
-                'b6_side_theta_per_gamma_score': self.config.get('s1_b6_side_weight_theta_per_gamma', 0.15),
-                'b6_side_premium_to_margin_score': self.config.get('s1_b6_side_weight_premium_to_margin', 0.10),
-                'b6_side_vega_per_premium_score': self.config.get('s1_b6_side_weight_vega_per_premium', 0.10),
-                'b6_side_gamma_per_premium_score': self.config.get('s1_b6_side_weight_gamma_per_premium', 0.05),
-            },
+        overlay = b6_product_side_budget_overlay(
+            side_df,
+            base_product_budget_map,
+            total_budget_pct,
+            date_str,
+            nav,
+            config=self.config,
+            rank_high=self._b2_rank_high,
+            rank_low=self._b2_rank_low,
         )
-
-        floor_weight = max(0.0, float(self.config.get('s1_b6_side_floor_weight', 0.70) or 0.70))
-        power = max(0.01, float(self.config.get('s1_b6_side_power', 1.25) or 1.25))
-        clip_low = float(self.config.get('s1_b6_score_clip_low', 5.0) or 5.0)
-        clip_high = float(self.config.get('s1_b6_score_clip_high', 95.0) or 95.0)
-        if clip_high < clip_low:
-            clip_low, clip_high = clip_high, clip_low
-        tilt_strength = float(np.clip(
-            float(self.config.get('s1_b6_side_tilt_strength', 0.25) or 0.0),
-            0.0,
-            1.0,
-        ))
-        b6['b6_raw_weight'] = floor_weight + (b6['b6_product_side_score'].clip(clip_low, clip_high) / 100.0) ** power
-        weight_total = float(b6['b6_raw_weight'].sum())
-        if weight_total <= 0:
-            b6['b6_raw_weight'] = 1.0
-            weight_total = float(len(b6))
-
-        base_side_budget = []
-        for row in b6.itertuples(index=False):
-            product_budget = float(base_product_budget_map.get(row.product, 0.0) or 0.0)
-            base_side_budget.append(product_budget / 2.0)
-        b6['b6_side_equal_budget_pct'] = base_side_budget
-        base_total_budget = float(pd.to_numeric(b6['b6_side_equal_budget_pct'], errors='coerce').clip(lower=0).sum())
-        if base_total_budget <= 0:
-            base_total_budget = float(total_budget_pct or 0.0)
-        b6['b6_side_quality_budget_pct'] = base_total_budget * b6['b6_raw_weight'] / weight_total
-        b6['b6_side_final_budget_pct'] = (
-            (1.0 - tilt_strength) * b6['b6_side_equal_budget_pct']
-            + tilt_strength * b6['b6_side_quality_budget_pct']
-        )
-
-        b6['b6_side_direction_penalty_mult'] = 1.0
-        if self.config.get('s1_b6_side_direction_penalty_enabled', True):
-            trend_z = pd.to_numeric(col('b5_trend_z_20d'), errors='coerce').fillna(0.0)
-            threshold = float(self.config.get('s1_b6_side_adverse_trend_z', 0.80) or 0.80)
-            trend_mult = float(self.config.get('s1_b6_side_adverse_trend_mult', 0.85) or 0.85)
-            adverse_trend = (
-                ((b6['option_type'].astype(str).str.upper() == 'C') & (trend_z > threshold))
-                | ((b6['option_type'].astype(str).str.upper() == 'P') & (trend_z < -threshold))
-            )
-            b6.loc[adverse_trend, 'b6_side_direction_penalty_mult'] *= trend_mult
-
-            up_score = 100.0 * self._b2_rank_high(col('b5_breakout_distance_up_60d'))
-            down_score = 100.0 * self._b2_rank_high(col('b5_breakout_distance_down_60d'))
-            cushion_score = np.where(
-                b6['option_type'].astype(str).str.upper() == 'C',
-                up_score,
-                down_score,
-            )
-            low_rank = float(self.config.get('s1_b6_side_breakout_rank_low', 30.0) or 30.0)
-            breakout_mult = float(self.config.get('s1_b6_side_breakout_mult_low', 0.90) or 0.90)
-            b6.loc[pd.Series(cushion_score, index=b6.index) < low_rank, 'b6_side_direction_penalty_mult'] *= breakout_mult
-
-            skew_score = 100.0 * self._b2_rank_low(col('b3_skew_steepening'))
-            skew_rank = float(self.config.get('s1_b6_side_skew_rank_low', 30.0) or 30.0)
-            skew_mult = float(self.config.get('s1_b6_side_skew_mult_low', 0.90) or 0.90)
-            b6.loc[skew_score < skew_rank, 'b6_side_direction_penalty_mult'] *= skew_mult
-
-            cooldown = pd.to_numeric(col('b5_cooldown_penalty_score'), errors='coerce').fillna(0.0).clip(0.0, 1.0)
-            floor = float(self.config.get('s1_b6_side_cooldown_mult_floor', 0.70) or 0.70)
-            cooldown_mult = 1.0 - cooldown * (1.0 - floor)
-            b6['b6_side_direction_penalty_mult'] *= cooldown_mult
-
-        b6['b6_side_final_budget_pct'] *= pd.to_numeric(
-            b6['b6_side_direction_penalty_mult'],
-            errors='coerce',
-        ).fillna(1.0)
-        min_mult = float(self.config.get('s1_b6_side_multiplier_min', 0.70) or 0.70)
-        max_mult = float(self.config.get('s1_b6_side_multiplier_max', 1.30) or 1.30)
-
-        product_budget_map = {}
-        side_meta_map = defaultdict(dict)
-        for product, group in b6.groupby('product', sort=False):
-            base_product_budget = float(base_product_budget_map.get(product, 0.0) or 0.0)
-            if base_product_budget > 0:
-                side_equal = base_product_budget / 2.0
-                clipped = group.copy()
-                mult = pd.to_numeric(clipped['b6_side_final_budget_pct'], errors='coerce') / side_equal
-                clipped['b6_side_final_budget_pct'] = mult.clip(min_mult, max_mult) * side_equal
-                b6.loc[clipped.index, 'b6_side_final_budget_pct'] = clipped['b6_side_final_budget_pct']
-            product_budget_map[product] = float(
-                pd.to_numeric(b6.loc[group.index, 'b6_side_final_budget_pct'], errors='coerce').sum()
-            )
-
-        for row in b6.to_dict('records'):
-            product = row['product']
-            ot = row['option_type']
-            product_budget = float(product_budget_map.get(product, 0.0) or 0.0)
-            equal_side = float(base_product_budget_map.get(product, 0.0) or 0.0) / 2.0
-            final_side = float(row.get('b6_side_final_budget_pct', 0.0) or 0.0)
-            side_budget_mult = final_side / equal_side if equal_side > 0 else np.nan
-            meta = dict(row)
-            meta.update({
-                'b6_product_side_score': row.get('b6_product_side_score', np.nan),
-                'b6_side_budget_mult': side_budget_mult,
-                'b6_side_tilt_strength': tilt_strength,
-            })
-            side_meta_map[product][ot] = meta
-
-        if self.config.get('s1_b6_product_side_budget_diagnostics_enabled', True):
-            for row in b6.to_dict('records'):
-                meta = side_meta_map.get(row['product'], {}).get(row['option_type'], {})
-                self.diagnostics_records.append({
-                    'date': date_str,
-                    'scope': 's1_b6_product_side_budget',
-                    'name': f"{row['product']}_{row['option_type']}",
-                    'product': row['product'],
-                    'option_type': row['option_type'],
-                    'nav': nav,
-                    'product_budget_pct': product_budget_map.get(row['product'], np.nan),
-                    **meta,
-                })
-
-        return {
-            'product_budget_map': product_budget_map,
-            'side_meta_map': side_meta_map,
-        }
+        if overlay:
+            self.diagnostics_records.extend(overlay.pop('diagnostics', []))
+        return overlay
 
     def _b2_collect_product_quality_inputs(self, product_frames, candidate_products, date_str=None):
         max_candidates = int(

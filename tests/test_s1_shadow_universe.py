@@ -12,7 +12,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from s1_shadow_universe import effective_count, hhi, write_b5_candidate_panels  # noqa: E402
+from s1_shadow_universe import add_b5_shadow_fields, effective_count, hhi, write_b5_candidate_panels  # noqa: E402
 
 
 class S1ShadowUniverseTest(unittest.TestCase):
@@ -77,7 +77,56 @@ class S1ShadowUniverseTest(unittest.TestCase):
             self.assertEqual(int(portfolio.loc[0, "active_product_count"]), 1)
             self.assertAlmostEqual(float(portfolio.loc[0, "top1_product_stress_share"]), 1.0)
 
+    def test_add_b5_shadow_fields_uses_vectorized_loss_metrics(self):
+        candidates = pd.DataFrame([
+            {
+                "option_code": "CU_TEST",
+                "abs_delta": 0.09,
+                "delta": -0.09,
+                "gamma": 0.0002,
+                "theta": -2.0,
+                "vega": 5.0,
+                "option_close": 20.0,
+                "multiplier": 5.0,
+                "spot_close": 80000.0,
+                "dte": 20,
+                "rv_ref": 0.20,
+                "stress_loss": 100.0,
+                "margin": 1000.0,
+                "contract_iv": 0.25,
+            }
+        ])
+        dates = pd.date_range("2025-01-01", periods=65, freq="D")
+        spots = pd.Series([80000.0 + i for i in range(65)], index=dates)
+        ivs = pd.Series(0.20, index=dates)
+
+        def history_series(history, product, value_key):
+            values = history[product][value_key]
+            dates_ = history[product]["dates"]
+            return pd.Series(values, index=pd.to_datetime(dates_))
+
+        out = add_b5_shadow_fields(
+            candidates,
+            date_str="2025-03-10",
+            product="CU",
+            option_type="P",
+            config={"s1_b5_shadow_factor_extension_enabled": True, "s1_sell_delta_cap": 0.10},
+            spot_history={"CU": {"dates": dates.strftime("%Y-%m-%d").tolist(), "spots": spots.tolist()}},
+            iv_history={"CU": {"dates": dates.strftime("%Y-%m-%d").tolist(), "ivs": ivs.tolist()}},
+            stop_history={},
+            stop_side_history={},
+            history_series=history_series,
+            option_roundtrip_fee=lambda *_args: 1.0,
+            normalize_product=lambda product: product,
+            is_reentry_blocked=lambda *_args: False,
+            last_iv_trend=lambda _product: 0.0,
+        )
+
+        self.assertEqual(out.loc[0, "b5_delta_bucket"], "0.08_0.10")
+        self.assertGreater(float(out.loc[0, "b5_expected_move_loss_cash"]), 0.0)
+        self.assertGreater(float(out.loc[0, "b5_theta_per_vega"]), 0.0)
+        self.assertAlmostEqual(float(out.loc[0, "b5_low_price_flag"]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

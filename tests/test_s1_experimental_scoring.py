@@ -10,7 +10,12 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from s1_experimental_scoring import apply_s1_b6_candidate_ranking, s1_b6_enabled  # noqa: E402
+from s1_experimental_scoring import (  # noqa: E402
+    apply_s1_b6_candidate_ranking,
+    b6_product_budget_overlay,
+    b6_product_side_budget_overlay,
+    s1_b6_enabled,
+)
 
 
 def rank_high(series):
@@ -81,7 +86,102 @@ class S1ExperimentalScoringTest(unittest.TestCase):
 
         self.assertEqual(filtered["option_code"].tolist(), ["B"])
 
+    def test_b6_product_budget_overlay_returns_diagnostics(self):
+        side_df = pd.DataFrame([
+            {
+                "product": "CU",
+                "option_type": "P",
+                "candidate_count": 2,
+                "b5_theta_per_vega": 2.0,
+                "premium_to_stress_loss": 2.0,
+                "b5_theta_per_gamma": 2.0,
+                "b5_range_expansion_proxy_20d": 0.2,
+                "gamma_rent_penalty": 0.2,
+                "volume": 10,
+                "open_interest": 20,
+            },
+            {
+                "product": "AL",
+                "option_type": "P",
+                "candidate_count": 2,
+                "b5_theta_per_vega": 0.5,
+                "premium_to_stress_loss": 0.5,
+                "b5_theta_per_gamma": 0.5,
+                "b5_range_expansion_proxy_20d": 2.0,
+                "gamma_rent_penalty": 2.0,
+                "volume": 10,
+                "open_interest": 20,
+            },
+        ])
+
+        overlay = b6_product_budget_overlay(
+            side_df,
+            ["CU", "AL"],
+            0.5,
+            "2025-05-06",
+            10000.0,
+            config={"s1_b6_product_tilt_strength": 1.0},
+            rank_high=rank_high,
+            rank_low=rank_low,
+            weighted_average=lambda frame, column: float(pd.to_numeric(frame[column]).mean()),
+        )
+
+        self.assertGreater(overlay["product_budget_map"]["CU"], overlay["product_budget_map"]["AL"])
+        self.assertEqual(len(overlay["diagnostics"]), 2)
+
+    def test_b6_side_overlay_returns_side_budgets_and_diagnostics(self):
+        side_df = pd.DataFrame([
+            {
+                "product": "CU",
+                "option_type": "P",
+                "b5_theta_per_vega": 2.0,
+                "premium_to_stress_loss": 2.0,
+                "b5_theta_per_gamma": 2.0,
+                "premium_yield_margin": 2.0,
+                "b5_premium_per_vega": 2.0,
+                "gamma_rent_penalty": 0.1,
+                "b5_trend_z_20d": 0.0,
+                "b5_breakout_distance_up_60d": 0.2,
+                "b5_breakout_distance_down_60d": 0.2,
+                "b3_skew_steepening": 0.0,
+                "b5_cooldown_penalty_score": 0.0,
+            },
+            {
+                "product": "CU",
+                "option_type": "C",
+                "b5_theta_per_vega": 1.0,
+                "premium_to_stress_loss": 1.0,
+                "b5_theta_per_gamma": 1.0,
+                "premium_yield_margin": 1.0,
+                "b5_premium_per_vega": 1.0,
+                "gamma_rent_penalty": 0.2,
+                "b5_trend_z_20d": 0.0,
+                "b5_breakout_distance_up_60d": 0.2,
+                "b5_breakout_distance_down_60d": 0.2,
+                "b3_skew_steepening": 0.0,
+                "b5_cooldown_penalty_score": 0.0,
+            },
+        ])
+
+        overlay = b6_product_side_budget_overlay(
+            side_df,
+            {"CU": 0.2},
+            0.2,
+            "2025-05-06",
+            10000.0,
+            config={"s1_b6_side_tilt_strength": 1.0},
+            rank_high=rank_high,
+            rank_low=rank_low,
+        )
+
+        side_sum = sum(
+            meta["b6_side_final_budget_pct"]
+            for meta in overlay["side_meta_map"]["CU"].values()
+        )
+        self.assertAlmostEqual(overlay["product_budget_map"]["CU"], side_sum)
+        self.assertLessEqual(overlay["product_budget_map"]["CU"], 0.2)
+        self.assertEqual(len(overlay["diagnostics"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-

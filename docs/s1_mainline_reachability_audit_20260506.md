@@ -62,6 +62,14 @@
 
 后续应继续把 `toolkit_minute_engine.py` 中的 B5 单合约字段构造、B6 product/side overlay 等调用迁出，使 shadow 研究层真正变成显式启用的实验模块。
 
+## 4.2 第三轮小步抽离与性能优化
+
+已将 B5/full shadow 单合约字段构造迁入 `src/s1_shadow_universe.py`，主引擎只保留 `_add_s1_b5_shadow_fields` 包装调用。
+
+已将 B6 product budget overlay 与 product-side budget overlay 迁入 `src/s1_experimental_scoring.py`，主引擎只负责传入配置、rank 函数和诊断记录收集。原主引擎中这两段不可达的旧实现已删除，避免后续审计误读。
+
+性能侧，本轮把 B5 shadow 中 `expected_move_loss`、`mae20_loss`、`tail_move_loss` 三个逐行损失估算改为向量化计算。该优化只影响 B5/B6/full-shadow 实验路径；P3B/A0 默认交易路径不启用这些 shadow 字段，因此不会改变当前主线回测口径。
+
 ## 5. 待抽离主引擎逻辑
 
 以下仍在 `toolkit_minute_engine.py` 中，但不属于 P3B/A0 默认交易路径：
