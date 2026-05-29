@@ -1,0 +1,10 @@
+{
+  "extends": "config_s1_mainline_candidate1_l1_clean_20260526.json",
+  "strategy_version": "s1_mainline_candidate1_l1_first_20260526",
+  "_candidate_role": "mainline_candidate_1_l1_first_smoke",
+  "_candidate_name": "L1-first product-side gate before mainline contract scan",
+  "_candidate_note": "Same as L1-clean candidate, but applies the L1 product-side hard gate before the mainline contract candidate scan. This tests the Ledet-style decision order: choose product-side first, then scan expiries/contracts inside allowed product-sides.",
+  "s1_l1_pre_candidate_enabled": true,
+  "s1_l1_pre_candidate_diagnostics_enabled": true,
+  "s1_l1_pre_candidate_missing_policy": "fail"
+}

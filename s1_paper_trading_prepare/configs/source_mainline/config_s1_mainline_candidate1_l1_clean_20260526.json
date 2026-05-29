@@ -1,0 +1,7 @@
+{
+  "extends": "config_s1_mainline_l1_clean_20260526.json",
+  "strategy_version": "s1_mainline_candidate1_l1_clean_20260526",
+  "_candidate_role": "mainline_candidate_1",
+  "_candidate_name": "L1-clean product-side hard gate and budget overlay",
+  "_candidate_note": "Current preferred S1 mainline candidate. It keeps the current mainline contract rules, B6 ranking, IV/VRP gates, redline, holiday block, and post-trigger VWAP stop, but adds a Ledet-style L1 product-side gate: historical_retention_score_bucket5_date >= 4 and tail_cluster_safety_score_bucket5_date >= 3. In the 2022-01-04 to 2026-03-31 run, it produced lower drawdown and fewer stop losses than the PSO candidate, with lower deployment."
+}

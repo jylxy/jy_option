@@ -1,0 +1,17 @@
+{
+  "extends": "config_s1_candidate3_oi1000_premium25_bucket08_margin70_20260527.json",
+  "strategy_version": "s1_mainline_locked_50m_liq10_20260527",
+  "_mainline_name": "S1 locked current mainline: 50m liq10 execution version",
+  "_mainline_lock_date": "2026-05-27",
+  "_mainline_lock_note": "Locked from the 50m capacity backtest version. Future engine or strategy experiments must not change this config in place; create a new config that extends this file or a separate experiment config instead.",
+  "_baseline_output_tag": "s1_capacity_liq10_50m_20260527_2022_20260331",
+  "_baseline_nav_file": "server_deploy/output/capacity_liq10_20260527_remote/nav_s1_capacity_liq10_50m_20260527_2022_20260331.csv",
+  "_baseline_orders_file": "server_deploy/output/capacity_liq10_20260527_remote/orders_s1_capacity_liq10_50m_20260527_2022_20260331.csv",
+  "_baseline_diagnostics_file": "server_deploy/output/capacity_liq10_20260527_remote/diagnostics_s1_capacity_liq10_50m_20260527_2022_20260331.csv",
+  "capital": 50000000,
+  "open_execution_volume_limit_enabled": true,
+  "s1_entry_volume_target_cap_enabled": true,
+  "volume_limit_pct": 0.10,
+  "s1_entry_volume_limit_ratio": 0.10,
+  "intraday_stop_vwap_participation_rate": 0.10
+}

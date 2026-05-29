@@ -1,0 +1,35 @@
+# Local runtime artifacts
+output/orders/*
+output/diagnostics/*
+output/audit/*
+data/daily_snapshots/*
+data/derived/*
+data/product_side_panel/*
+data/manifests/*
+logs/
+
+# Keep output directory anchors
+!output/orders/.gitkeep
+!output/diagnostics/.gitkeep
+!output/audit/.gitkeep
+!data/daily_snapshots/.gitkeep
+!data/derived/.gitkeep
+!data/product_side_panel/.gitkeep
+!data/manifests/.gitkeep
+
+# Large or sensitive data
+*.db
+*.sqlite
+*.parquet
+*.csv.gz
+*.xlsx
+*.xls
+*.pdf
+credentials*
+*.key
+*.pem
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -1,0 +1,8 @@
+# This repository is intentionally narrowed to the S1 paper-trading
+# preparation project.  The surrounding local research workspace is kept out of
+# GitHub.
+*
+
+!.gitignore
+!s1_paper_trading_prepare/
+!s1_paper_trading_prepare/**

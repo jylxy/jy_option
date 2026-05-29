@@ -1,0 +1,9 @@
+{
+  "extends": "source_mainline/config_s1_mainline_current.json",
+  "_paper_trading_prepare": true,
+  "_paper_strategy_version": "s1_sim_mainline_20260529",
+  "_source_mainline_config": "s1_paper_trading_prepare/configs/source_mainline/config_s1_mainline_current.json",
+  "_s1_rolling_product_side_panel_path": "s1_paper_trading_prepare/data/product_side_panel/rolling_product_side_panel.csv",
+  "_source_mainline_note": "Paper-trading preparation wrapper. Do not edit historical locked mainline configs in place.",
+  "_order_generation_objective": "Read T-day data, run the locked S1 mainline signal and candidate pipeline, and export T+1 planned paper-trading orders plus diagnostics."
+}

@@ -1,0 +1,10 @@
+{
+  "extends": "config_s1_mainline_candidate1_l3_ledger_l1q3_oi1000_20260526.json",
+  "strategy_version": "s1_candidate3_oi1000_premium25_bucket08_20260527",
+  "_candidate_role": "candidate3_liquidity_live_premium_budget_relaxed",
+  "_candidate_name": "Candidate 3 OI>=1000 with premium budget 2.5% and bucket/corr 0.8%",
+  "_candidate_note": "Based on Candidate 3 live-liquidity version. Only relaxes portfolio total entry premium cap from 2.0% to 2.5%, and bucket/correlation-group premium caps from 0.6% to 0.8%. Product and product-side premium caps remain unchanged.",
+  "portfolio_entry_premium_cap": 0.025,
+  "portfolio_bucket_entry_premium_cap": 0.008,
+  "portfolio_corr_group_entry_premium_cap": 0.008
+}

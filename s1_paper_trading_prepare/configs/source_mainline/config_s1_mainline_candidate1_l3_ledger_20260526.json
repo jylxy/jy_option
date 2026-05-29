@@ -1,0 +1,19 @@
+{
+  "extends": "config_s1_mainline_candidate1_l1_first_20260526.json",
+  "strategy_version": "s1_mainline_candidate1_l3_ledger_20260526",
+  "_candidate_role": "mainline_candidate_1_l3_ledger",
+  "_candidate_name": "Candidate 1: L1/L2 product-side priority with explicit L3 budget ledger",
+  "_candidate_note": "Keeps L1 hard gate and L2 three-factor bucket multipliers unchanged. Layer 3 no longer treats failed product-sides as redistributable budget by default: base budget is computed over all candidate product-sides, passed sides receive bucket multipliers, excess budget is capped, and unused budget can remain idle.",
+  "s1_l3_product_side_ledger_enabled": true,
+  "s1_l3_ledger_base_scope": "all_candidate_sides",
+  "s1_l3_ledger_cap_total_budget": true,
+  "s1_l3_refill_min_bucket": 4,
+  "s1_l3_apply_max_contracts_by_bucket": false,
+  "s1_l3_max_contracts_by_bucket": {
+    "5": 10,
+    "4": 10,
+    "3": 8,
+    "2": 6,
+    "1": 4
+  }
+}
