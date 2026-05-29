@@ -21,6 +21,13 @@ ROLLING_PANEL_FILE = "rolling_product_side_panel.csv"
 ROLLING_OBSERVATION_FILE = "rolling_product_side_observations.csv"
 ROLLING_ADMISSION_PREFIX = "rolling_l1_admission"
 ROLLING_MANIFEST_PREFIX = "rolling_product_side_update"
+LABEL_COLUMNS = [
+    "label_v3_retention_10d",
+    "label_v3_stop_touch_10d",
+    "label_v3_retention_to_expiry_clipped",
+    "label_v3_max_adverse_price_ratio_10d",
+    "label_v3_product_stop_cluster_with_portfolio",
+]
 L1_PANEL_REQUIRED_COLUMNS = [
     "date",
     "product",
@@ -272,6 +279,18 @@ def _load_snapshot_for_date(data_dir: Path, date: str) -> pd.DataFrame:
     return _read_csv(path)
 
 
+def _load_snapshot_cached(data_dir: Path, date: str, snapshot_cache: dict[str, pd.DataFrame] | None) -> pd.DataFrame:
+    if snapshot_cache is None:
+        return _load_snapshot_for_date(data_dir, date)
+    key = str(date)[:10]
+    if key not in snapshot_cache:
+        snapshot_cache[key] = _load_snapshot_for_date(data_dir, key)
+        if len(snapshot_cache) > 32:
+            for old_key in sorted(snapshot_cache)[: len(snapshot_cache) - 32]:
+                snapshot_cache.pop(old_key, None)
+    return snapshot_cache[key]
+
+
 def _available_snapshot_dates(data_dir: Path) -> list[str]:
     out = []
     for path in sorted((data_dir / "daily_snapshots").glob("option_chain_*.csv")):
@@ -286,12 +305,21 @@ def _mature_observation_labels(
     data_dir: Path,
     config: dict[str, Any],
     outcome_horizon: int,
+    snapshot_cache: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Update matured product-side outcome labels from stored daily snapshots."""
     if observations.empty:
         return observations
 
     out = observations.copy()
+    out["date"] = out["date"].astype(str).str[:10]
+    out["product"] = out["product"].astype(str).str.upper().str.strip()
+    out["option_type"] = out["option_type"].astype(str).str.upper().str[:1]
+    for col in LABEL_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    if "outcome_matured" not in out.columns:
+        out["outcome_matured"] = 0
     available_dates = _available_snapshot_dates(data_dir)
     if not available_dates:
         return out
@@ -306,11 +334,15 @@ def _mature_observation_labels(
         end_idx = start_idx + int(outcome_horizon)
         if end_idx >= len(available_dates):
             continue
+        obs_mask = out["date"].eq(obs_date)
+        already_matured = pd.to_numeric(out.loc[obs_mask, "outcome_matured"], errors="coerce").fillna(0).eq(1).all()
+        if already_matured:
+            continue
         future_dates = available_dates[start_idx + 1:end_idx + 1]
         if not future_dates:
             continue
 
-        entry_snapshot = _load_snapshot_for_date(data_dir, obs_date)
+        entry_snapshot = _load_snapshot_cached(data_dir, obs_date, snapshot_cache)
         if entry_snapshot.empty:
             continue
         entry = entry_snapshot.copy()
@@ -323,7 +355,10 @@ def _mature_observation_labels(
             continue
         entry["_entry_price"] = _safe_numeric(entry, "option_close")
 
-        future_parts = [_contract_key_frame(_load_snapshot_for_date(data_dir, date)) for date in future_dates]
+        future_parts = [
+            _contract_key_frame(_load_snapshot_cached(data_dir, date, snapshot_cache))
+            for date in future_dates
+        ]
         future = pd.concat([part for part in future_parts if not part.empty], ignore_index=True, sort=False)
         if future.empty:
             continue
@@ -349,23 +384,14 @@ def _mature_observation_labels(
         side_labels["date"] = obs_date
         side_labels["label_v3_product_stop_cluster_with_portfolio"] = side_labels["label_v3_stop_touch_10d"]
 
-        label_cols = [
-            "label_v3_retention_10d",
-            "label_v3_stop_touch_10d",
-            "label_v3_retention_to_expiry_clipped",
-            "label_v3_max_adverse_price_ratio_10d",
-            "label_v3_product_stop_cluster_with_portfolio",
-        ]
-        merged = out.merge(
-            side_labels[["date", "product", "option_type", *label_cols]],
-            how="left",
-            on=["date", "product", "option_type"],
-            suffixes=("", "_new"),
-        )
-        for col in label_cols:
-            new_col = f"{col}_new"
-            if new_col in merged.columns:
-                out[col] = merged[new_col].where(merged[new_col].notna(), merged[col])
+        label_map = side_labels.set_index(["date", "product", "option_type"])[LABEL_COLUMNS]
+        target_idx = out.index[obs_mask]
+        target_keys = pd.MultiIndex.from_frame(out.loc[target_idx, ["date", "product", "option_type"]])
+        updates = label_map.reindex(target_keys)
+        updates.index = target_idx
+        for col in LABEL_COLUMNS:
+            out.loc[target_idx, col] = updates[col].where(updates[col].notna(), out.loc[target_idx, col])
+        out.loc[target_idx, "outcome_matured"] = 1
 
     out["outcome_matured"] = out["date"].astype(str).map(
         lambda date: int(date in date_pos and date_pos[date] + int(outcome_horizon) < len(available_dates) and max_date > date)
@@ -474,6 +500,7 @@ def update_rolling_product_side_panel(
     hist_window: int = 63,
     outcome_horizon: int = 10,
     write_outputs: bool = True,
+    snapshot_cache: dict[str, pd.DataFrame] | None = None,
 ) -> RollingProductSideUpdateResult:
     """Upsert one date and refresh the full rolling S1 product-side panel."""
     date = str(signal_date)[:10]
@@ -487,7 +514,7 @@ def update_rolling_product_side_panel(
     existing = _read_csv(observation_path)
     new_observations = build_daily_product_side_observations(l0_universe, config, date)
     observations = _upsert_by_key(existing, new_observations, ["date", "product", "option_type"])
-    observations = _mature_observation_labels(observations, data_dir, config, outcome_horizon)
+    observations = _mature_observation_labels(observations, data_dir, config, outcome_horizon, snapshot_cache)
     panel = _add_hist_and_scores(observations, hist_window)
     panel = ensure_l1_loader_columns(panel)
     admission = build_rolling_l1_admission(panel, config, date)

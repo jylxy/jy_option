@@ -57,6 +57,9 @@ Refresh only missing trading-day partitions in a date window:
 python s1_paper_trading_prepare/scripts/update_daily_data.py --start-date 2022-04-14 --end-date 2022-04-20
 ```
 
+The default Toolkit product chunk size is `32`; pass `--product-chunk-size 8`
+if a data source needs smaller queries.
+
 Check deployable files remain S1-only:
 
 ```powershell
@@ -119,6 +122,7 @@ only because the historical engine imports those modules at load time. See:
 ```text
 docs/s1_only_scope_and_daily_data.md
 docs/rolling_product_side_panel.md
+docs/rolling_product_side_chain_audit.md
 docs/paper_account_state_contract.md
 docs/daily_runbook.md
 ```

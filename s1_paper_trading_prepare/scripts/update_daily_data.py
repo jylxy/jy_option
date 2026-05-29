@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("--config", default=None, help="Optional paper mainline config path.")
     parser.add_argument("--data-dir", default=None, help="Optional data output directory.")
     parser.add_argument("--products", default=None, help="Optional comma-separated product list.")
-    parser.add_argument("--product-chunk-size", type=int, default=8, help="Products per Toolkit query chunk.")
+    parser.add_argument("--product-chunk-size", type=int, default=32, help="Products per Toolkit query chunk.")
     parser.add_argument("--force", action="store_true", help="Re-fetch existing date partitions from Toolkit.")
     args = parser.parse_args()
 

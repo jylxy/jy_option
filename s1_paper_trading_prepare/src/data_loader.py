@@ -21,7 +21,7 @@ def load_signal_day_snapshot(
     config_path: str | Path | None = None,
     *,
     products: tuple[str, ...] | None = None,
-    product_chunk_size: int = 8,
+    product_chunk_size: int = 32,
 ) -> pd.DataFrame:
     """Load the same daily aggregate snapshot used by the ToolkitMinuteEngine."""
     ensure_server_deploy_importable()

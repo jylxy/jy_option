@@ -13,7 +13,7 @@ from .config_snapshot import important_rules, load_effective_config
 from .data_loader import load_signal_day_snapshot, load_trading_dates
 from .diagnostics import write_csv, write_json
 from .paths import DEFAULT_DATA_DIR, DEFAULT_PAPER_CONFIG, resolve_path
-from .product_side_panel import audit_l1_admission
+from .product_side_panel import audit_l1_admission_from_panel, load_panel
 from .product_side_rolling import RollingProductSideUpdateResult, update_rolling_product_side_panel
 from .table_registry import current_registry_status
 
@@ -229,7 +229,7 @@ def update_daily_data(
     config_path: str | Path | None = None,
     data_dir: str | Path | None = None,
     products: tuple[str, ...] | None = None,
-    product_chunk_size: int = 8,
+    product_chunk_size: int = 32,
     force: bool = False,
     write_outputs: bool = True,
 ) -> DailyDataUpdateResult:
@@ -244,6 +244,8 @@ def update_daily_data(
     out_dir = resolve_path(data_dir, default=DEFAULT_DATA_DIR)
     snapshot = load_effective_config(config_target)
     dates = _resolve_update_dates(signal_date, start_date, end_date, out_dir)
+    locked_l1_panel = load_panel(snapshot.config)
+    rolling_snapshot_cache: dict[str, pd.DataFrame] = {}
 
     base_meta = {
         "signal_date": dates[-1] if dates else None,
@@ -253,7 +255,7 @@ def update_daily_data(
         "strategy_version": snapshot.config.get("strategy_version"),
         "paper_strategy_version": snapshot.config.get("_paper_strategy_version"),
         "products": list(products) if products else None,
-        "product_chunk_size": int(product_chunk_size or 8),
+        "product_chunk_size": int(product_chunk_size or 32),
         "force": bool(force),
         "toolkit_sources": [
             "Toolkit option minute table via ToolkitDayLoader daily aggregation",
@@ -303,13 +305,14 @@ def update_daily_data(
                 write_csv(snapshot_path, option_snapshot)
 
         l0_universe = build_l0_contract_universe(option_snapshot, snapshot.config, date)
-        l1_admission = audit_l1_admission(date, snapshot.path)
+        l1_admission = audit_l1_admission_from_panel(date, snapshot.config, locked_l1_panel)
         rolling_result = update_rolling_product_side_panel(
             date,
             l0_universe=l0_universe,
             config=snapshot.config,
             data_dir=out_dir,
             write_outputs=write_outputs,
+            snapshot_cache=rolling_snapshot_cache,
         )
         manifest = {
             **base_meta,
@@ -358,8 +361,6 @@ def update_daily_data(
         }
 
         if write_outputs:
-            if action == "fetch_from_toolkit" or force or not snapshot_path.exists():
-                write_csv(snapshot_path, option_snapshot)
             write_csv(l0_path, l0_universe)
             write_csv(l1_path, l1_admission)
             write_json(manifest_path, manifest)

@@ -24,11 +24,8 @@ def load_panel(config: dict) -> pd.DataFrame:
     return panel
 
 
-def audit_l1_admission(signal_date: str, config_path: str | Path | None = None) -> pd.DataFrame:
-    """Return Q3/Q3 L1 pass/fail rows for a signal date."""
-    snapshot = load_effective_config(config_path)
-    config = snapshot.config
-    panel = load_panel(config)
+def audit_l1_admission_from_panel(signal_date: str, config: dict, panel: pd.DataFrame) -> pd.DataFrame:
+    """Return Q3/Q3 L1 pass/fail rows from a preloaded product-side panel."""
     if panel.empty:
         return pd.DataFrame()
     date_key = str(signal_date)[:10]
@@ -44,3 +41,10 @@ def audit_l1_admission(signal_date: str, config_path: str | Path | None = None) 
     day["l1_min_tail_bucket"] = min_tail
     return day
 
+
+def audit_l1_admission(signal_date: str, config_path: str | Path | None = None) -> pd.DataFrame:
+    """Return Q3/Q3 L1 pass/fail rows for a signal date."""
+    snapshot = load_effective_config(config_path)
+    config = snapshot.config
+    panel = load_panel(config)
+    return audit_l1_admission_from_panel(signal_date, config, panel)
