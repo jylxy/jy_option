@@ -35,9 +35,15 @@ The current implementation fixes those costs:
 - For a multi-date update with `--rebuild-contract-history`, rebuild the
   historical contract-shadow table only on the first formal date, then append
   later dates incrementally.  This prevents one full replay per signal date.
+- `--prehistory-start-date` only fetches or reuses warmup snapshots.  It no
+  longer triggers a contract-shadow replay unless `--rebuild-contract-history`
+  is also explicit.
 - If `contract_shadow_fields_YYYYMMDD.csv` already exists for a signal date,
   same-day reruns reuse that audit partition and skip the large
   contract-shadow recalculation.
+- Matured-label refresh now caches contract-key snapshots and builds the
+  product-level expiry spot map once per run instead of once per observation
+  date.
 - Existing snapshots without `vwap` are enriched by fetching only the missing
   Toolkit VWAP partition for that date.
 
@@ -70,6 +76,15 @@ rolling_panel_rows: 9,172
 elapsed: 7m20s
 ```
 
+After caching contract-key snapshots and the product-level expiry spot map, the
+same full warmup rebuild completed in:
+
+```text
+contract_shadow_observation_rows: 1,015,827
+rolling_panel_rows: 9,172
+elapsed: 213.75s
+```
+
 This is the full historical recalibration path.  A same-day rerun after the
 `contract_shadow_fields_20220401.csv` audit partition exists reused the cached
 contract fields and completed in:
@@ -77,6 +92,11 @@ contract fields and completed in:
 ```text
 elapsed: 6.48s
 ```
+
+A daily no-rebuild run for `2022-04-01` completed in 12.84s.  The same command
+with `--prehistory-start-date 2021-07-01` but without
+`--rebuild-contract-history` completed in 13.97s and recorded
+`rolling_rebuild_history_for_date=false`.
 
 The scoring-chain port is heavier than the earlier proxy because it replays the
 5-day and 10-day outcome label refresh and product stop-cluster aggregation.
@@ -159,6 +179,7 @@ incremental contract-level history used to recompute rolling fields.
 | 2022-03-01..2022-03-31, contract-observation path labels | 1144 / 1144 | 1144 | 98.6% |
 | 2022-03-01..2022-03-31, plus entry-infeasible candidates retained in cluster aggregation | 1144 / 1144 | 1144 | 99.8% |
 | 2022-03-01..2022-03-31, plus product-level expiry spot asof | 1144 / 1144 | 1144 | 99.8% |
+| 2022-03-01..2022-03-31, plus performance-policy audit | 1144 / 1144 | 1144 | 99.8% |
 
 After replaying the full-shadow fields from the available 2022 snapshots,
 the 2022-03-01..2022-03-31 window initially remained close at about 90.5% gate match:
@@ -266,10 +287,11 @@ when daily volume is zero.
 
 The locked research table also inherits richer full-shadow and intermediate
 fields from longer pre-2022 history and the historical research candidate tape.
-The current 2022 smoke backfill starts at 2022-01-04, so the exact HAR field is
-intentionally unavailable until enough pre-signal training history exists.  In
-that early window, the full-shadow VRP core falls back to GARCH/RV20, matching
-the research fallback order without introducing future data.
+The current warmup backfill starts at 2021-07-01.  If a still-earlier formal
+window is tested, HAR fields remain unavailable until enough pre-signal training
+history exists; in that early window, the full-shadow VRP core falls back to
+GARCH/RV20, matching the research fallback order without introducing future
+data.
 
 The updater now supports that initial prehistory backfill through
 `--prehistory-start-date`.  Warmup dates only fetch or reuse Toolkit snapshots;
@@ -277,9 +299,49 @@ the first formal signal date then rebuilds contract-shadow history once from all
 stored snapshots.  This keeps the HAR/VRP warmup auditable without creating
 formal daily order-generation partitions for prehistory dates.
 
-The remaining gate gap is no longer the candidate tape.  It is concentrated in
-30 product-side dates near the Q3/Q3 historical label thresholds, mainly in
-`AL P`, `TA P`, `ZC C`, and `ZN C`.  The next action is to keep tightening the
-label path: compare the locked contract-level `v3_retention_10d`,
-`v3_stop_touch_10d`, and `v3_product_stop_cluster_with_portfolio` inputs against
-the rolling labels for those product-side dates.
+The remaining gate gap is no longer the candidate tape.  The March 2022 gate
+gap is down to two `ZN C` rows near the Q3/Q3 boundary.  The next action is to
+run an order-level dry run with the rolling panel and check whether the residual
+bucket and sizing differences survive the premium, margin, and ledger caps.
+
+Latest March 2022 comparison:
+
+```text
+locked_rows=1144 rolling_rows=1144 overlap_rows=1144
+diff_rows=121
+issues={'bucket_mismatch': 119, 'l1_gate_mismatch': 2}
+gate_match_rate=0.9982517482517482
+```
+
+The 119 bucket mismatches are not a reason to reject the rolling chain, but they
+are also not ignorable.  Their direct L1 impact in the March window is:
+
+```text
+l1_pass_gate_mismatch: 0 / 119
+l1_sort_bucket_mismatch: 81 / 119
+l1_budget_mult_mismatch: 28 / 119
+l1_side_final_budget_pct_mismatch: 28 / 119
+l3_refill_allowed_mismatch: 7 / 119
+```
+
+So the remaining bucket differences do not change Q3/Q3 admission, but some do
+change Layer-2/Layer-3 sizing.  Before replacing the locked panel in order
+generation, the order-level dry run must confirm whether those sizing changes
+alter final orders under the premium and margin caps.
+
+## Locked Panel Lookahead Risk
+
+`server_deploy/scripts/research/build_s1_product_scoring_panel.py` is marked
+research-only and keeps forward `label_*` fields.  Its `add_hist_features`
+function shifts those labels by one row before rolling them into
+`hist_*` fields, but it does not require the 10-day path label or expiry label
+to be observable as of the signal date.  The locked product-side panel used by
+the current mainline also lacks `label_lag_days` and `expiry_label_lag_days`
+audit columns.
+
+This means the locked product-side panel should be treated as a research parity
+target with lookahead risk, not as a final point-in-time production data source.
+Historical performance that depended on those product-side buckets may be
+optimistic.  The correct validation path is to rerun the S1 backtest/order
+comparison with the point-in-time rolling panel and then compare NAV, orders,
+admission, budgets, and constraints against the locked result.

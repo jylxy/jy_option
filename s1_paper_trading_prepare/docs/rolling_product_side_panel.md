@@ -41,18 +41,23 @@ python .\s1_paper_trading_prepare\scripts\update_daily_data.py `
 
 The first formal signal date then rebuilds contract-shadow history once from all
 stored warmup and signal snapshots.  Later daily updates can omit
-`--rebuild-contract-history` and only append the new date.
+`--rebuild-contract-history` and only append the new date.  Passing
+`--prehistory-start-date` by itself no longer forces a full replay; historical
+contract-shadow rebuilds require the explicit `--rebuild-contract-history`
+flag.
 
 Latest h200 warmup check:
 
 ```text
 signal_date: 2022-04-01
 prehistory_start_date: 2021-07-01
-prehistory_dates: 218 stored snapshot dates
+prehistory_dates: 217 stored snapshot dates
 rolling_panel_rows: 9172
 contract_shadow_observation_rows: 1015827
 full_shadow_max_dte: 120
-March 2022 rolling-vs-locked gate_match_rate: 97.38%
+March 2022 rolling-vs-locked gate_match_rate: 99.83%
+full warmup rebuild runtime: 213.75s on h200
+daily no-rebuild runtime with prehistory argument: 13.97s on h200
 ```
 
 ## Loader Contract
@@ -87,6 +92,13 @@ The rolling label refresh uses the research convention for matured rows:
 - `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured over the contract's valid daily observations after that T+1 entry date.
 - contracts that are signal-eligible but not T+1 entry-feasible remain in the label aggregation with path labels as missing; this preserves the research product stop-cluster convention where all-missing stop rates map to a zero stop flag.
 - expiry retention uses a product-level expiry spot map with a 10-calendar-day backward asof tolerance, matching the report-slim full-shadow convention where available; labels whose expiry outcome is not yet observable remain missing.
+
+The locked research panel is still treated as a parity target, not as a
+point-in-time data source for paper trading.  Its generation script keeps
+forward `label_*` fields for research and computes shifted historical features
+from those labels.  The rolling panel therefore remains the safer live path:
+labels become usable only when the required future observations are actually
+stored.
 
 Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
 forecasts use the original research embargo: a signal date can train only on

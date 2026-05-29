@@ -1739,6 +1739,39 @@ def _mature_observation_labels(
     date_pos = {date: idx for idx, date in enumerate(available_dates)}
     max_date = max(available_dates)
     stop_multiple = float(config.get("premium_stop_multiple", 2.5) or 2.5)
+    contract_key_cache: dict[str, pd.DataFrame] = {}
+    product_spot_map: pd.DataFrame | None = None
+
+    def load_contract_key(date: str) -> pd.DataFrame:
+        key = str(date)[:10]
+        if key not in contract_key_cache:
+            contract_key_cache[key] = _contract_key_frame(_load_snapshot_cached(data_dir, key, snapshot_cache))
+        return contract_key_cache[key]
+
+    def get_product_spot_map() -> pd.DataFrame:
+        nonlocal product_spot_map
+        if product_spot_map is None:
+            parts = []
+            for spot_date in available_dates:
+                part = load_contract_key(spot_date)
+                if part.empty or not {"product", "spot_close"}.issubset(part.columns):
+                    continue
+                spot_part = part[["product", "spot_close"]].copy()
+                spot_part["trade_date"] = spot_date
+                parts.append(spot_part)
+            if parts:
+                spot_map = pd.concat(parts, ignore_index=True, sort=False)
+                spot_map["trade_date"] = pd.to_datetime(spot_map["trade_date"], errors="coerce")
+                spot_map["spot_close"] = pd.to_numeric(spot_map["spot_close"], errors="coerce")
+                product_spot_map = (
+                    spot_map.dropna(subset=["product", "trade_date", "spot_close"])
+                    .groupby(["product", "trade_date"], as_index=False)
+                    .agg(expiry_spot=("spot_close", "median"))
+                    .sort_values(["product", "trade_date"], kind="mergesort")
+                )
+            else:
+                product_spot_map = pd.DataFrame(columns=["product", "trade_date", "expiry_spot"])
+        return product_spot_map
 
     for obs_date in sorted(out["date"].dropna().astype(str).unique()):
         if obs_date not in date_pos:
@@ -1757,6 +1790,8 @@ def _mature_observation_labels(
         entry_snapshot = _load_snapshot_cached(data_dir, entry_date, snapshot_cache)
         if signal_snapshot.empty or entry_snapshot.empty:
             continue
+        if entry_date not in contract_key_cache:
+            contract_key_cache[entry_date] = _contract_key_frame(entry_snapshot)
         entry = signal_snapshot.copy()
         entry["product"] = _safe_text(entry, "product").str.upper().str.strip()
         entry["option_type"] = _safe_text(entry, "option_type").str.upper().str[:1]
@@ -1775,7 +1810,7 @@ def _mature_observation_labels(
         else:
             entry["expiry_date"] = ""
         entry["_entry_multiplier"] = _safe_numeric(entry, "multiplier").fillna(1.0) if "multiplier" in entry.columns else 1.0
-        entry_quotes = _contract_key_frame(entry_snapshot)
+        entry_quotes = load_contract_key(entry_date).copy()
         if entry_quotes.empty:
             continue
         entry_quotes["_entry_price"] = _safe_numeric(entry_quotes, "vwap").where(
@@ -1812,7 +1847,7 @@ def _mature_observation_labels(
             path_counts = pd.Series(0, index=entry_codes, dtype=int)
             path_complete = pd.Series(False, index=entry_codes, dtype=bool)
             for future_date in available_dates[entry_idx + 1:]:
-                part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
+                part = load_contract_key(future_date)
                 if not part.empty:
                     part = part[part["option_code"].isin(entry_codes)].copy()
                 if not part.empty:
@@ -1866,28 +1901,15 @@ def _mature_observation_labels(
             ]
         )
         if not expiry_candidates.empty:
-            max_needed_expiry = expiry_candidates["expiry_date"].max()
-            expiry_dates = [
-                future_date
-                for future_date in available_dates[start_idx:]
-                if future_date <= max_needed_expiry and future_date <= max_date
-            ]
-            expiry_parts = []
-            for future_date in expiry_dates:
-                part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
-                if not part.empty and {"product", "spot_close"}.issubset(part.columns):
-                    part["trade_date"] = future_date
-                    expiry_parts.append(part[["trade_date", "product", "spot_close"]])
-            if expiry_parts:
-                spot_map = pd.concat(expiry_parts, ignore_index=True, sort=False)
-                spot_map["trade_date"] = pd.to_datetime(spot_map["trade_date"], errors="coerce")
-                spot_map["spot_close"] = pd.to_numeric(spot_map["spot_close"], errors="coerce")
-                spot_map = (
-                    spot_map.dropna(subset=["product", "trade_date", "spot_close"])
-                    .groupby(["product", "trade_date"], as_index=False)
-                    .agg(expiry_spot=("spot_close", "median"))
-                    .sort_values(["product", "trade_date"], kind="mergesort")
-                )
+            max_needed_expiry = pd.to_datetime(expiry_candidates["expiry_date"], errors="coerce").max()
+            spot_map_all = get_product_spot_map()
+            if pd.notna(max_needed_expiry) and not spot_map_all.empty:
+                start_ts = pd.Timestamp(available_dates[start_idx])
+                max_ts = pd.Timestamp(max_date)
+                end_ts = min(pd.Timestamp(max_needed_expiry), max_ts)
+                spot_map = spot_map_all[
+                    spot_map_all["trade_date"].between(start_ts, end_ts, inclusive="both")
+                ].copy()
                 label_parts = []
                 candidates = expiry_candidates.copy()
                 candidates["expiry_date"] = pd.to_datetime(candidates["expiry_date"], errors="coerce")

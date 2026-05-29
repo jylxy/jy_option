@@ -87,6 +87,15 @@ def _load_existing_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _read_csv_columns(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return list(pd.read_csv(path, nrows=0).columns)
+    except Exception:
+        return []
+
+
 def build_l0_contract_universe(option_snapshot: pd.DataFrame, config: dict[str, Any], signal_date: str) -> pd.DataFrame:
     """Build the daily S1 L0 contract-eligibility table from stored snapshot data."""
     front_cols = [
@@ -222,9 +231,14 @@ def _load_or_fetch_snapshot(
     product_chunk_size: int,
     force: bool,
     write_outputs: bool,
+    read_existing: bool = True,
 ) -> tuple[str, pd.DataFrame, Path]:
     snapshot_path = _snapshot_path_for_date(data_dir, signal_date, products)
     if snapshot_path.exists() and not force:
+        if not read_existing:
+            columns = set(_read_csv_columns(snapshot_path))
+            if "vwap" in columns:
+                return "reuse_existing_snapshot", pd.DataFrame(), snapshot_path
         existing = _load_existing_csv(snapshot_path)
         if _snapshot_needs_vwap(existing):
             existing_products = products
@@ -392,6 +406,7 @@ def update_daily_data(
             product_chunk_size=product_chunk_size,
             force=force,
             write_outputs=write_outputs,
+            read_existing=False,
         )
         if action == "fetch_from_toolkit":
             prehistory_fetched_dates.append(date)
@@ -422,7 +437,7 @@ def update_daily_data(
 
         l0_universe = build_l0_contract_universe(option_snapshot, snapshot.config, date)
         l1_admission = audit_l1_admission_from_panel(date, snapshot.config, locked_l1_panel)
-        rebuild_rolling_history = bool(index == 0 and (rebuild_contract_history or prehistory_dates))
+        rebuild_rolling_history = bool(index == 0 and rebuild_contract_history)
         rolling_result = update_rolling_product_side_panel(
             date,
             l0_universe=l0_universe,
@@ -438,10 +453,10 @@ def update_daily_data(
             "incremental_action": action,
             "rolling_rebuild_history_for_date": rebuild_rolling_history,
             "rolling_rebuild_policy": (
-                "For a multi-date update window, rebuild the stored contract-shadow "
-                "history only on the first formal date, then append later dates "
-                "incrementally. This avoids replaying the full historical table once "
-                "per signal date."
+                "Rebuild the stored contract-shadow history only when "
+                "--rebuild-contract-history is explicit. For a multi-date update "
+                "window, that rebuild runs on the first formal date, then later "
+                "dates append incrementally."
             ),
             "prehistory_action_summary": {
                 "dates": prehistory_dates,

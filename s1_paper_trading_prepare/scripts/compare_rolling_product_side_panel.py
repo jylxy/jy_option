@@ -77,6 +77,128 @@ def _match_rate(left: pd.Series, right: pd.Series) -> float | None:
     return float(left[valid].eq(right[valid]).mean())
 
 
+def _rank_high(series: pd.Series) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if values.notna().sum() <= 1:
+        return pd.Series(0.5, index=values.index)
+    return values.rank(pct=True).fillna(0.5).clip(0.0, 1.0)
+
+
+def _flatten_l1_overlay(overlay: dict[str, Any] | None) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if not overlay:
+        return pd.DataFrame()
+    for product, sides in (overlay.get("side_meta_map") or {}).items():
+        for side, meta in (sides or {}).items():
+            item = {
+                "product": str(product).upper().strip(),
+                "side": str(side).upper().strip()[:1],
+            }
+            for col in (
+                "l1_pass_gate",
+                "l1_hist_bucket",
+                "l1_tail_bucket",
+                "l1_sort_score",
+                "l1_sort_rank",
+                "l1_sort_bucket",
+                "l1_budget_mult",
+                "l1_side_final_budget_pct",
+                "l3_refill_allowed",
+            ):
+                item[col] = meta.get(col, np.nan)
+            rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def _budget_impact_rows(
+    *,
+    locked_path: Path,
+    rolling_path: Path,
+    locked: pd.DataFrame,
+    rolling: pd.DataFrame,
+    diff: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    if diff.empty:
+        return pd.DataFrame()
+    try:
+        from s1_experimental_scoring import l1_product_side_gate_budget_overlay
+    except Exception as exc:
+        return pd.DataFrame([{"budget_impact_error": repr(exc)}])
+
+    locked = ensure_l1_loader_columns(locked)
+    rolling = ensure_l1_loader_columns(rolling)
+    key_cols = ["date", "product", "side"]
+    outputs: list[pd.DataFrame] = []
+    total_budget = float(config.get("portfolio_entry_premium_cap", 0.025) or 0.025)
+
+    for date in sorted(diff["date"].dropna().astype(str).str[:10].unique()):
+        locked_day = _filter_dates(locked, date, date)
+        rolling_day = _filter_dates(rolling, date, date)
+        grid = (
+            pd.concat(
+                [
+                    locked_day[["product", "option_type"]],
+                    rolling_day[["product", "option_type"]],
+                ],
+                ignore_index=True,
+                sort=False,
+            )
+            .dropna(subset=["product", "option_type"])
+            .drop_duplicates()
+        )
+        if grid.empty:
+            continue
+        grid["product"] = grid["product"].astype(str).str.upper().str.strip()
+        grid["option_type"] = grid["option_type"].astype(str).str.upper().str[:1]
+        products = sorted(grid["product"].dropna().astype(str).str.upper().unique())
+        base_product_budget_map = {product: total_budget / max(len(products), 1) for product in products}
+        locked_overlay = l1_product_side_gate_budget_overlay(
+            grid,
+            base_product_budget_map,
+            total_budget,
+            date,
+            1.0,
+            config={**config, "s1_l1_product_side_panel_path": str(locked_path)},
+            rank_high=_rank_high,
+        )
+        rolling_overlay = l1_product_side_gate_budget_overlay(
+            grid,
+            base_product_budget_map,
+            total_budget,
+            date,
+            1.0,
+            config={**config, "s1_l1_product_side_panel_path": str(rolling_path)},
+            rank_high=_rank_high,
+        )
+        locked_flat = _flatten_l1_overlay(locked_overlay).add_suffix("_locked")
+        rolling_flat = _flatten_l1_overlay(rolling_overlay).add_suffix("_rolling")
+        if locked_flat.empty and rolling_flat.empty:
+            continue
+        locked_flat = locked_flat.rename(columns={"product_locked": "product", "side_locked": "side"})
+        rolling_flat = rolling_flat.rename(columns={"product_rolling": "product", "side_rolling": "side"})
+        merged = locked_flat.merge(rolling_flat, how="outer", on=["product", "side"])
+        merged["date"] = date
+        outputs.append(merged)
+
+    if not outputs:
+        return pd.DataFrame()
+    impact = pd.concat(outputs, ignore_index=True, sort=False)
+    diff_keys = diff.loc[:, [col for col in key_cols + ["issue"] if col in diff.columns]].copy()
+    impact = diff_keys.merge(impact, on=key_cols, how="left")
+    for col in (
+        "l1_pass_gate",
+        "l1_sort_bucket",
+        "l1_budget_mult",
+        "l1_side_final_budget_pct",
+        "l3_refill_allowed",
+    ):
+        left = pd.to_numeric(impact.get(f"{col}_locked"), errors="coerce").round(12)
+        right = pd.to_numeric(impact.get(f"{col}_rolling"), errors="coerce").round(12)
+        impact[f"{col}_mismatch"] = left.ne(right)
+    return impact
+
+
 def _build_issue_rows(merged: pd.DataFrame, min_hist_bucket: float, min_tail_bucket: float) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     key_cols = ["date", "product", "side"]
@@ -227,7 +349,42 @@ def main() -> int:
     output_dir = resolve_path(args.output_dir)
     diff_path = output_dir / f"diff_{tag}.csv"
     summary_path = output_dir / f"summary_{tag}.json"
+    budget_impact_path = output_dir / f"budget_impact_{tag}.csv"
+    budget_impact = _budget_impact_rows(
+        locked_path=locked_path,
+        rolling_path=rolling_path,
+        locked=locked,
+        rolling=rolling,
+        diff=diff,
+        config=snapshot.config,
+    )
+    if not budget_impact.empty:
+        issue_mask = budget_impact["issue"].eq("bucket_mismatch") if "issue" in budget_impact.columns else pd.Series(False, index=budget_impact.index)
+        summary["bucket_budget_impact"] = {
+            "rows": int(issue_mask.sum()),
+            "l1_sort_bucket_mismatch": int(budget_impact.loc[issue_mask, "l1_sort_bucket_mismatch"].sum())
+            if "l1_sort_bucket_mismatch" in budget_impact.columns
+            else 0,
+            "l1_budget_mult_mismatch": int(budget_impact.loc[issue_mask, "l1_budget_mult_mismatch"].sum())
+            if "l1_budget_mult_mismatch" in budget_impact.columns
+            else 0,
+            "l1_side_final_budget_pct_mismatch": int(
+                budget_impact.loc[issue_mask, "l1_side_final_budget_pct_mismatch"].sum()
+            )
+            if "l1_side_final_budget_pct_mismatch" in budget_impact.columns
+            else 0,
+            "l3_refill_allowed_mismatch": int(budget_impact.loc[issue_mask, "l3_refill_allowed_mismatch"].sum())
+            if "l3_refill_allowed_mismatch" in budget_impact.columns
+            else 0,
+            "l1_pass_gate_mismatch": int(budget_impact.loc[issue_mask, "l1_pass_gate_mismatch"].sum())
+            if "l1_pass_gate_mismatch" in budget_impact.columns
+            else 0,
+            "path": str(budget_impact_path),
+        }
+    else:
+        summary["bucket_budget_impact"] = {"rows": 0, "path": str(budget_impact_path)}
     write_csv(diff_path, diff)
+    write_csv(budget_impact_path, budget_impact)
     write_json(
         summary_path,
         {
@@ -243,8 +400,10 @@ def main() -> int:
     print(f"locked_rows={summary['locked_rows']} rolling_rows={summary['rolling_rows']} overlap_rows={summary['overlap_rows']}")
     print(f"rolling_gate_ready_rows={summary['rolling_gate_ready_rows']}")
     print(f"diff_rows={summary['diff_rows']} issues={summary['issues']}")
+    print(f"bucket_budget_impact={summary['bucket_budget_impact']}")
     print(f"gate_match_rate={summary['l1_gate_match_rate']}")
     print(f"diff_path={diff_path}")
+    print(f"budget_impact_path={budget_impact_path}")
     print(f"summary_path={summary_path}")
     return 1 if args.fail_on_diff and summary["diff_rows"] else 0
 
