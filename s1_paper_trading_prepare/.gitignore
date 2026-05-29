@@ -6,6 +6,7 @@ data/daily_snapshots/*
 data/derived/*
 data/product_side_panel/*
 data/manifests/*
+state/*
 logs/
 
 # Keep output directory anchors
@@ -16,6 +17,7 @@ logs/
 !data/derived/.gitkeep
 !data/product_side_panel/.gitkeep
 !data/manifests/.gitkeep
+!state/.gitkeep
 
 # Large or sensitive data
 *.db

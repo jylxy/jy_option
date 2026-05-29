@@ -75,6 +75,19 @@ Run the default one-day smoke:
 python s1_paper_trading_prepare/scripts/smoke_one_day.py
 ```
 
+Validate paper-account state files:
+
+```powershell
+python s1_paper_trading_prepare/scripts/init_account_state.py --as-of-date 2026-05-29 --nav 50000000
+python s1_paper_trading_prepare/scripts/validate_account_state.py --as-of-date 2026-05-29 --require-files
+```
+
+Run the daily preparation pipeline:
+
+```powershell
+python s1_paper_trading_prepare/scripts/run_daily_paper_pipeline.py --signal-date 2026-05-29 --require-account-state
+```
+
 Compare generated pending orders with the locked historical backtest output:
 
 ```powershell
@@ -99,4 +112,6 @@ only because the historical engine imports those modules at load time. See:
 
 ```text
 docs/s1_only_scope_and_daily_data.md
+docs/paper_account_state_contract.md
+docs/daily_runbook.md
 ```

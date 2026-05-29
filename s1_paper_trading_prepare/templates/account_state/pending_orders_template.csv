@@ -1,0 +1,2 @@
+signal_date,execute_date,strategy,product,code,option_type,strike,expiry,action,quantity,limit_price,status,remaining_quantity,source_order_id,note
+2026-05-29,2026-06-01,S1,,,,,,open_sell,0,0,pending_manual_review,0,,

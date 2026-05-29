@@ -1,0 +1,2 @@
+trade_date,strategy,product,code,option_type,strike,expiry,action,filled_quantity,fill_price,fee,order_id,fill_id,source,note
+2026-05-29,S1,,,,,,open_sell,0,0,0,,,manual,

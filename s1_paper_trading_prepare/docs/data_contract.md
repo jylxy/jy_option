@@ -17,7 +17,7 @@ day before generating orders.
 | Spot/underlying daily features | Toolkit daily aggregation/enrichment | included in the daily snapshot |
 | Trading calendar | Toolkit calendar loader | manifest |
 | L1 product-side admission | locked mainline panel snapshot for parity | `data/product_side_panel/l1_admission_YYYYMMDD.csv` |
-| NAV, positions, pending/unfilled orders | paper account state, later phase | not implemented in phase 1 |
+| NAV, positions, pending/unfilled orders | paper account state | `state/` runtime files, see `docs/paper_account_state_contract.md` |
 | Fees, margin, taxonomy | S1 config and server-deploy S1 helpers | audit manifest |
 
 ## Daily outputs
@@ -30,6 +30,8 @@ day before generating orders.
 | `output/audit/diff_orders_*.csv` | parity diff against locked historical backtest orders |
 | `data/manifests/daily_data_update_*.json` | daily input refresh manifest |
 | `data/manifests/data_store_index.json` | partition index and row-count ledger |
+| `output/audit/account_state_validation_*.json` | paper-account state validation manifest |
+| `output/audit/daily_pipeline_*.json` | daily end-to-end run manifest |
 
 Each daily manifest includes `s1_table_dependency_status`, which records the
 effective-config status of the active S1 research table and the inactive
