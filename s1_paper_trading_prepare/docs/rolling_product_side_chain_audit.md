@@ -91,6 +91,20 @@ hit the stop threshold, then the product-side label receives the same-day count
 of other stopped products. This label is persisted only after the horizon is
 matured, and it enters signals only through a one-row-shifted rolling history.
 
+The upstream full-shadow fields are now replayed before aggregation:
+
+- side surface and skew from the contract tape;
+- underlying RV, fixed-parameter GARCH, HAR, trend, gap, and jump fields;
+- VRP core, rolling product-side VRP percentile, side IV percentile, and IV/VRP
+  weights;
+- term structure, tail-correlation state, disaster score, and risk-dulling /
+  risk-fomenting flags;
+- B6 proxy ranks, base B6 score, VRP quality score, and B6+V3 score.
+
+These are written to `contract_shadow/contract_shadow_fields_YYYYMMDD.csv` for
+daily audit, while `rolling_contract_shadow_observations.csv` keeps the
+incremental contract-level history used to recompute rolling fields.
+
 ## Current Parity
 
 | Window | Key overlap | Gate-ready rows | Gate match |
@@ -98,6 +112,16 @@ matured, and it enters signals only through a one-row-shifted rolling history.
 | 2022-02-23 | 48 / 48 | 48 | 91.7% |
 | 2022-02-23..2022-03-18 | 894 / 894 | 894 | 90.5% |
 | 2022-03-01..2022-03-31 | 1144 / 1144 | 1144 | 91.1% |
+
+After replaying the exact full-shadow fields from the available 2022 snapshots,
+the 2022-03-01..2022-03-31 window remains close at about 90.5% gate match:
+
+```text
+locked_rows=1144 rolling_rows=1144 overlap_rows=1144
+diff_rows=596
+issues={'bucket_mismatch': 487, 'l1_gate_mismatch': 109}
+gate_match_rate=0.9047202797202797
+```
 
 The March mature-window comparison improved from about 74.5% gate match to
 about 91.1% after replacing the proxy tail feature with the product
@@ -114,13 +138,12 @@ underlying_code, spot_close, moneyness, implied_vol, delta, gamma, vega, theta
 ```
 
 The locked research table also inherits richer full-shadow and intermediate
-fields that are not yet present in the paper datamart, including exact B6 ranks,
-exact VRP quality, richer regime and path fields, exact HAR/GARCH/RV inputs, and
-the historical research candidate tape. The remaining mismatch is therefore not
-from the rolling update mechanism itself; it comes from fields that still need a
-clean point-in-time live equivalent before the rolling panel can be promoted into
-order generation.
+fields from longer pre-2022 history and the historical research candidate tape.
+The current 2022 smoke backfill starts at 2022-01-04, so the exact HAR field is
+intentionally unavailable until enough pre-signal training history exists.  In
+that early window, the full-shadow VRP core falls back to GARCH/RV20, matching
+the research fallback order without introducing future data.
 
-Next action is to backfill or recompute those missing source fields from
-Toolkit-accessible history, then rerun the same parity checks before switching
-order generation away from the locked mainline panel.
+Next action is to add an initial prehistory backfill for the contract-shadow
+datamart, then rerun the same parity checks before switching order generation
+away from the locked mainline panel.

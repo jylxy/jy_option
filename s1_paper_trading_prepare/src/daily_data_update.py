@@ -345,6 +345,20 @@ def update_daily_data(
                     ),
                 },
                 {
+                    "name": "s1_rolling_contract_shadow_observations",
+                    "path": str(rolling_result.contract_observation_path)
+                    if rolling_result.contract_observation_path else None,
+                    "source": "computed from stored S1 daily snapshots",
+                    "rows": int(rolling_result.contract_observation_rows),
+                },
+                {
+                    "name": "s1_rolling_contract_shadow_fields",
+                    "path": str(rolling_result.contract_fields_path)
+                    if rolling_result.contract_fields_path else None,
+                    "source": "full-shadow V3/B6/VRP/regime fields recomputed from Toolkit snapshots",
+                    "rows": int(rolling_result.contract_fields_rows),
+                },
+                {
                     "name": "s1_rolling_product_side_panel",
                     "path": str(rolling_result.panel_path) if rolling_result.panel_path else None,
                     "source": "computed from stored S1 daily snapshots",

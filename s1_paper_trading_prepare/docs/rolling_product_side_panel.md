@@ -8,10 +8,16 @@ The rolling panel is the daily-updated replacement candidate for `s1_l1_product_
 
 The daily updater writes:
 
+- `data/product_side_panel/rolling_contract_shadow_observations.csv`
+- `data/product_side_panel/contract_shadow/contract_shadow_fields_YYYYMMDD.csv`
 - `data/product_side_panel/rolling_product_side_observations.csv`
 - `data/product_side_panel/rolling_product_side_panel.csv`
 - `data/product_side_panel/rolling_l1_admission_YYYYMMDD.csv`
 - `data/manifests/rolling_product_side_update_YYYYMMDD.json`
+
+The contract-shadow files are the audit layer for full-shadow V3/B6/VRP/regime
+fields.  They are computed only from stored Toolkit daily snapshots and prior
+snapshot history, then aggregated into the product-side panel.
 
 ## Loader Contract
 
@@ -35,6 +41,10 @@ The source aggregation keeps `option_type`; `side` is the loader-compatible alia
 ## No-Future Rule
 
 Outcome labels are updated only after enough stored future snapshots exist for the configured horizon.  Signal-day features use shifted rolling windows, so the current row's outcome is not included in its own score or bucket.
+
+Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
+forecasts use the original research embargo: a signal date can train only on
+targets whose forward horizon has already ended before that signal date.
 
 The manifest separates two states:
 
