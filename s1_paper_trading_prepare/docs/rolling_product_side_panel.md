@@ -58,6 +58,8 @@ full_shadow_max_dte: 120
 March 2022 rolling-vs-locked gate_match_rate: 99.83%
 full warmup rebuild runtime: 213.75s on h200
 daily no-rebuild runtime with prehistory argument: 13.97s on h200
+March 2022 research-parity check after future snapshots and maturity fix:
+  bucket_mismatch=28, l1_gate_mismatch=0
 ```
 
 ## Loader Contract
@@ -92,6 +94,10 @@ The rolling label refresh uses the research convention for matured rows:
 - `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured over the contract's valid daily observations after that T+1 entry date.
 - contracts that are signal-eligible but not T+1 entry-feasible remain in the label aggregation with path labels as missing; this preserves the research product stop-cluster convention where all-missing stop rates map to a zero stop flag.
 - expiry retention uses a product-level expiry spot map with a 10-calendar-day backward asof tolerance, matching the report-slim full-shadow convention where available; labels whose expiry outcome is not yet observable remain missing.
+- product-level expiry spot follows the report-slim convention of taking the
+  first full-shadow candidate-tape spot for each product/date; this is retained
+  for backtest parity, even though it is less economically clean than a
+  contract-underlying settlement lookup.
 
 The locked research panel is still treated as a parity target, not as a
 point-in-time data source for paper trading.  Its generation script keeps

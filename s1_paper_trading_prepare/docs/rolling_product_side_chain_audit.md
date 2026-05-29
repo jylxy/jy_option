@@ -44,6 +44,10 @@ The current implementation fixes those costs:
 - Matured-label refresh now caches contract-key snapshots and builds the
   product-level expiry spot map once per run instead of once per observation
   date.
+- Outcome maturity is label-aware: 5-day stop-cluster labels, 10-day path
+  labels, and expiry labels are only written once their required future
+  observations are stored.  Not-yet-observable labels stay missing instead of
+  being written as zero.
 - Existing snapshots without `vwap` are enriched by fetching only the missing
   Toolkit VWAP partition for that date.
 
@@ -97,6 +101,9 @@ A daily no-rebuild run for `2022-04-01` completed in 12.84s.  The same command
 with `--prehistory-start-date 2021-07-01` but without
 `--rebuild-contract-history` completed in 13.97s and recorded
 `rolling_rebuild_history_for_date=false`.
+
+After adding 2022-04-07..2022-06-30 research-parity snapshots, the same
+no-rebuild daily refresh completed in 17.52s.
 
 The scoring-chain port is heavier than the earlier proxy because it replays the
 5-day and 10-day outcome label refresh and product stop-cluster aggregation.
@@ -308,26 +315,37 @@ Latest March 2022 comparison:
 
 ```text
 locked_rows=1144 rolling_rows=1144 overlap_rows=1144
-diff_rows=121
-issues={'bucket_mismatch': 119, 'l1_gate_mismatch': 2}
-gate_match_rate=0.9982517482517482
+diff_rows=28
+issues={'bucket_mismatch': 28}
+gate_match_rate=1.0
 ```
 
-The 119 bucket mismatches are not a reason to reject the rolling chain, but they
-are also not ignorable.  Their direct L1 impact in the March window is:
+The remaining 28 bucket mismatches are not a reason to reject the rolling chain,
+but they are also not ignorable.  Their direct L1 impact in the March window is:
 
 ```text
-l1_pass_gate_mismatch: 0 / 119
-l1_sort_bucket_mismatch: 81 / 119
-l1_budget_mult_mismatch: 28 / 119
-l1_side_final_budget_pct_mismatch: 28 / 119
-l3_refill_allowed_mismatch: 7 / 119
+l1_pass_gate_mismatch: 0 / 28
+l1_sort_bucket_mismatch: 13 / 28
+l1_budget_mult_mismatch: 6 / 28
+l1_side_final_budget_pct_mismatch: 6 / 28
+l3_refill_allowed_mismatch: 2 / 28
 ```
 
-So the remaining bucket differences do not change Q3/Q3 admission, but some do
-change Layer-2/Layer-3 sizing.  Before replacing the locked panel in order
-generation, the order-level dry run must confirm whether those sizing changes
-alter final orders under the premium and margin caps.
+So the remaining bucket differences do not change Q3/Q3 admission, but a few do
+change Layer-2/Layer-3 sizing.  The residual is concentrated in
+`historical_retention_score_bucket5_date`; tail-cluster safety now matches in
+the March window.  The residual historical score gap is very small
+(`mean_abs ~= 0.00465`) and mostly comes from the locked report-slim expiry spot
+selection, which is product/date first-row based rather than a clean
+contract-underlying settlement lookup.
+
+Two comparisons should be kept separate:
+
+- Live point-in-time mode: do not fetch or use future labels.  Recent
+  5-day/10-day/expiry labels remain missing until observable.
+- Research parity mode: future snapshots can be present so March 2022 labels
+  can be recomputed and compared against the locked research panel.  This mode
+  is useful for formula debugging, not for live paper trading.
 
 ## Locked Panel Lookahead Risk
 
