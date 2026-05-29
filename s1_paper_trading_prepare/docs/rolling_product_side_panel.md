@@ -15,6 +15,12 @@ The daily updater writes:
 - `data/product_side_panel/rolling_l1_admission_YYYYMMDD.csv`
 - `data/manifests/rolling_product_side_update_YYYYMMDD.json`
 
+Stored daily snapshots include the Toolkit minute-aggregated option `vwap`
+column.  Existing snapshots that were written before this field existed are
+enriched in place by fetching only the missing VWAP partition for that date.
+Signal and label prices prefer `vwap`, with `option_close` used only as a
+fallback when VWAP is unavailable.
+
 The contract-shadow files are the audit layer for full-shadow V3/B6/VRP/regime
 fields.  They are computed only from stored Toolkit daily snapshots and prior
 snapshot history, then aggregated into the product-side panel.
@@ -75,6 +81,8 @@ Outcome labels are updated only after enough stored future snapshots exist for t
 The rolling label refresh uses the research convention for matured rows:
 
 - `entry_price` is taken from the next stored trading snapshot, matching the T+1 research-entry convention.
+- the T+1 entry price uses Toolkit daily VWAP when available, matching the
+  locked full-shadow research tape; close is only a missing-data fallback.
 - `retention_10d = 1 - exit_price / entry_price`, with the exit window beginning after that T+1 entry date.
 - `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured after that T+1 entry date.
 - expiry retention is written only after expiry can be observed from stored snapshots

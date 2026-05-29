@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 
 from .config_snapshot import important_rules, load_effective_config
-from .data_loader import load_signal_day_snapshot, load_trading_dates
+from .data_loader import enrich_snapshot_with_option_vwap, load_signal_day_snapshot, load_trading_dates
 from .diagnostics import write_csv, write_json
 from .paths import DEFAULT_DATA_DIR, DEFAULT_PAPER_CONFIG, resolve_path
 from .product_side_panel import audit_l1_admission_from_panel, load_panel
@@ -97,6 +97,7 @@ def build_l0_contract_universe(option_snapshot: pd.DataFrame, config: dict[str, 
         "strike",
         "expiry_date",
         "dte",
+        "vwap",
         "option_close",
         "volume",
         "open_interest",
@@ -123,7 +124,8 @@ def build_l0_contract_universe(option_snapshot: pd.DataFrame, config: dict[str, 
         source = work[name] if name in work.columns else pd.Series(index=work.index, dtype=float)
         return pd.to_numeric(source, errors="coerce")
 
-    price = numeric_col("option_close")
+    vwap = numeric_col("vwap")
+    price = vwap.where(vwap.gt(0), numeric_col("option_close"))
     volume = numeric_col("volume").fillna(0)
     oi = numeric_col("open_interest").fillna(0)
     dte = numeric_col("dte")
@@ -199,6 +201,18 @@ def _snapshot_path_for_date(
     return data_dir / "daily_snapshots" / f"option_chain_{_date_tag(signal_date, products)}.csv"
 
 
+def _snapshot_needs_vwap(snapshot: pd.DataFrame) -> bool:
+    if snapshot.empty or "option_code" not in snapshot.columns:
+        return False
+    if "vwap" not in snapshot.columns:
+        return True
+    vwap = pd.to_numeric(snapshot["vwap"], errors="coerce")
+    close_source = snapshot["option_close"] if "option_close" in snapshot.columns else pd.Series(index=snapshot.index, dtype=float)
+    close = pd.to_numeric(close_source, errors="coerce")
+    required = close.notna() & close.gt(0)
+    return bool(required.any() and vwap[required].isna().any())
+
+
 def _load_or_fetch_snapshot(
     signal_date: str,
     *,
@@ -211,7 +225,24 @@ def _load_or_fetch_snapshot(
 ) -> tuple[str, pd.DataFrame, Path]:
     snapshot_path = _snapshot_path_for_date(data_dir, signal_date, products)
     if snapshot_path.exists() and not force:
-        return "reuse_existing_snapshot", _load_existing_csv(snapshot_path), snapshot_path
+        existing = _load_existing_csv(snapshot_path)
+        if _snapshot_needs_vwap(existing):
+            existing_products = products
+            if existing_products is None and "product" in existing.columns:
+                existing_products = tuple(
+                    sorted({str(value).upper().strip() for value in existing["product"].dropna() if str(value).strip()})
+                )
+            existing = enrich_snapshot_with_option_vwap(
+                existing,
+                signal_date,
+                config_path,
+                products=existing_products,
+                product_chunk_size=product_chunk_size,
+            )
+            if write_outputs and not existing.empty:
+                write_csv(snapshot_path, existing)
+            return "reuse_existing_snapshot_attach_vwap", existing, snapshot_path
+        return "reuse_existing_snapshot", existing, snapshot_path
     option_snapshot = load_signal_day_snapshot(
         signal_date,
         config_path,
@@ -391,6 +422,7 @@ def update_daily_data(
 
         l0_universe = build_l0_contract_universe(option_snapshot, snapshot.config, date)
         l1_admission = audit_l1_admission_from_panel(date, snapshot.config, locked_l1_panel)
+        rebuild_rolling_history = bool(index == 0 and (rebuild_contract_history or prehistory_dates))
         rolling_result = update_rolling_product_side_panel(
             date,
             l0_universe=l0_universe,
@@ -398,12 +430,19 @@ def update_daily_data(
             data_dir=out_dir,
             write_outputs=write_outputs,
             snapshot_cache=rolling_snapshot_cache,
-            rebuild_contract_history=bool(rebuild_contract_history or (prehistory_dates and index == 0)),
+            rebuild_contract_history=rebuild_rolling_history,
         )
         manifest = {
             **base_meta,
             "signal_date": date,
             "incremental_action": action,
+            "rolling_rebuild_history_for_date": rebuild_rolling_history,
+            "rolling_rebuild_policy": (
+                "For a multi-date update window, rebuild the stored contract-shadow "
+                "history only on the first formal date, then append later dates "
+                "incrementally. This avoids replaying the full historical table once "
+                "per signal date."
+            ),
             "prehistory_action_summary": {
                 "dates": prehistory_dates,
                 "fetched_dates": prehistory_fetched_dates,

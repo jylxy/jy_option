@@ -43,7 +43,11 @@ def main() -> int:
     parser.add_argument(
         "--rebuild-contract-history",
         action="store_true",
-        help="Rebuild rolling contract-shadow history from stored snapshots before scoring.",
+        help=(
+            "Rebuild rolling contract-shadow history from stored snapshots before scoring. "
+            "For a date window this rebuild runs once on the first formal date, then later "
+            "dates append incrementally."
+        ),
     )
     args = parser.parse_args()
 

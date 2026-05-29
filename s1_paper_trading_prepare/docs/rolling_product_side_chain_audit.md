@@ -32,6 +32,14 @@ The current implementation fixes those costs:
 - Write each fetched snapshot once, using atomic CSV replacement.
 - Mature only newly eligible observation dates; keep a bounded snapshot cache for overlapping forward windows.
 - Default Toolkit product chunk size is now `32`, with `--product-chunk-size` still available for fallback.
+- For a multi-date update with `--rebuild-contract-history`, rebuild the
+  historical contract-shadow table only on the first formal date, then append
+  later dates incrementally.  This prevents one full replay per signal date.
+- If `contract_shadow_fields_YYYYMMDD.csv` already exists for a signal date,
+  same-day reruns reuse that audit partition and skip the large
+  contract-shadow recalculation.
+- Existing snapshots without `vwap` are enriched by fetching only the missing
+  Toolkit VWAP partition for that date.
 
 ## Measured Results
 
@@ -52,6 +60,23 @@ Single-date Toolkit fetch for `2022-04-06`:
 | 8 | 10989 | 19.18s |
 | 16 | 10989 | 13.07s |
 | 32 | 10989 | 10.60s |
+
+After adding VWAP enrichment, a one-time `2022-04-01` full rebuild from the
+2021-07 warmup table took:
+
+```text
+contract_shadow_observation_rows: 1,015,827
+rolling_panel_rows: 9,172
+elapsed: 7m20s
+```
+
+This is the full historical recalibration path.  A same-day rerun after the
+`contract_shadow_fields_20220401.csv` audit partition exists reused the cached
+contract fields and completed in:
+
+```text
+elapsed: 6.48s
+```
 
 The scoring-chain port is heavier than the earlier proxy because it replays the
 5-day and 10-day outcome label refresh and product stop-cluster aggregation.
@@ -122,6 +147,7 @@ incremental contract-level history used to recompute rolling fields.
 | 2022-03-01..2022-03-31 | 1144 / 1144 | 1144 | 91.1% |
 | 2022-03-01..2022-03-31, prehistory from 2021-09-01 | 1144 / 1144 | 1144 | 93.3% |
 | 2022-03-01..2022-03-31, DTE<=120 + T+1 labels + prehistory from 2021-07-01 | 1144 / 1144 | 1144 | 97.4% |
+| 2022-03-01..2022-03-31, plus Toolkit VWAP snapshot enrichment | 1144 / 1144 | 1144 | 96.6% |
 
 After replaying the full-shadow fields from the available 2022 snapshots,
 the 2022-03-01..2022-03-31 window initially remained close at about 90.5% gate match:
@@ -148,6 +174,21 @@ hist_bucket_match_rate=0.8347902097902098
 tail_bucket_match_rate=0.6101398601398601
 product_side_score_corr=0.853500548293816
 ```
+
+After enriching the stored snapshots with Toolkit VWAP and using VWAP for the
+signal/entry label price where available, the same window reported:
+
+```text
+locked_rows=1144 rolling_rows=1144 overlap_rows=1144
+rolling_gate_ready_rows=1144
+diff_rows=519
+issues={'bucket_mismatch': 480, 'l1_gate_mismatch': 39}
+gate_match_rate=0.9659090909090909
+```
+
+The VWAP change aligns the price source with the locked full-shadow tape, but it
+does not by itself eliminate the remaining label/bucket gap; the remaining
+audit still needs to isolate non-price label inputs.
 
 The locked enriched full-shadow source and the rolling candidate tape now match
 exactly on `2022-03-01`: `5307 / 5307` contract rows and `48 / 48`
@@ -181,6 +222,10 @@ trade_date, option_code, option_close, option_high, volume, open_interest,
 strike, option_type, expiry_date, product, exchange, multiplier, dte,
 underlying_code, spot_close, moneyness, implied_vol, delta, gamma, vega, theta
 ```
+
+New and enriched stored snapshots also carry `vwap`, computed from Toolkit
+minute bars as `sum(close * volume) / sum(volume)` with average close fallback
+when daily volume is zero.
 
 The locked research table also inherits richer full-shadow and intermediate
 fields from longer pre-2022 history and the historical research candidate tape.

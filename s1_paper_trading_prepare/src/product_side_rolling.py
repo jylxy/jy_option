@@ -146,6 +146,14 @@ def _csv_has_rows(path: Path) -> bool:
         return bool(handle.readline())
 
 
+def _csv_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("rb") as handle:
+        line_count = sum(1 for _ in handle)
+    return max(0, line_count - 1)
+
+
 def _upsert_by_key(existing: pd.DataFrame, new_rows: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     if existing.empty:
         return new_rows.copy()
@@ -162,6 +170,13 @@ def _safe_numeric(frame: pd.DataFrame, col: str) -> pd.Series:
     if col not in frame.columns:
         return pd.Series(index=frame.index, dtype=float)
     return pd.to_numeric(frame[col], errors="coerce")
+
+
+def _option_signal_price(frame: pd.DataFrame) -> pd.Series:
+    """Research shadow price: prefer Toolkit daily VWAP, then close fallback."""
+    close = _safe_numeric(frame, "option_close")
+    vwap = _safe_numeric(frame, "vwap")
+    return vwap.where(vwap.gt(0), close)
 
 
 def _safe_text(frame: pd.DataFrame, col: str) -> pd.Series:
@@ -365,7 +380,7 @@ def build_daily_contract_shadow_observations(
     out = out[out["option_type"].isin(["C", "P"])].copy()
     if out.empty:
         return out
-    full_shadow_price = _safe_numeric(out, "option_close")
+    full_shadow_price = _option_signal_price(out)
     full_shadow_dte = _safe_numeric(out, "dte")
     out = out[
         full_shadow_price.gt(0)
@@ -377,7 +392,7 @@ def build_daily_contract_shadow_observations(
     if "l0_basic_trade_eligible" in out.columns:
         eligible = out["l0_basic_trade_eligible"].astype(bool)
     else:
-        price = _safe_numeric(out, "option_close")
+        price = _option_signal_price(out)
         volume = _safe_numeric(out, "volume").fillna(0)
         oi = _safe_numeric(out, "open_interest").fillna(0)
         dte = _safe_numeric(out, "dte")
@@ -400,7 +415,7 @@ def build_daily_contract_shadow_observations(
     out["code"] = out["contract_code"]
     out["expiry"] = _safe_text(out, "expiry_date")
     out["expiry_date"] = _safe_text(out, "expiry_date").str[:10]
-    out["entry_price"] = _safe_numeric(out, "option_close")
+    out["entry_price"] = _option_signal_price(out)
     out["vwap"] = out["entry_price"]
     out["entry_volume"] = _safe_numeric(out, "volume").fillna(0.0)
     out["entry_open_interest"] = _safe_numeric(out, "open_interest").fillna(0.0)
@@ -1109,7 +1124,7 @@ def _normalize_l0_for_research_aggregate(
     out = out[out["side"].isin(["C", "P"])].copy()
     if out.empty:
         return out
-    full_shadow_price = _safe_numeric(out, "option_close")
+    full_shadow_price = _option_signal_price(out)
     full_shadow_dte = _safe_numeric(out, "dte")
     out = out[
         full_shadow_price.gt(0)
@@ -1123,7 +1138,7 @@ def _normalize_l0_for_research_aggregate(
     else:
         eligible = pd.Series(bool(eligible), index=out.index)
 
-    price = _safe_numeric(out, "option_close")
+    price = _option_signal_price(out)
     high = _safe_numeric(out, "option_high")
     volume = _safe_numeric(out, "volume").fillna(0.0)
     oi = _safe_numeric(out, "open_interest").fillna(0.0)
@@ -1747,7 +1762,7 @@ def _mature_observation_labels(
         entry["product"] = _safe_text(entry, "product").str.upper().str.strip()
         entry["option_type"] = _safe_text(entry, "option_type").str.upper().str[:1]
         entry["option_code"] = _safe_text(entry, "option_code")
-        signal_price = _safe_numeric(entry, "option_close")
+        signal_price = _option_signal_price(entry)
         signal_dte = _safe_numeric(entry, "dte")
         entry = entry[
             entry["option_type"].isin(["C", "P"])
@@ -2092,13 +2107,25 @@ def update_rolling_product_side_panel(
     admission_path = product_side_dir / f"{ROLLING_ADMISSION_PREFIX}_{_date_tag(date)}.csv"
     manifest_path = manifest_dir / f"{ROLLING_MANIFEST_PREFIX}_{_date_tag(date)}.json"
 
-    existing_contracts = _read_csv(contract_observation_path)
-    if (rebuild_contract_history or existing_contracts.empty) and (data_dir / "daily_snapshots").exists():
-        existing_contracts = _bootstrap_contract_shadow_observations(data_dir, config, date)
-    new_contracts = build_daily_contract_shadow_observations(l0_universe, config, date)
-    contract_observations = _upsert_by_key(existing_contracts, new_contracts, ["date", "contract_code"])
-    contract_fields = _add_full_shadow_contract_fields(contract_observations)
-    day_contract_fields = contract_fields[contract_fields["date"].astype(str).str[:10].eq(date)].copy()
+    reused_day_contract_fields = bool(
+        not rebuild_contract_history
+        and _csv_has_rows(contract_fields_path)
+        and _csv_has_rows(contract_observation_path)
+    )
+    if reused_day_contract_fields:
+        new_contracts = pd.DataFrame()
+        contract_observations = pd.DataFrame()
+        contract_observation_rows = _csv_row_count(contract_observation_path)
+        day_contract_fields = _read_csv(contract_fields_path)
+    else:
+        existing_contracts = _read_csv(contract_observation_path)
+        new_contracts = build_daily_contract_shadow_observations(l0_universe, config, date)
+        if (rebuild_contract_history or existing_contracts.empty) and (data_dir / "daily_snapshots").exists():
+            existing_contracts = _bootstrap_contract_shadow_observations(data_dir, config, date)
+        contract_observations = _upsert_by_key(existing_contracts, new_contracts, ["date", "contract_code"])
+        contract_observation_rows = int(len(contract_observations))
+        contract_fields = _add_full_shadow_contract_fields(contract_observations)
+        day_contract_fields = contract_fields[contract_fields["date"].astype(str).str[:10].eq(date)].copy()
 
     existing = _read_csv(observation_path)
     exact_required_cols = [
@@ -2126,8 +2153,9 @@ def update_rolling_product_side_panel(
     coverage = scoring_feature_coverage(panel, date)
 
     if write_outputs:
-        write_csv(contract_observation_path, contract_observations)
-        write_csv(contract_fields_path, day_contract_fields)
+        if not reused_day_contract_fields:
+            write_csv(contract_observation_path, contract_observations)
+            write_csv(contract_fields_path, day_contract_fields)
         write_csv(observation_path, observations)
         write_csv(panel_path, panel)
         write_csv(admission_path, admission)
@@ -2135,9 +2163,10 @@ def update_rolling_product_side_panel(
             manifest_path,
             {
                 "signal_date": date,
-                "contract_observation_rows": int(len(contract_observations)),
+                "contract_observation_rows": contract_observation_rows,
                 "new_contract_observation_rows": int(len(new_contracts)),
                 "contract_fields_rows": int(len(day_contract_fields)),
+                "reused_day_contract_fields": reused_day_contract_fields,
                 "rebuilt_contract_shadow_history": bool(rebuild_contract_history),
                 "observation_rows": int(len(observations)),
                 "new_observation_rows": int(len(new_observations)),
@@ -2172,7 +2201,7 @@ def update_rolling_product_side_panel(
         panel_rows=int(len(panel)),
         admission_rows=int(len(admission)),
         matured_observation_rows=matured_rows,
-        contract_observation_rows=int(len(contract_observations)),
+        contract_observation_rows=contract_observation_rows,
         contract_fields_rows=int(len(day_contract_fields)),
         contract_observation_path=contract_observation_path,
         contract_fields_path=contract_fields_path,
