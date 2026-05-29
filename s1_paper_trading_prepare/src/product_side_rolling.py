@@ -21,6 +21,20 @@ ROLLING_PANEL_FILE = "rolling_product_side_panel.csv"
 ROLLING_OBSERVATION_FILE = "rolling_product_side_observations.csv"
 ROLLING_ADMISSION_PREFIX = "rolling_l1_admission"
 ROLLING_MANIFEST_PREFIX = "rolling_product_side_update"
+L1_PANEL_REQUIRED_COLUMNS = [
+    "date",
+    "product",
+    "side",
+    "historical_retention_score",
+    "historical_retention_score_rank_date",
+    "historical_retention_score_bucket5_date",
+    "tail_cluster_safety_score",
+    "tail_cluster_safety_score_rank_date",
+    "tail_cluster_safety_score_bucket5_date",
+    "product_side_score",
+    "product_side_score_rank_date",
+    "avg_v3_b6_premium_to_stress_rank",
+]
 
 
 @dataclass(frozen=True)
@@ -85,6 +99,52 @@ def _mean_existing(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
     if not existing:
         return pd.Series(np.nan, index=frame.index)
     return frame[existing].mean(axis=1, skipna=True)
+
+
+def ensure_l1_loader_columns(panel: pd.DataFrame) -> pd.DataFrame:
+    """Return a rolling panel that can be read by the locked L1 loader."""
+    out = panel.copy()
+    if "option_type" in out.columns:
+        out["option_type"] = out["option_type"].fillna("").astype(str).str.upper().str[:1]
+    if "side" in out.columns:
+        out["side"] = out["side"].fillna("").astype(str).str.upper().str[:1]
+    elif "option_type" in out.columns:
+        out["side"] = out["option_type"]
+    else:
+        out["side"] = ""
+    if "option_type" not in out.columns:
+        out["option_type"] = out["side"]
+    for col in L1_PANEL_REQUIRED_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    if "date" in out.columns:
+        out["date"] = out["date"].astype(str).str[:10]
+    if "product" in out.columns:
+        out["product"] = out["product"].fillna("").astype(str).str.upper().str.strip()
+    return out
+
+
+def l1_loader_readiness(panel: pd.DataFrame, signal_date: str) -> dict[str, Any]:
+    """Summarize whether the rolling panel is structurally ready for L1 use."""
+    missing_columns = [col for col in L1_PANEL_REQUIRED_COLUMNS if col not in panel.columns]
+    if panel.empty or missing_columns:
+        day = pd.DataFrame()
+    else:
+        day = panel[panel["date"].astype(str).str[:10].eq(str(signal_date)[:10])].copy()
+    hist = pd.to_numeric(day.get("historical_retention_score_bucket5_date"), errors="coerce")
+    tail = pd.to_numeric(day.get("tail_cluster_safety_score_bucket5_date"), errors="coerce")
+    score = pd.to_numeric(day.get("product_side_score"), errors="coerce")
+    gate_ready = hist.notna() & tail.notna()
+    score_ready = score.notna()
+    return {
+        "l1_loader_required_columns_present": not missing_columns,
+        "l1_loader_missing_columns": missing_columns,
+        "rolling_panel_day_rows": int(len(day)),
+        "rolling_panel_gate_ready_rows": int(gate_ready.sum()) if len(day) else 0,
+        "rolling_panel_score_ready_rows": int(score_ready.sum()) if len(day) else 0,
+        "rolling_panel_loader_ready": bool(not missing_columns and len(day) > 0),
+        "rolling_panel_history_ready": bool(not missing_columns and len(day) > 0 and gate_ready.all()),
+    }
 
 
 def build_daily_product_side_observations(
@@ -315,7 +375,7 @@ def _mature_observation_labels(
 
 def _add_hist_and_scores(observations: pd.DataFrame, hist_window: int) -> pd.DataFrame:
     if observations.empty:
-        return observations
+        return ensure_l1_loader_columns(observations)
     out = observations.copy()
     out["date"] = out["date"].astype(str).str[:10]
     out["product"] = out["product"].astype(str).str.upper().str.strip()
@@ -381,12 +441,13 @@ def _add_hist_and_scores(observations: pd.DataFrame, hist_window: int) -> pd.Dat
             continue
         out[f"{col}_rank_date"] = _rank_by_date(out, col)
         out[f"{col}_bucket5_date"] = np.ceil(out[f"{col}_rank_date"] * 5.0).clip(1, 5)
-    return out
+    return ensure_l1_loader_columns(out)
 
 
 def build_rolling_l1_admission(panel: pd.DataFrame, config: dict[str, Any], signal_date: str) -> pd.DataFrame:
     if panel.empty:
         return pd.DataFrame()
+    panel = ensure_l1_loader_columns(panel)
     date = str(signal_date)[:10]
     day = panel[panel["date"].astype(str).str[:10].eq(date)].copy()
     if day.empty:
@@ -428,8 +489,10 @@ def update_rolling_product_side_panel(
     observations = _upsert_by_key(existing, new_observations, ["date", "product", "option_type"])
     observations = _mature_observation_labels(observations, data_dir, config, outcome_horizon)
     panel = _add_hist_and_scores(observations, hist_window)
+    panel = ensure_l1_loader_columns(panel)
     admission = build_rolling_l1_admission(panel, config, date)
     matured_rows = int(pd.to_numeric(observations.get("outcome_matured", 0), errors="coerce").fillna(0).sum())
+    readiness = l1_loader_readiness(panel, date)
 
     if write_outputs:
         write_csv(observation_path, observations)
@@ -444,6 +507,7 @@ def update_rolling_product_side_panel(
                 "panel_rows": int(len(panel)),
                 "admission_rows": int(len(admission)),
                 "matured_observation_rows": matured_rows,
+                **readiness,
                 "hist_window": int(hist_window),
                 "outcome_horizon": int(outcome_horizon),
                 "panel_path": str(panel_path),

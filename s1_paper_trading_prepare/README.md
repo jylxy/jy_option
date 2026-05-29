@@ -94,6 +94,12 @@ Compare generated pending orders with the locked historical backtest output:
 python s1_paper_trading_prepare/scripts/compare_with_backtest.py --generated s1_paper_trading_prepare/output/orders/orders_s1_paper_20220414.csv
 ```
 
+Compare the daily rolling product-side panel candidate with the locked mainline panel:
+
+```powershell
+python s1_paper_trading_prepare/scripts/compare_rolling_product_side_panel.py --signal-date 2022-04-14
+```
+
 Outputs are written under:
 
 ```text
@@ -112,6 +118,7 @@ only because the historical engine imports those modules at load time. See:
 
 ```text
 docs/s1_only_scope_and_daily_data.md
+docs/rolling_product_side_panel.md
 docs/paper_account_state_contract.md
 docs/daily_runbook.md
 ```
