@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,13 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
 def write_csv(path: str | Path, frame: pd.DataFrame) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(out, index=False, encoding="utf-8-sig")
+    tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_csv(tmp, index=False, encoding="utf-8-sig")
+        tmp.replace(out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def diagnostics_frame(records: list[dict[str, Any]], signal_date: str | None = None) -> pd.DataFrame:
@@ -158,4 +165,3 @@ def compare_order_frames(generated: pd.DataFrame, baseline: pd.DataFrame) -> tup
         "issues": diff["issue"].value_counts().to_dict() if not diff.empty else {},
     }
     return diff, summary
-
