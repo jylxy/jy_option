@@ -21,6 +21,7 @@ RULE_KEYS = (
     "s1_l1_secondary_bucket_col",
     "s1_l1_min_primary_bucket",
     "s1_l1_min_secondary_bucket",
+    "s1_l2_sort_weights",
     "s1_l1_sort_weights",
     "s1_l1_budget_multipliers",
     "s1_l3_product_side_ledger_enabled",

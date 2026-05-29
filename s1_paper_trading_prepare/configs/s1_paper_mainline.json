@@ -1,15 +1,24 @@
 {
   "extends": "source_mainline/config_s1_mainline_current.json",
   "_paper_trading_prepare": true,
-  "strategy_version": "s1_sim_l1_tail_q3_trend_safe_q3_20260530",
-  "_paper_strategy_version": "s1_sim_l1_tail_q3_trend_safe_q3_20260530",
+  "strategy_version": "s1_sim_l1_tail_q3_trend_safe_q3_l2_clean6_20260530",
+  "_paper_strategy_version": "s1_sim_l1_tail_q3_trend_safe_q3_l2_clean6_20260530",
   "_source_mainline_config": "s1_paper_trading_prepare/configs/source_mainline/config_s1_mainline_current.json",
   "_s1_rolling_product_side_panel_path": "s1_paper_trading_prepare/data/product_side_panel/rolling_product_side_panel.csv",
+  "s1_l1_product_side_panel_path": "s1_paper_trading_prepare/data/product_side_panel/rolling_product_side_panel.csv",
   "_s1_l1_gate_note": "Candidate B Q3/Q3: tail_cluster_safety_score_bucket5_date >= Q3 and avg_v3_trend_breakout_score_safe_bucket5_date >= Q3.",
   "s1_l1_primary_bucket_col": "tail_cluster_safety_score_bucket5_date",
   "s1_l1_secondary_bucket_col": "avg_v3_trend_breakout_score_safe_bucket5_date",
   "s1_l1_min_primary_bucket": 3,
   "s1_l1_min_secondary_bucket": 3,
+  "s1_l2_sort_weights": {
+    "premium_quality_score": 0.1666666667,
+    "avg_v3_contract_vrp_pct": 0.1666666667,
+    "avg_implied_vol": 0.1666666667,
+    "capacity_premium_density": 0.1666666667,
+    "avg_v3_b6_premium_to_iv10_rank": 0.1666666667,
+    "far_002_006_delta_share": 0.1666666667
+  },
   "_source_mainline_note": "Paper-trading preparation wrapper. Do not edit historical locked mainline configs in place.",
   "_order_generation_objective": "Read T-day data, run the locked S1 mainline signal and candidate pipeline, and export T+1 planned paper-trading orders plus diagnostics."
 }
