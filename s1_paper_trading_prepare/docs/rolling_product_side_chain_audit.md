@@ -121,9 +121,10 @@ incremental contract-level history used to recompute rolling fields.
 | 2022-02-23..2022-03-18 | 894 / 894 | 894 | 90.5% |
 | 2022-03-01..2022-03-31 | 1144 / 1144 | 1144 | 91.1% |
 | 2022-03-01..2022-03-31, prehistory from 2021-09-01 | 1144 / 1144 | 1144 | 93.3% |
+| 2022-03-01..2022-03-31, DTE<=120 + T+1 labels + prehistory from 2021-07-01 | 1144 / 1144 | 1144 | 97.4% |
 
-After replaying the exact full-shadow fields from the available 2022 snapshots,
-the 2022-03-01..2022-03-31 window remains close at about 90.5% gate match:
+After replaying the full-shadow fields from the available 2022 snapshots,
+the 2022-03-01..2022-03-31 window initially remained close at about 90.5% gate match:
 
 ```text
 locked_rows=1144 rolling_rows=1144 overlap_rows=1144
@@ -134,24 +135,42 @@ gate_match_rate=0.9047202797202797
 
 The March mature-window comparison improved from about 74.5% gate match to
 about 91.1% after replacing the proxy tail feature with the product
-stop-cluster label.  After prehistory warmup, exact B6/VRP/regime aggregation,
-and research-style matured labels, the same March window reached:
+stop-cluster label.  After prehistory warmup, DTE<=120 candidate-tape filtering,
+and research-style T+1 matured labels, the same March window reached:
 
 ```text
 locked_rows=1144 rolling_rows=1144 overlap_rows=1144
 rolling_gate_ready_rows=1144
-diff_rows=534
-issues={'bucket_mismatch': 457, 'l1_gate_mismatch': 77}
-gate_match_rate=0.9326923076923077
-hist_bucket_match_rate=0.8094405594405595
-tail_bucket_match_rate=0.6713286713286714
-product_side_score_corr=0.831789174039538
+diff_rows=572
+issues={'bucket_mismatch': 542, 'l1_gate_mismatch': 30}
+gate_match_rate=0.9737762237762237
+hist_bucket_match_rate=0.8347902097902098
+tail_bucket_match_rate=0.6101398601398601
+product_side_score_corr=0.853500548293816
 ```
 
-For `2022-04-01`, the rolling manifest reported no missing research scoring
-fields.  Coverage was `100%` for B6 stress, GARCH, product-side scores, and
-L1 buckets; HAR and IV10 fields covered `44 / 48` product-side rows because a
-few product-side histories still lacked enough clean observations.
+The locked enriched full-shadow source and the rolling candidate tape now match
+exactly on `2022-03-01`: `5307 / 5307` contract rows and `48 / 48`
+product-side row counts match with zero absolute row-count difference.
+
+For `2022-04-01`, the rolling manifest after the 2021-07 warmup reported:
+
+```text
+contract_shadow_observation_rows=1015827
+rolling_panel_rows=9172
+full_shadow_max_dte=120
+```
+
+Coverage on `2022-03-01`, `2022-03-31`, and `2022-04-01` is now `100%` for:
+
+- `avg_v3_b6_premium_to_iv10_rank`
+- `avg_underlying_har_pred_rv_5d`
+- `avg_underlying_garch_pred_rv_5d`
+- `avg_underlying_har_garch_avg_rv_5d`
+- `avg_v3_contract_vrp_pct`
+- `avg_v3_vrp_quality_score`
+- `avg_v3_disaster_score`
+- `avg_v3_trend_breakout_score`
 
 ## Remaining Gap
 
@@ -176,9 +195,9 @@ the first formal signal date then rebuilds contract-shadow history once from all
 stored snapshots.  This keeps the HAR/VRP warmup auditable without creating
 formal daily order-generation partitions for prehistory dates.
 
-The remaining gap is now dominated by the candidate tape boundary.  On
-`2022-03-01`, locked `candidate_rows` averaged `110.6` per product-side, while
-rolling raw-chain aggregation averaged `204.0`.  The next action is to
-replicate the full-shadow research candidate-tape filter before aggregation,
-then rerun the same parity checks before switching order generation away from
-the locked mainline panel.
+The remaining gate gap is no longer the candidate tape.  It is concentrated in
+30 product-side dates near the Q3/Q3 historical label thresholds, mainly in
+`AL P`, `TA P`, `ZC C`, and `ZN C`.  The next action is to keep tightening the
+label path: compare the locked contract-level `v3_retention_10d`,
+`v3_stop_touch_10d`, and `v3_product_stop_cluster_with_portfolio` inputs against
+the rolling labels for those product-side dates.

@@ -29,7 +29,7 @@ dates:
 ```powershell
 python .\s1_paper_trading_prepare\scripts\update_daily_data.py `
   --signal-date 2022-04-01 `
-  --prehistory-start-date 2021-09-01 `
+  --prehistory-start-date 2021-07-01 `
   --rebuild-contract-history
 ```
 
@@ -41,12 +41,12 @@ Latest h200 warmup check:
 
 ```text
 signal_date: 2022-04-01
-prehistory_start_date: 2021-09-01
-prehistory_dates: 164
-rolling_panel_rows: 6970
-contract_shadow_observation_rows: 1421227
-research_scoring_missing_fields: []
-March 2022 rolling-vs-locked gate_match_rate: 93.27%
+prehistory_start_date: 2021-07-01
+prehistory_dates: 218 stored snapshot dates
+rolling_panel_rows: 9172
+contract_shadow_observation_rows: 1015827
+full_shadow_max_dte: 120
+March 2022 rolling-vs-locked gate_match_rate: 97.38%
 ```
 
 ## Loader Contract
@@ -74,13 +74,20 @@ Outcome labels are updated only after enough stored future snapshots exist for t
 
 The rolling label refresh uses the research convention for matured rows:
 
-- `retention_10d = 1 - T+10 close / entry_price`
-- `max_adverse_price_ratio_10d = max_future_high / entry_price`
+- `entry_price` is taken from the next stored trading snapshot, matching the T+1 research-entry convention.
+- `retention_10d = 1 - exit_price / entry_price`, with the exit window beginning after that T+1 entry date.
+- `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured after that T+1 entry date.
 - expiry retention is written only after expiry can be observed from stored snapshots
 
 Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
 forecasts use the original research embargo: a signal date can train only on
 targets whose forward horizon has already ended before that signal date.
+
+When exact `underlying_code` history is too short for HAR/VRP/regime fields,
+the updater now fills missing history features from the same product's stored
+spot series.  This is a point-in-time fallback for the research continuous
+contract / alias behavior; it never overwrites exact underlying-code values and
+does not read future dates.
 
 The manifest separates two states:
 

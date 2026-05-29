@@ -30,6 +30,7 @@ ROLLING_MANIFEST_PREFIX = "rolling_product_side_update"
 CATEGORY_FIELDS = ["sector", "portfolio_bucket", "corr_group"]
 FULL_SHADOW_ROLLING_WINDOW = 252
 FULL_SHADOW_MIN_OBS = 60
+FULL_SHADOW_MAX_DTE = 120
 HAR_HORIZON = 5
 HAR_TRAIN_WINDOW = 500
 HAR_MIN_TRAIN = 80
@@ -364,6 +365,14 @@ def build_daily_contract_shadow_observations(
     out = out[out["option_type"].isin(["C", "P"])].copy()
     if out.empty:
         return out
+    full_shadow_price = _safe_numeric(out, "option_close")
+    full_shadow_dte = _safe_numeric(out, "dte")
+    out = out[
+        full_shadow_price.gt(0)
+        & full_shadow_dte.between(1, FULL_SHADOW_MAX_DTE, inclusive="both")
+    ].copy()
+    if out.empty:
+        return out
 
     if "l0_basic_trade_eligible" in out.columns:
         eligible = out["l0_basic_trade_eligible"].astype(bool)
@@ -560,7 +569,83 @@ def _add_underlying_features_from_contract_history(contract: pd.DataFrame) -> pd
         "underlying_har_garch_avg_rv_5d",
     ]
     out = out.drop(columns=[col for col in feature_cols if col not in ("date", "underlying_code") and col in out.columns], errors="ignore")
-    return out.merge(ohlc[feature_cols], on=["date", "underlying_code"], how="left")
+    merged = out.merge(ohlc[feature_cols], on=["date", "underlying_code"], how="left")
+
+    product_ohlc = (
+        unique.groupby(["date", "product"], as_index=False)
+        .agg(
+            close=("spot", "median"),
+            open=("spot_open", "median"),
+            high=("spot_high", "median"),
+            low=("spot_low", "median"),
+        )
+        .dropna(subset=["close"])
+    )
+    product_ohlc = product_ohlc[product_ohlc["close"].gt(0)].copy()
+    if not product_ohlc.empty:
+        product_ohlc["open"] = product_ohlc["open"].where(product_ohlc["open"].gt(0), product_ohlc["close"])
+        product_ohlc["high"] = product_ohlc["high"].where(product_ohlc["high"].gt(0), product_ohlc["close"])
+        product_ohlc["low"] = product_ohlc["low"].where(product_ohlc["low"].gt(0), product_ohlc["close"])
+        product_ohlc["date_dt"] = pd.to_datetime(product_ohlc["date"], errors="coerce")
+        product_ohlc = product_ohlc.sort_values(["product", "date_dt"], kind="mergesort")
+        product_group = product_ohlc.groupby("product", sort=False)
+        product_prev_close = product_group["close"].shift(1)
+        product_ohlc["underlying_ret_1d"] = np.log(product_ohlc["close"] / product_prev_close)
+        product_ohlc["underlying_abs_ret_1d"] = product_ohlc["underlying_ret_1d"].abs()
+        product_ohlc["underlying_gap_abs"] = np.log(product_ohlc["open"] / product_prev_close).abs()
+        product_tr_abs = pd.concat(
+            [
+                (product_ohlc["high"] - product_ohlc["low"]).abs(),
+                (product_ohlc["high"] - product_prev_close).abs(),
+                (product_ohlc["low"] - product_prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        product_ohlc["underlying_true_range_pct"] = product_tr_abs / product_prev_close.replace(0, np.nan)
+        product_sq = product_ohlc["underlying_ret_1d"].pow(2)
+        for window in (3, 5, 10, 20, 60):
+            product_ohlc[f"underlying_rv_{window}d"] = np.sqrt(
+                product_sq.groupby(product_ohlc["product"], sort=False).transform(
+                    lambda series, w=window: series.rolling(w, min_periods=max(3, w // 2)).mean()
+                )
+                * 252.0
+            )
+        product_ohlc["underlying_rv_ratio_5_20"] = product_ohlc["underlying_rv_5d"] / product_ohlc["underlying_rv_20d"].replace(0, np.nan)
+        product_ohlc["underlying_rv_ratio_20_60"] = product_ohlc["underlying_rv_20d"] / product_ohlc["underlying_rv_60d"].replace(0, np.nan)
+        product_ohlc["underlying_rv_accel_5_20"] = product_ohlc["underlying_rv_ratio_5_20"] - 1.0
+        product_ohlc["underlying_atr_5d"] = product_group["underlying_true_range_pct"].transform(lambda series: series.rolling(5, min_periods=3).mean())
+        product_ohlc["underlying_atr_20d"] = product_group["underlying_true_range_pct"].transform(lambda series: series.rolling(20, min_periods=10).mean())
+        for window in (5, 20, 60):
+            product_ohlc[f"underlying_trend_ret_{window}d"] = product_group["close"].transform(lambda series, w=window: np.log(series / series.shift(w)))
+        product_ohlc["underlying_trend_z_20d"] = product_ohlc["underlying_trend_ret_20d"] / (
+            product_ohlc["underlying_rv_20d"] * np.sqrt(20.0 / 252.0)
+        )
+        product_denom = product_group["underlying_true_range_pct"].transform(lambda series: series.rolling(20, min_periods=10).mean())
+        product_ohlc["underlying_gap_share_20d"] = (
+            product_group["underlying_gap_abs"].transform(lambda series: series.rolling(20, min_periods=10).mean())
+            / product_denom.replace(0, np.nan)
+        )
+        product_ohlc["underlying_jump_share_20d"] = product_group["underlying_ret_1d"].transform(jump_share)
+        product_har_parts = []
+        product_garch_parts = []
+        for _, part in product_group:
+            product_har_parts.append(_add_har_forecast(part, HAR_HORIZON, HAR_TRAIN_WINDOW, HAR_MIN_TRAIN))
+            product_garch_parts.append(_add_fixed_garch_forecast(part, GARCH_ALPHA, GARCH_BETA, HAR_HORIZON, GARCH_LONG_WINDOW))
+        product_ohlc["underlying_har_pred_rv_5d"] = pd.concat(product_har_parts).sort_index() if product_har_parts else np.nan
+        product_ohlc["underlying_garch_pred_rv_5d"] = pd.concat(product_garch_parts).sort_index() if product_garch_parts else np.nan
+        product_ohlc["underlying_har_garch_avg_rv_5d"] = product_ohlc[
+            ["underlying_har_pred_rv_5d", "underlying_garch_pred_rv_5d"]
+        ].mean(axis=1)
+        fallback_cols = [col for col in feature_cols if col not in ("date", "underlying_code")]
+        fallback = product_ohlc[["date", "product", *fallback_cols]].rename(
+            columns={col: f"{col}__product_fallback" for col in fallback_cols}
+        )
+        merged = merged.merge(fallback, on=["date", "product"], how="left")
+        for col in fallback_cols:
+            fallback_col = f"{col}__product_fallback"
+            merged[col] = merged[col].where(pd.to_numeric(merged[col], errors="coerce").notna(), merged[fallback_col])
+        merged = merged.drop(columns=[f"{col}__product_fallback" for col in fallback_cols], errors="ignore")
+    return merged
 
 
 def _add_side_surface_features(contract: pd.DataFrame) -> pd.DataFrame:
@@ -1022,6 +1107,14 @@ def _normalize_l0_for_research_aggregate(
     out["product"] = _safe_text(out, "product").str.upper().str.strip()
     out["side"] = _safe_text(out, "option_type").str.upper().str[:1]
     out = out[out["side"].isin(["C", "P"])].copy()
+    if out.empty:
+        return out
+    full_shadow_price = _safe_numeric(out, "option_close")
+    full_shadow_dte = _safe_numeric(out, "dte")
+    out = out[
+        full_shadow_price.gt(0)
+        & full_shadow_dte.between(1, FULL_SHADOW_MAX_DTE, inclusive="both")
+    ].copy()
     if out.empty:
         return out
     eligible = out.get("l0_basic_trade_eligible", True)
@@ -1508,8 +1601,11 @@ def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
     contract_cols = [
         "option_code",
         "trade_date",
+        "vwap",
         "option_close",
         "option_high",
+        "volume",
+        "open_interest",
         "expiry_date",
         "option_type",
         "strike",
@@ -1525,16 +1621,18 @@ def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
     out["option_code"] = out["option_code"].astype(str)
     if "option_close" not in out.columns:
         out["option_close"] = np.nan
+    if "vwap" not in out.columns:
+        out["vwap"] = out["option_close"]
     if "option_high" not in out.columns:
         out["option_high"] = out["option_close"]
     if "expiry_date" not in out.columns:
         out["expiry_date"] = ""
     if "trade_date" in out.columns:
         out["trade_date"] = out["trade_date"].astype(str).str[:10]
-    if "option_close" in out.columns:
-        out["option_close"] = pd.to_numeric(out["option_close"], errors="coerce")
-    if "option_high" in out.columns:
-        out["option_high"] = pd.to_numeric(out["option_high"], errors="coerce")
+    for col in ["vwap", "option_close", "option_high", "volume", "open_interest"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["vwap"] = out["vwap"].where(out["vwap"].gt(0), out["option_close"])
     if "expiry_date" in out.columns:
         out["expiry_date"] = out["expiry_date"].astype(str).str[:10]
     if "option_type" in out.columns:
@@ -1628,34 +1726,65 @@ def _mature_observation_labels(
         if obs_date not in date_pos:
             continue
         start_idx = date_pos[obs_date]
-        end_idx = start_idx + int(outcome_horizon)
+        entry_idx = start_idx + 1
+        end_idx = entry_idx + int(outcome_horizon)
         if end_idx >= len(available_dates):
             continue
+        entry_date = available_dates[entry_idx]
         obs_mask = out["date"].eq(obs_date)
         already_matured = pd.to_numeric(out.loc[obs_mask, "outcome_matured"], errors="coerce").fillna(0).eq(1).all()
         if already_matured:
             continue
-        future_dates = available_dates[start_idx + 1:end_idx + 1]
+        future_dates = available_dates[entry_idx + 1:end_idx + 1]
         if not future_dates:
             continue
 
-        entry_snapshot = _load_snapshot_cached(data_dir, obs_date, snapshot_cache)
-        if entry_snapshot.empty:
+        signal_snapshot = _load_snapshot_cached(data_dir, obs_date, snapshot_cache)
+        entry_snapshot = _load_snapshot_cached(data_dir, entry_date, snapshot_cache)
+        if signal_snapshot.empty or entry_snapshot.empty:
             continue
-        entry = entry_snapshot.copy()
+        entry = signal_snapshot.copy()
         entry["product"] = _safe_text(entry, "product").str.upper().str.strip()
         entry["option_type"] = _safe_text(entry, "option_type").str.upper().str[:1]
         entry["option_code"] = _safe_text(entry, "option_code")
-        entry_price = _safe_numeric(entry, "option_close")
-        entry = entry[entry_price.gt(0)].copy()
+        signal_price = _safe_numeric(entry, "option_close")
+        signal_dte = _safe_numeric(entry, "dte")
+        entry = entry[
+            entry["option_type"].isin(["C", "P"])
+            & signal_price.gt(0)
+            & signal_dte.between(1, FULL_SHADOW_MAX_DTE, inclusive="both")
+        ].copy()
         if entry.empty:
             continue
-        entry["_entry_price"] = _safe_numeric(entry, "option_close")
         if "expiry_date" in entry.columns:
             entry["expiry_date"] = entry["expiry_date"].astype(str).str[:10]
         else:
             entry["expiry_date"] = ""
         entry["_entry_multiplier"] = _safe_numeric(entry, "multiplier").fillna(1.0) if "multiplier" in entry.columns else 1.0
+        entry_quotes = _contract_key_frame(entry_snapshot)
+        if entry_quotes.empty:
+            continue
+        entry_quotes["_entry_price"] = _safe_numeric(entry_quotes, "vwap").where(
+            _safe_numeric(entry_quotes, "vwap").gt(0),
+            _safe_numeric(entry_quotes, "option_close"),
+        )
+        entry_quotes["_entry_high"] = _safe_numeric(entry_quotes, "option_high")
+        entry_quotes["_entry_volume"] = _safe_numeric(entry_quotes, "volume").fillna(0.0)
+        entry_quotes["_entry_open_interest"] = _safe_numeric(entry_quotes, "open_interest").fillna(0.0)
+        entry_quote_cols = [
+            col for col in [
+                "option_code",
+                "_entry_price",
+                "_entry_high",
+                "_entry_volume",
+                "_entry_open_interest",
+            ] if col in entry_quotes.columns
+        ]
+        entry = entry.merge(entry_quotes[entry_quote_cols], on="option_code", how="left")
+        entry["_entry_price"] = _safe_numeric(entry, "_entry_price")
+        entry = entry[entry["_entry_price"].gt(0)].copy()
+        if entry.empty:
+            continue
 
         future_5_dates = future_dates[: min(5, len(future_dates))]
         future_5_parts = []
@@ -1685,7 +1814,7 @@ def _mature_observation_labels(
         horizon_close = (
             future[future["trade_date"].astype(str).str[:10].eq(future_dates[-1])]
             .groupby("option_code", as_index=False)
-            .agg(future_horizon_close=("option_close", "last"))
+            .agg(future_horizon_close=("vwap", "last"))
         )
         expiry_candidates = entry[["option_code", "expiry_date"]].dropna().drop_duplicates("option_code").copy()
         expiry_candidates = expiry_candidates[expiry_candidates["expiry_date"].astype(str).str.len().ge(10)]
@@ -1696,7 +1825,7 @@ def _mature_observation_labels(
             max_needed_expiry = expiry_candidates["expiry_date"].max()
             expiry_dates = [
                 future_date
-                for future_date in available_dates[start_idx + 1:]
+                for future_date in available_dates[entry_idx + 1:]
                 if future_date <= max_needed_expiry and future_date <= max_date
             ]
             expiry_parts = []
@@ -1802,7 +1931,11 @@ def _mature_observation_labels(
         out.loc[target_idx, "outcome_matured"] = 1
 
     out["outcome_matured"] = out["date"].astype(str).map(
-        lambda date: int(date in date_pos and date_pos[date] + int(outcome_horizon) < len(available_dates) and max_date > date)
+        lambda date: int(
+            date in date_pos
+            and date_pos[date] + 1 + int(outcome_horizon) < len(available_dates)
+            and max_date > date
+        )
     )
     return out
 
@@ -2017,6 +2150,7 @@ def update_rolling_product_side_panel(
                 "hist_window": int(hist_window),
                 "full_shadow_rolling_window": int(FULL_SHADOW_ROLLING_WINDOW),
                 "full_shadow_min_obs": int(FULL_SHADOW_MIN_OBS),
+                "full_shadow_max_dte": int(FULL_SHADOW_MAX_DTE),
                 "outcome_horizon": int(outcome_horizon),
                 "contract_observation_path": str(contract_observation_path),
                 "contract_fields_path": str(contract_fields_path),
