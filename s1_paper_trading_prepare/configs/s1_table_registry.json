@@ -36,6 +36,10 @@
         "tail_cluster_safety_score",
         "tail_cluster_safety_score_rank_date",
         "tail_cluster_safety_score_bucket5_date",
+        "avg_v3_trend_breakout_score",
+        "avg_v3_trend_breakout_score_safe",
+        "avg_v3_trend_breakout_score_safe_rank_date",
+        "avg_v3_trend_breakout_score_safe_bucket5_date",
         "product_side_score",
         "product_side_score_rank_date",
         "avg_v3_b6_premium_to_stress_rank"

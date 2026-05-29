@@ -8,6 +8,7 @@ import pandas as pd
 
 from .config_snapshot import load_effective_config
 from .paths import REPO_ROOT
+from .product_side_rolling import ensure_l1_gate_columns, l1_gate_bucket_columns
 
 
 def load_panel(config: dict) -> pd.DataFrame:
@@ -29,16 +30,20 @@ def audit_l1_admission_from_panel(signal_date: str, config: dict, panel: pd.Data
     if panel.empty:
         return pd.DataFrame()
     date_key = str(signal_date)[:10]
+    panel = ensure_l1_gate_columns(panel)
     day = panel[panel["date"].astype(str).str[:10].eq(date_key)].copy()
-    hist_col = "historical_retention_score_bucket5_date"
-    tail_col = "tail_cluster_safety_score_bucket5_date"
-    min_hist = float(config.get("s1_l1_min_hist_bucket", 3) or 3)
-    min_tail = float(config.get("s1_l1_min_tail_bucket", 3) or 3)
-    day["l1_hist_bucket"] = pd.to_numeric(day.get(hist_col), errors="coerce")
-    day["l1_tail_bucket"] = pd.to_numeric(day.get(tail_col), errors="coerce")
-    day["l1_pass_gate"] = day["l1_hist_bucket"].ge(min_hist) & day["l1_tail_bucket"].ge(min_tail)
-    day["l1_min_hist_bucket"] = min_hist
-    day["l1_min_tail_bucket"] = min_tail
+    primary_col, secondary_col = l1_gate_bucket_columns(config)
+    min_primary = float(config.get("s1_l1_min_primary_bucket", 3) or 3)
+    min_secondary = float(config.get("s1_l1_min_secondary_bucket", 3) or 3)
+    day["l1_primary_bucket"] = pd.to_numeric(day.get(primary_col), errors="coerce")
+    day["l1_secondary_bucket"] = pd.to_numeric(day.get(secondary_col), errors="coerce")
+    day["l1_pass_gate"] = day["l1_primary_bucket"].ge(min_primary) & day["l1_secondary_bucket"].ge(min_secondary)
+    day["l1_min_primary_bucket"] = min_primary
+    day["l1_min_secondary_bucket"] = min_secondary
+    day["l1_primary_bucket_col"] = primary_col
+    day["l1_secondary_bucket_col"] = secondary_col
+    day["l1_tail_bucket"] = day["l1_primary_bucket"]
+    day["l1_hist_bucket"] = day["l1_secondary_bucket"]
     return day
 
 

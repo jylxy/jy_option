@@ -1,0 +1,17 @@
+{
+  "extends": "source_mainline/config_s1_mainline_locked_50m_liq10_20260527.json",
+  "strategy_version": "s1_mainline_pit_tail_q3_trend_safe_q3_20260530",
+  "_pit_rolling_nav": true,
+  "_pit_rolling_note": "Audit rerun of the locked S1 mainline using a point-in-time rolling product-side panel. Do not enable research-parity or future spot-map inputs here.",
+  "_pit_source_mainline": "s1_paper_trading_prepare/configs/source_mainline/config_s1_mainline_locked_50m_liq10_20260527.json",
+  "_pit_baseline_output_tag": "s1_capacity_liq10_50m_20260527_2022_20260331",
+  "s1_l1_product_side_panel_path": "s1_paper_trading_prepare/data_pit/product_side_panel/rolling_product_side_panel_pit_asof.csv",
+  "_s1_l1_gate_note": "Candidate B Q3/Q3 PIT rerun: tail_cluster_safety_score_bucket5_date >= Q3 and avg_v3_trend_breakout_score_safe_bucket5_date >= Q3.",
+  "s1_l1_primary_bucket_col": "tail_cluster_safety_score_bucket5_date",
+  "s1_l1_secondary_bucket_col": "avg_v3_trend_breakout_score_safe_bucket5_date",
+  "s1_l1_min_primary_bucket": 3,
+  "s1_l1_min_secondary_bucket": 3,
+  "s1_rolling_product_spot_map_allow_future": false,
+  "s1_rolling_research_parity_spot_map": false,
+  "s1_rolling_product_spot_map_readonly": false
+}

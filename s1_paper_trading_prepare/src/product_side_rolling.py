@@ -23,6 +23,7 @@ from .diagnostics import write_csv, write_json
 ROLLING_PANEL_FILE = "rolling_product_side_panel.csv"
 ROLLING_OBSERVATION_FILE = "rolling_product_side_observations.csv"
 ROLLING_CONTRACT_OBSERVATION_FILE = "rolling_contract_shadow_observations.csv"
+ROLLING_PRODUCT_SPOT_MAP_FILE = "rolling_product_spot_map.csv"
 CONTRACT_SHADOW_DIR = "contract_shadow"
 CONTRACT_FIELDS_PREFIX = "contract_shadow_fields"
 ROLLING_ADMISSION_PREFIX = "rolling_l1_admission"
@@ -106,6 +107,9 @@ L1_PANEL_REQUIRED_COLUMNS = [
     "product_side_score_rank_date",
     "avg_v3_b6_premium_to_stress_rank",
 ]
+TREND_BREAKOUT_SAFE_COL = "avg_v3_trend_breakout_score_safe"
+TREND_BREAKOUT_SAFE_RANK_COL = f"{TREND_BREAKOUT_SAFE_COL}_rank_date"
+TREND_BREAKOUT_SAFE_BUCKET_COL = f"{TREND_BREAKOUT_SAFE_COL}_bucket5_date"
 
 
 @dataclass(frozen=True)
@@ -190,6 +194,10 @@ def _rank_by_date(frame: pd.DataFrame, col: str, higher_good: bool = True) -> pd
     if not higher_good:
         values = -values
     return values.groupby(frame["date"]).rank(pct=True, method="average")
+
+
+def _bucket5_from_rank(rank: pd.Series) -> pd.Series:
+    return np.ceil(pd.to_numeric(rank, errors="coerce") * 5).clip(1, 5)
 
 
 def _mean_existing(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -1307,6 +1315,8 @@ def _research_add_derived_factors(panel: pd.DataFrame, side_level: bool) -> pd.D
 
     if "avg_underlying_trend_z_20d" in out.columns:
         out["abs_trend_z_20d"] = pd.to_numeric(out["avg_underlying_trend_z_20d"], errors="coerce").abs()
+    if "avg_v3_trend_breakout_score" in out.columns:
+        out[TREND_BREAKOUT_SAFE_COL] = -pd.to_numeric(out["avg_v3_trend_breakout_score"], errors="coerce")
     if "avg_v3_rv5_rv20" in out.columns:
         out["rv_contraction_raw"] = 1.0 - pd.to_numeric(out["avg_v3_rv5_rv20"], errors="coerce")
     elif "avg_underlying_rv_ratio_5_20" in out.columns:
@@ -1348,14 +1358,19 @@ def _research_add_rank_fields(panel: pd.DataFrame, side_level: bool) -> pd.DataF
         "capacity_premium_pool_proxy",
         "premium_pool_per_candidate",
         "avg_v3_contract_vrp_pct",
+        "avg_v3_contract_vrp_core",
         "avg_v3_vrp_quality_score",
         "avg_v3_term_not_inverted",
+        "avg_v3_b6_theta_vega_rank",
+        "avg_v3_b6_premium_to_stress_rank",
+        "far_002_006_delta_share",
+        TREND_BREAKOUT_SAFE_COL,
     ]
     for col in rank_cols:
         if col not in out.columns:
             continue
         out[f"{col}_rank_date"] = _rank_by_date(out, col)
-        out[f"{col}_bucket5_date"] = np.ceil(out[f"{col}_rank_date"] * 5).clip(1, 5)
+        out[f"{col}_bucket5_date"] = _bucket5_from_rank(out[f"{col}_rank_date"])
         if side_level and "side" in out.columns:
             out[f"{col}_rank_side_date"] = pd.to_numeric(out[col], errors="coerce").groupby(
                 [out["date"], out["side"]]
@@ -1464,9 +1479,43 @@ def _add_point_in_time_market_features(panel: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def ensure_l1_gate_columns(panel: pd.DataFrame) -> pd.DataFrame:
+    """Populate configured L1 gate bucket columns that can be derived PIT-safely."""
+    out = panel.copy()
+    if "date" in out.columns:
+        out["date"] = out["date"].astype(str).str[:10]
+    raw_col = "avg_v3_trend_breakout_score"
+    if raw_col in out.columns and (
+        TREND_BREAKOUT_SAFE_COL not in out.columns
+        or pd.to_numeric(out[TREND_BREAKOUT_SAFE_COL], errors="coerce").isna().all()
+    ):
+        out[TREND_BREAKOUT_SAFE_COL] = -pd.to_numeric(out[raw_col], errors="coerce")
+    if TREND_BREAKOUT_SAFE_COL in out.columns and (
+        TREND_BREAKOUT_SAFE_BUCKET_COL not in out.columns
+        or pd.to_numeric(out[TREND_BREAKOUT_SAFE_BUCKET_COL], errors="coerce").isna().all()
+    ):
+        if "date" in out.columns:
+            out[TREND_BREAKOUT_SAFE_RANK_COL] = _rank_by_date(out, TREND_BREAKOUT_SAFE_COL)
+        else:
+            out[TREND_BREAKOUT_SAFE_RANK_COL] = pd.to_numeric(
+                out[TREND_BREAKOUT_SAFE_COL], errors="coerce"
+            ).rank(pct=True, method="average")
+        out[TREND_BREAKOUT_SAFE_BUCKET_COL] = _bucket5_from_rank(out[TREND_BREAKOUT_SAFE_RANK_COL])
+    return out
+
+
+def l1_gate_bucket_columns(config: dict[str, Any]) -> tuple[str, str]:
+    """Return the explicitly configured L1 gate bucket columns."""
+    primary = config.get("s1_l1_primary_bucket_col")
+    secondary = config.get("s1_l1_secondary_bucket_col")
+    if not primary or not secondary:
+        raise KeyError("s1_l1_primary_bucket_col and s1_l1_secondary_bucket_col are required")
+    return str(primary), str(secondary)
+
+
 def ensure_l1_loader_columns(panel: pd.DataFrame) -> pd.DataFrame:
     """Return a rolling panel that can be read by the locked L1 loader."""
-    out = panel.copy()
+    out = ensure_l1_gate_columns(panel)
     if "option_type" in out.columns:
         out["option_type"] = out["option_type"].fillna("").astype(str).str.upper().str[:1]
     if "side" in out.columns:
@@ -1487,17 +1536,20 @@ def ensure_l1_loader_columns(panel: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def l1_loader_readiness(panel: pd.DataFrame, signal_date: str) -> dict[str, Any]:
+def l1_loader_readiness(panel: pd.DataFrame, signal_date: str, config: dict[str, Any]) -> dict[str, Any]:
     """Summarize whether the rolling panel is structurally ready for L1 use."""
-    missing_columns = [col for col in L1_PANEL_REQUIRED_COLUMNS if col not in panel.columns]
+    panel = ensure_l1_gate_columns(panel)
+    primary_col, secondary_col = l1_gate_bucket_columns(config)
+    required = list(dict.fromkeys(L1_PANEL_REQUIRED_COLUMNS + [primary_col, secondary_col]))
+    missing_columns = [col for col in required if col not in panel.columns]
     if panel.empty or missing_columns:
         day = pd.DataFrame()
     else:
         day = panel[panel["date"].astype(str).str[:10].eq(str(signal_date)[:10])].copy()
-    hist = pd.to_numeric(day.get("historical_retention_score_bucket5_date"), errors="coerce")
-    tail = pd.to_numeric(day.get("tail_cluster_safety_score_bucket5_date"), errors="coerce")
+    primary = pd.to_numeric(day.get(primary_col), errors="coerce")
+    secondary = pd.to_numeric(day.get(secondary_col), errors="coerce")
     score = pd.to_numeric(day.get("product_side_score"), errors="coerce")
-    gate_ready = hist.notna() & tail.notna()
+    gate_ready = primary.notna() & secondary.notna()
     score_ready = score.notna()
     return {
         "l1_loader_required_columns_present": not missing_columns,
@@ -1507,6 +1559,8 @@ def l1_loader_readiness(panel: pd.DataFrame, signal_date: str) -> dict[str, Any]
         "rolling_panel_score_ready_rows": int(score_ready.sum()) if len(day) else 0,
         "rolling_panel_loader_ready": bool(not missing_columns and len(day) > 0),
         "rolling_panel_history_ready": bool(not missing_columns and len(day) > 0 and gate_ready.all()),
+        "l1_primary_bucket_col": primary_col,
+        "l1_secondary_bucket_col": secondary_col,
     }
 
 
@@ -1680,6 +1734,157 @@ def _load_snapshot_cached(data_dir: Path, date: str, snapshot_cache: dict[str, p
     return snapshot_cache[key]
 
 
+def _product_spot_map_path(data_dir: Path, config: dict[str, Any]) -> Path:
+    configured = (
+        config.get("s1_rolling_product_spot_map_path")
+        or config.get("_s1_rolling_product_spot_map_path")
+    )
+    if configured:
+        path = Path(str(configured))
+        return path if path.is_absolute() else Path.cwd() / path
+    return data_dir / "product_side_panel" / ROLLING_PRODUCT_SPOT_MAP_FILE
+
+
+def _normalize_product_spot_map(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize product/date spot rows for expiry-retention labels."""
+    if frame.empty:
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    out = frame.copy()
+    if "trade_date" not in out.columns:
+        for alias in ["date", "signal_date"]:
+            if alias in out.columns:
+                out["trade_date"] = out[alias]
+                break
+    if "expiry_spot" not in out.columns:
+        for alias in ["underlying_price", "spot", "spot_close"]:
+            if alias in out.columns:
+                out["expiry_spot"] = out[alias]
+                break
+    if not {"product", "trade_date", "expiry_spot"}.issubset(out.columns):
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    out = out[["product", "trade_date", "expiry_spot"] + (["source"] if "source" in out.columns else [])].copy()
+    out["product"] = out["product"].astype(str).str.upper().str.strip()
+    out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce")
+    out["expiry_spot"] = pd.to_numeric(out["expiry_spot"], errors="coerce")
+    out = out.dropna(subset=["product", "trade_date", "expiry_spot"]).copy()
+    if "source" not in out.columns:
+        out["source"] = ""
+    return (
+        out.sort_values(["product", "trade_date"], kind="mergesort")
+        .drop_duplicates(["product", "trade_date"], keep="first")
+        [["product", "trade_date", "expiry_spot", "source"]]
+    )
+
+
+def _daily_product_spot_map_from_snapshot(snapshot: pd.DataFrame, date: str) -> pd.DataFrame:
+    """Extract the same-day product spot map from a Toolkit option snapshot."""
+    if snapshot.empty or "product" not in snapshot.columns:
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    spot_col = None
+    for candidate in ["underlying_price", "spot", "spot_close"]:
+        if candidate in snapshot.columns:
+            values = pd.to_numeric(snapshot[candidate], errors="coerce")
+            if values.notna().any():
+                spot_col = candidate
+                break
+    if spot_col is None:
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    keep_cols = ["product", spot_col] + (["dte"] if "dte" in snapshot.columns else [])
+    out = snapshot[keep_cols].copy()
+    out["product"] = out["product"].astype(str).str.upper().str.strip()
+    out["trade_date"] = pd.to_datetime(str(date)[:10], errors="coerce")
+    out["expiry_spot"] = pd.to_numeric(out[spot_col], errors="coerce")
+    if "dte" in out.columns:
+        dte = pd.to_numeric(out["dte"], errors="coerce")
+        out = out[dte.between(1, FULL_SHADOW_MAX_DTE, inclusive="both")].copy()
+    out = out.dropna(subset=["product", "trade_date", "expiry_spot"]).copy()
+    out["source"] = f"toolkit_snapshot_{spot_col}_first"
+    return (
+        out.sort_values(["product", "trade_date"], kind="mergesort")
+        .drop_duplicates(["product", "trade_date"], keep="first")
+        [["product", "trade_date", "expiry_spot", "source"]]
+    )
+
+
+def _load_product_spot_map(
+    data_dir: Path,
+    config: dict[str, Any],
+    available_dates: list[str],
+) -> pd.DataFrame:
+    path = _product_spot_map_path(data_dir, config)
+    if not path.exists():
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    spot_map = _normalize_product_spot_map(_read_csv(path))
+    if spot_map.empty:
+        return spot_map
+    research_source = spot_map["source"].astype(str).str.contains("report_slim|contract_shadow", regex=True).any()
+    allow_future = bool(
+        config.get("s1_rolling_product_spot_map_allow_future", False)
+        or config.get("s1_rolling_research_parity_spot_map", False)
+    )
+    if research_source and allow_future:
+        return spot_map
+    allowed = pd.to_datetime(pd.Series(available_dates), errors="coerce").dropna()
+    if allowed.empty:
+        return spot_map.iloc[0:0].copy()
+    return spot_map[spot_map["trade_date"].isin(set(allowed))].copy()
+
+
+def _build_product_spot_map_from_snapshots(
+    data_dir: Path,
+    available_dates: list[str],
+    snapshot_cache: dict[str, pd.DataFrame] | None,
+) -> pd.DataFrame:
+    parts = []
+    for spot_date in available_dates:
+        part = _daily_product_spot_map_from_snapshot(
+            _load_snapshot_cached(data_dir, spot_date, snapshot_cache),
+            spot_date,
+        )
+        if not part.empty:
+            parts.append(part)
+    if not parts:
+        return pd.DataFrame(columns=["product", "trade_date", "expiry_spot", "source"])
+    return _normalize_product_spot_map(pd.concat(parts, ignore_index=True, sort=False))
+
+
+def _upsert_product_spot_map(
+    data_dir: Path,
+    config: dict[str, Any],
+    current_snapshot: pd.DataFrame,
+    current_date: str,
+    *,
+    rebuild_from_snapshots: bool,
+    snapshot_cache: dict[str, pd.DataFrame] | None,
+) -> tuple[Path, int, bool, str]:
+    """Maintain the stored product spot map used by expiry-retention labels."""
+    path = _product_spot_map_path(data_dir, config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _normalize_product_spot_map(_read_csv(path))
+    allow_future = bool(
+        config.get("s1_rolling_product_spot_map_allow_future", False)
+        or config.get("s1_rolling_research_parity_spot_map", False)
+    )
+    readonly = bool(config.get("s1_rolling_product_spot_map_readonly", False))
+    if (
+        allow_future
+        and not existing.empty
+        and existing["source"].astype(str).str.contains("report_slim|contract_shadow", regex=True).any()
+    ):
+        readonly = True
+    if readonly:
+        return path, int(len(existing)), True, "readonly_existing_map"
+
+    if rebuild_from_snapshots or existing.empty:
+        available_dates = _available_snapshot_dates(data_dir)
+        updated = _build_product_spot_map_from_snapshots(data_dir, available_dates, snapshot_cache)
+    else:
+        daily = _daily_product_spot_map_from_snapshot(current_snapshot, current_date)
+        updated = _normalize_product_spot_map(pd.concat([existing, daily], ignore_index=True, sort=False))
+    write_csv(path, updated)
+    return path, int(len(updated)), False, "rebuilt_from_snapshots" if rebuild_from_snapshots else "upserted_daily_snapshot"
+
+
 def _available_snapshot_dates(data_dir: Path) -> list[str]:
     out = []
     for path in sorted((data_dir / "daily_snapshots").glob("option_chain_*.csv")):
@@ -1720,6 +1925,7 @@ def _mature_observation_labels(
     config: dict[str, Any],
     outcome_horizon: int,
     snapshot_cache: dict[str, pd.DataFrame] | None = None,
+    as_of_date: str | None = None,
 ) -> pd.DataFrame:
     """Update matured product-side outcome labels from stored daily snapshots."""
     if observations.empty:
@@ -1732,13 +1938,26 @@ def _mature_observation_labels(
     for col in LABEL_COLUMNS:
         if col not in out.columns:
             out[col] = np.nan
+    ready_cols = ["label_path5_ready", "label_path10_ready", "label_expiry_ready"]
+    for col in ready_cols:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    if "label_expiry_check_date" not in out.columns:
+        out["label_expiry_check_date"] = ""
     if "outcome_matured" not in out.columns:
         out["outcome_matured"] = 0
+    matured_flag = pd.to_numeric(out["outcome_matured"], errors="coerce").fillna(0).eq(1)
+    if bool(matured_flag.all()):
+        out["outcome_matured"] = 1
+        return out
     available_dates = _available_snapshot_dates(data_dir)
+    if as_of_date:
+        cutoff = str(as_of_date)[:10]
+        available_dates = [date for date in available_dates if date <= cutoff]
     if not available_dates:
         return out
     date_pos = {date: idx for idx, date in enumerate(available_dates)}
-    max_date = max(available_dates)
     stop_multiple = float(config.get("premium_stop_multiple", 2.5) or 2.5)
     contract_key_cache: dict[str, pd.DataFrame] = {}
     product_spot_map: pd.DataFrame | None = None
@@ -1752,45 +1971,10 @@ def _mature_observation_labels(
     def get_product_spot_map() -> pd.DataFrame:
         nonlocal product_spot_map
         if product_spot_map is None:
-            parts = []
-            for spot_date in available_dates:
-                part = load_contract_key(spot_date)
-                if part.empty or not {"product", "spot_close"}.issubset(part.columns):
-                    continue
-                keep_cols = ["product", "spot_close"] + (["dte"] if "dte" in part.columns else [])
-                spot_part = part[keep_cols].copy()
-                spot_part["trade_date"] = spot_date
-                parts.append(spot_part)
-            if parts:
-                spot_map = pd.concat(parts, ignore_index=True, sort=False)
-                spot_map["trade_date"] = pd.to_datetime(spot_map["trade_date"], errors="coerce")
-                spot_map["spot_close"] = pd.to_numeric(spot_map["spot_close"], errors="coerce")
-                spot_map = spot_map.dropna(subset=["product", "trade_date", "spot_close"]).copy()
-                if "dte" in spot_map.columns:
-                    spot_map["_dte"] = pd.to_numeric(spot_map["dte"], errors="coerce")
-                    candidate_spot = spot_map[
-                        spot_map["_dte"].between(1, FULL_SHADOW_MAX_DTE, inclusive="both")
-                    ].copy()
-                    if not candidate_spot.empty:
-                        product_spot_map = (
-                            candidate_spot.sort_values(
-                                ["product", "trade_date"],
-                                kind="mergesort",
-                            )
-                            .drop_duplicates(["product", "trade_date"], keep="first")
-                            .rename(columns={"spot_close": "expiry_spot"})
-                            [["product", "trade_date", "expiry_spot"]]
-                        )
-                    else:
-                        product_spot_map = pd.DataFrame(columns=["product", "trade_date", "expiry_spot"])
-                else:
-                    product_spot_map = (
-                        spot_map.groupby(["product", "trade_date"], as_index=False)
-                        .agg(expiry_spot=("spot_close", "median"))
-                        .sort_values(["product", "trade_date"], kind="mergesort")
-                    )
-            else:
-                product_spot_map = pd.DataFrame(columns=["product", "trade_date", "expiry_spot"])
+            product_spot_map = _load_product_spot_map(data_dir, config, available_dates)
+            if product_spot_map.empty:
+                product_spot_map = _build_product_spot_map_from_snapshots(data_dir, available_dates, snapshot_cache)
+            product_spot_map = product_spot_map[["product", "trade_date", "expiry_spot"]].copy()
         return product_spot_map
 
     for obs_date in sorted(out["date"].dropna().astype(str).unique()):
@@ -1805,6 +1989,23 @@ def _mature_observation_labels(
         already_matured = pd.to_numeric(out.loc[obs_mask, "outcome_matured"], errors="coerce").fillna(0).eq(1).all()
         if already_matured:
             continue
+        path5_already = pd.to_numeric(
+            out.loc[obs_mask, "label_path5_ready"], errors="coerce"
+        ).fillna(0).eq(1).all()
+        path10_already = pd.to_numeric(
+            out.loc[obs_mask, "label_path10_ready"], errors="coerce"
+        ).fillna(0).eq(1).all()
+        expiry_already = pd.to_numeric(
+            out.loc[obs_mask, "label_expiry_ready"], errors="coerce"
+        ).fillna(0).eq(1).all()
+        if path5_already and path10_already and expiry_already:
+            out.loc[out.index[obs_mask], "outcome_matured"] = 1
+            continue
+        if as_of_date and path5_already and path10_already and not expiry_already:
+            expiry_check = out.loc[obs_mask, "label_expiry_check_date"].dropna().astype(str)
+            expiry_check = expiry_check[expiry_check.str.len().ge(10)]
+            if not expiry_check.empty and str(as_of_date)[:10] < expiry_check.max()[:10]:
+                continue
 
         signal_snapshot = _load_snapshot_cached(data_dir, obs_date, snapshot_cache)
         entry_snapshot = _load_snapshot_cached(data_dir, entry_date, snapshot_cache)
@@ -1854,11 +2055,13 @@ def _mature_observation_labels(
 
         path_entry = entry[entry["_entry_price"].gt(0)].copy()
         entry_codes = pd.Index(path_entry["option_code"].dropna().astype(str).unique())
-        max_path_horizon = max(int(outcome_horizon), 5)
         future_5_max = pd.DataFrame(columns=["option_code", "future_5d_max_high"])
         future_max = pd.DataFrame(columns=["option_code", "future_max_high"])
         horizon_close = pd.DataFrame(columns=["option_code", "future_horizon_close"])
-        if not entry_codes.empty:
+        if path5_already and path10_already:
+            path5_ready = True
+            path10_ready = True
+        elif not entry_codes.empty:
             entry_expiry_by_code = pd.to_datetime(
                 path_entry.drop_duplicates("option_code").set_index("option_code")["expiry_date"],
                 errors="coerce",
@@ -1867,6 +2070,7 @@ def _mature_observation_labels(
             path_counts = pd.Series(0, index=entry_codes, dtype=int)
             path5_complete = pd.Series(False, index=entry_codes, dtype=bool)
             path_complete = pd.Series(False, index=entry_codes, dtype=bool)
+            max_path_horizon = 5 if path10_already else max(int(outcome_horizon), 5)
             for future_date in available_dates[entry_idx + 1:]:
                 part = load_contract_key(future_date)
                 if not part.empty:
@@ -1881,9 +2085,15 @@ def _mature_observation_labels(
                     ).astype(int)
                 future_ts = pd.Timestamp(future_date)
                 expired = entry_expiry_by_code.notna() & entry_expiry_by_code.le(future_ts)
-                path5_complete = path_counts.ge(5) | expired.fillna(False)
-                path_complete = path_counts.ge(max_path_horizon) | expired.fillna(False)
-                if bool(path_complete.all()):
+                if not path5_already:
+                    path5_complete = path_counts.ge(5) | expired.fillna(False)
+                else:
+                    path5_complete = pd.Series(True, index=entry_codes, dtype=bool)
+                if not path10_already:
+                    path_complete = path_counts.ge(max_path_horizon) | expired.fillna(False)
+                else:
+                    path_complete = pd.Series(True, index=entry_codes, dtype=bool)
+                if bool(path5_complete.all() and path_complete.all()):
                     break
             complete_codes_5 = pd.Index(path5_complete[path5_complete].index)
             complete_codes = pd.Index(path_complete[path_complete].index)
@@ -1913,8 +2123,8 @@ def _mature_observation_labels(
                             .tail(1)[["option_code", "vwap"]]
                             .rename(columns={"vwap": "future_horizon_close"})
                         )
-            path5_ready = bool(path5_complete.all())
-            path10_ready = bool(path_complete.all())
+            path5_ready = bool(path5_already or path5_complete.all())
+            path10_ready = bool(path10_already or path_complete.all())
         else:
             path5_ready = True
             path10_ready = True
@@ -1922,6 +2132,9 @@ def _mature_observation_labels(
             ["option_code", "product", "option_type", "strike", "multiplier", "expiry_date"]
         ].dropna(subset=["option_code", "product", "expiry_date"]).drop_duplicates("option_code").copy()
         expiry_candidates = expiry_candidates[expiry_candidates["expiry_date"].astype(str).str.len().ge(10)]
+        max_needed_expiry = pd.to_datetime(expiry_candidates["expiry_date"], errors="coerce").max()
+        if pd.notna(max_needed_expiry):
+            out.loc[out.index[obs_mask], "label_expiry_check_date"] = max_needed_expiry.strftime("%Y-%m-%d")
         expiry_labels = pd.DataFrame(
             columns=[
                 "option_code",
@@ -1932,13 +2145,13 @@ def _mature_observation_labels(
                 "expiry_spot_stale_days",
             ]
         )
-        if not expiry_candidates.empty:
-            max_needed_expiry = pd.to_datetime(expiry_candidates["expiry_date"], errors="coerce").max()
+        if expiry_already:
+            expiry_ready = True
+        elif not expiry_candidates.empty:
             spot_map_all = get_product_spot_map()
             if pd.notna(max_needed_expiry) and not spot_map_all.empty:
                 start_ts = pd.Timestamp(available_dates[start_idx])
-                max_ts = pd.Timestamp(max_date)
-                end_ts = min(pd.Timestamp(max_needed_expiry), max_ts)
+                end_ts = pd.Timestamp(max_needed_expiry)
                 spot_map = spot_map_all[
                     spot_map_all["trade_date"].between(start_ts, end_ts, inclusive="both")
                 ].copy()
@@ -1979,7 +2192,9 @@ def _mature_observation_labels(
                             "multiplier": "expiry_multiplier",
                         }
                     )
-        if expiry_candidates.empty:
+        if expiry_already:
+            expiry_ready = True
+        elif expiry_candidates.empty:
             expiry_ready = True
         else:
             expiry_ready_codes = set(
@@ -2078,6 +2293,12 @@ def _mature_observation_labels(
                     updates[col] = np.nan
         for col in LABEL_COLUMNS:
             out.loc[target_idx, col] = updates[col].where(updates[col].notna(), out.loc[target_idx, col])
+        if path5_ready:
+            out.loc[target_idx, "label_path5_ready"] = 1
+        if path10_ready:
+            out.loc[target_idx, "label_path10_ready"] = 1
+        if expiry_ready:
+            out.loc[target_idx, "label_expiry_ready"] = 1
         if path5_ready and path10_ready and expiry_ready:
             out.loc[target_idx, "outcome_matured"] = 1
         else:
@@ -2202,16 +2423,21 @@ def build_rolling_l1_admission(panel: pd.DataFrame, config: dict[str, Any], sign
     day = panel[panel["date"].astype(str).str[:10].eq(date)].copy()
     if day.empty:
         return day
-    hist = pd.to_numeric(day.get("historical_retention_score_bucket5_date"), errors="coerce")
-    tail = pd.to_numeric(day.get("tail_cluster_safety_score_bucket5_date"), errors="coerce")
-    min_hist = float(config.get("s1_l1_min_hist_bucket", 3) or 3)
-    min_tail = float(config.get("s1_l1_min_tail_bucket", 3) or 3)
-    day["l1_hist_bucket"] = hist
-    day["l1_tail_bucket"] = tail
-    day["l1_missing_panel"] = hist.isna() | tail.isna()
-    day["l1_pass_gate"] = hist.ge(min_hist) & tail.ge(min_tail) & ~day["l1_missing_panel"]
-    day["l1_min_hist_bucket"] = min_hist
-    day["l1_min_tail_bucket"] = min_tail
+    primary_col, secondary_col = l1_gate_bucket_columns(config)
+    primary = pd.to_numeric(day.get(primary_col), errors="coerce")
+    secondary = pd.to_numeric(day.get(secondary_col), errors="coerce")
+    min_primary = float(config.get("s1_l1_min_primary_bucket", 3) or 3)
+    min_secondary = float(config.get("s1_l1_min_secondary_bucket", 3) or 3)
+    day["l1_primary_bucket"] = primary
+    day["l1_secondary_bucket"] = secondary
+    day["l1_missing_panel"] = primary.isna() | secondary.isna()
+    day["l1_pass_gate"] = primary.ge(min_primary) & secondary.ge(min_secondary) & ~day["l1_missing_panel"]
+    day["l1_min_primary_bucket"] = min_primary
+    day["l1_min_secondary_bucket"] = min_secondary
+    day["l1_primary_bucket_col"] = primary_col
+    day["l1_secondary_bucket_col"] = secondary_col
+    day["l1_tail_bucket"] = primary
+    day["l1_hist_bucket"] = secondary
     return day
 
 
@@ -2234,6 +2460,7 @@ def update_rolling_product_side_panel(
     manifest_dir = data_dir / "manifests"
     contract_observation_path = product_side_dir / ROLLING_CONTRACT_OBSERVATION_FILE
     contract_fields_path = contract_shadow_dir / f"{CONTRACT_FIELDS_PREFIX}_{_date_tag(date)}.csv"
+    product_spot_map_path = _product_spot_map_path(data_dir, config)
     observation_path = product_side_dir / ROLLING_OBSERVATION_FILE
     panel_path = product_side_dir / ROLLING_PANEL_FILE
     admission_path = product_side_dir / f"{ROLLING_ADMISSION_PREFIX}_{_date_tag(date)}.csv"
@@ -2259,6 +2486,15 @@ def update_rolling_product_side_panel(
         contract_fields = _add_full_shadow_contract_fields(contract_observations)
         day_contract_fields = contract_fields[contract_fields["date"].astype(str).str[:10].eq(date)].copy()
 
+    spot_map_path, spot_map_rows, spot_map_readonly, spot_map_update_mode = _upsert_product_spot_map(
+        data_dir,
+        config,
+        l0_universe,
+        date,
+        rebuild_from_snapshots=bool(rebuild_contract_history or not product_spot_map_path.exists()),
+        snapshot_cache=snapshot_cache,
+    )
+
     existing = _read_csv(observation_path)
     exact_required_cols = [
         "avg_v3_base_b6_score",
@@ -2276,12 +2512,19 @@ def update_rolling_product_side_panel(
     else:
         new_observations = build_product_side_observations_from_contract_fields(day_contract_fields, config, date)
         observations = _upsert_by_key(existing, new_observations, ["date", "product", "option_type"])
-    observations = _mature_observation_labels(observations, data_dir, config, outcome_horizon, snapshot_cache)
+    observations = _mature_observation_labels(
+        observations,
+        data_dir,
+        config,
+        outcome_horizon,
+        snapshot_cache,
+        as_of_date=date,
+    )
     panel = _add_hist_and_scores(observations, hist_window)
     panel = ensure_l1_loader_columns(panel)
     admission = build_rolling_l1_admission(panel, config, date)
     matured_rows = int(pd.to_numeric(observations.get("outcome_matured", 0), errors="coerce").fillna(0).sum())
-    readiness = l1_loader_readiness(panel, date)
+    readiness = l1_loader_readiness(panel, date, config)
     coverage = scoring_feature_coverage(panel, date)
 
     if write_outputs:
@@ -2300,6 +2543,10 @@ def update_rolling_product_side_panel(
                 "contract_fields_rows": int(len(day_contract_fields)),
                 "reused_day_contract_fields": reused_day_contract_fields,
                 "rebuilt_contract_shadow_history": bool(rebuild_contract_history),
+                "product_spot_map_path": str(spot_map_path),
+                "product_spot_map_rows": int(spot_map_rows),
+                "product_spot_map_readonly": bool(spot_map_readonly),
+                "product_spot_map_update_mode": spot_map_update_mode,
                 "observation_rows": int(len(observations)),
                 "new_observation_rows": int(len(new_observations)),
                 "rebuilt_product_side_observation_history": bool(rebuild_observations),

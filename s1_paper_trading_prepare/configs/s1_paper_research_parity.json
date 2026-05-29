@@ -1,0 +1,9 @@
+{
+  "extends": "s1_paper_mainline.json",
+  "_research_parity_only": true,
+  "_research_parity_note": "Use only for locked-panel formula audits. Live paper trading must use s1_paper_mainline.json.",
+  "s1_rolling_product_spot_map_path": "s1_paper_trading_prepare/data/product_side_panel/rolling_product_spot_map.csv",
+  "s1_rolling_product_spot_map_readonly": true,
+  "s1_rolling_product_spot_map_allow_future": true,
+  "s1_rolling_research_parity_spot_map": true
+}
