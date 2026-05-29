@@ -30,6 +30,21 @@ def main() -> int:
     parser.add_argument("--products", default=None, help="Optional comma-separated product list.")
     parser.add_argument("--product-chunk-size", type=int, default=32, help="Products per Toolkit query chunk.")
     parser.add_argument("--force", action="store_true", help="Re-fetch existing date partitions from Toolkit.")
+    parser.add_argument(
+        "--prehistory-start-date",
+        default=None,
+        help="Fetch/reuse earlier snapshots for rolling contract-shadow warmup.",
+    )
+    parser.add_argument(
+        "--prehistory-end-date",
+        default=None,
+        help="Optional inclusive warmup end date; defaults to the day before the first signal date.",
+    )
+    parser.add_argument(
+        "--rebuild-contract-history",
+        action="store_true",
+        help="Rebuild rolling contract-shadow history from stored snapshots before scoring.",
+    )
     args = parser.parse_args()
 
     result = update_daily_data(
@@ -41,8 +56,20 @@ def main() -> int:
         products=parse_products(args.products),
         product_chunk_size=args.product_chunk_size,
         force=args.force,
+        prehistory_start_date=args.prehistory_start_date,
+        prehistory_end_date=args.prehistory_end_date,
+        rebuild_contract_history=args.rebuild_contract_history,
     )
     print(f"DATA_UPDATE_OK dates={len(result.dates)} last_signal_date={result.signal_date}")
+    print(f"prehistory_dates={len(result.prehistory_dates)}")
+    print(
+        "prehistory_fetched_dates="
+        f"{','.join(result.prehistory_fetched_dates) if result.prehistory_fetched_dates else '-'}"
+    )
+    print(
+        "prehistory_reused_dates="
+        f"{','.join(result.prehistory_reused_dates) if result.prehistory_reused_dates else '-'}"
+    )
     print(f"fetched_dates={','.join(result.fetched_dates) if result.fetched_dates else '-'}")
     print(f"reused_dates={','.join(result.reused_dates) if result.reused_dates else '-'}")
     print(f"snapshot_rows={result.snapshot_rows} path={result.snapshot_path}")

@@ -36,6 +36,7 @@ HAR_MIN_TRAIN = 80
 GARCH_ALPHA = 0.08
 GARCH_BETA = 0.90
 GARCH_LONG_WINDOW = 252
+SNAPSHOT_CACHE_MAX_DATES = 256
 MEAN_FEATURES = [
     "v3_contract_vrp_pct",
     "v3_contract_vrp_core",
@@ -134,6 +135,14 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.read_csv(path)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
+
+
+def _csv_has_rows(path: Path) -> bool:
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
+        _header = handle.readline()
+        return bool(handle.readline())
 
 
 def _upsert_by_key(existing: pd.DataFrame, new_rows: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
@@ -979,20 +988,17 @@ def _add_full_shadow_contract_fields(contract_observations: pd.DataFrame) -> pd.
     out = _add_iv_vrp_buckets(out)
     out = _add_disaster_score(out)
     out = _add_b6_proxy_scores(out)
-    eligible = pd.to_numeric(out.get("trade_eligible_flag"), errors="coerce").fillna(0.0).gt(0)
-    out["entry_volume"] = _safe_numeric(out, "entry_volume").where(eligible, 0.0)
-    out["entry_open_interest"] = _safe_numeric(out, "entry_open_interest").where(eligible, 0.0)
-    out["entry_premium_cash_1lot"] = _safe_numeric(out, "entry_premium_cash_1lot").where(eligible, 0.0)
-    out["v3_capacity_lots_10pct"] = _safe_numeric(out, "v3_capacity_lots_10pct").where(eligible, 0.0)
-    out["abs_delta"] = _safe_numeric(out, "abs_delta").where(eligible)
-    out["contract_iv"] = _safe_numeric(out, "contract_iv").where(eligible)
-    out["implied_vol"] = _safe_numeric(out, "implied_vol").where(eligible)
+    out["entry_volume"] = _safe_numeric(out, "entry_volume").fillna(0.0)
+    out["entry_open_interest"] = _safe_numeric(out, "entry_open_interest").fillna(0.0)
+    out["entry_premium_cash_1lot"] = _safe_numeric(out, "entry_premium_cash_1lot")
+    out["v3_capacity_lots_10pct"] = _safe_numeric(out, "v3_capacity_lots_10pct").fillna(0.0)
+    out["abs_delta"] = _safe_numeric(out, "abs_delta")
+    out["contract_iv"] = _safe_numeric(out, "contract_iv")
+    out["implied_vol"] = _safe_numeric(out, "implied_vol")
     for col in MEAN_FEATURES:
         if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").where(eligible)
-    out["oi_ge1000_flag"] = (
-        eligible & _safe_numeric(out, "entry_open_interest").ge(1000)
-    ).astype(float)
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["oi_ge1000_flag"] = _safe_numeric(out, "entry_open_interest").ge(1000).astype(float)
     out["oi_ge1000_premium_cash"] = out["entry_premium_cash_1lot"].where(out["oi_ge1000_flag"].eq(1.0), 0.0)
     out["capacity_premium_proxy"] = out["entry_premium_cash_1lot"].clip(lower=0.0) * out["v3_capacity_lots_10pct"].clip(lower=0.0)
     abs_delta = _safe_numeric(out, "abs_delta")
@@ -1041,17 +1047,17 @@ def _normalize_l0_for_research_aggregate(
     volume_cap = float(config.get("s1_entry_volume_limit_ratio", config.get("volume_limit_pct", 0.10)) or 0.10)
     out["trade_eligible_flag"] = eligible.astype(float)
     out["entry_price"] = price
-    out["entry_volume"] = volume.where(eligible, 0.0)
-    out["entry_open_interest"] = oi.where(eligible, 0.0)
-    out["entry_premium_cash_1lot"] = (price * multiplier).where(eligible, 0.0)
-    out["v3_capacity_lots_10pct"] = (volume * volume_cap).where(eligible, 0.0)
-    out["abs_delta"] = abs_delta.where(eligible)
-    out["contract_iv"] = implied_vol.where(eligible)
-    out["atm_iv"] = implied_vol.where(eligible)
+    out["entry_volume"] = volume
+    out["entry_open_interest"] = oi
+    out["entry_premium_cash_1lot"] = price * multiplier
+    out["v3_capacity_lots_10pct"] = volume * volume_cap
+    out["abs_delta"] = abs_delta
+    out["contract_iv"] = implied_vol
+    out["atm_iv"] = implied_vol
     out["spot_close"] = spot_close
-    out["v3_contract_vrp_pct"] = implied_vol.where(eligible)
-    out["v3_contract_vrp_core"] = implied_vol.where(eligible)
-    out["v3_vrp_quality_score"] = implied_vol.where(eligible)
+    out["v3_contract_vrp_pct"] = implied_vol
+    out["v3_contract_vrp_core"] = implied_vol
+    out["v3_vrp_quality_score"] = implied_vol
     out["v3_side_iv_pct"] = implied_vol
     out["v3_theta_per_vega"] = (-theta) / vega.replace(0, np.nan)
     out["v3_theta_per_gamma"] = (-theta) / gamma.abs().replace(0, np.nan)
@@ -1102,9 +1108,7 @@ def _normalize_l0_for_research_aggregate(
         out["v3_term_slope_front_second"] = np.nan
         out["v3_term_not_inverted"] = np.nan
 
-    out["oi_ge1000_flag"] = (
-        eligible & out["entry_open_interest"].ge(float(config.get("s1_min_oi", 1000) or 1000))
-    ).astype(float)
+    out["oi_ge1000_flag"] = out["entry_open_interest"].ge(float(config.get("s1_min_oi", 1000) or 1000)).astype(float)
     out["oi_ge1000_premium_cash"] = out["entry_premium_cash_1lot"].where(out["oi_ge1000_flag"].eq(1.0), 0.0)
     out["capacity_premium_proxy"] = (
         out["entry_premium_cash_1lot"].clip(lower=0.0)
@@ -1118,7 +1122,7 @@ def _normalize_l0_for_research_aggregate(
 
 def _research_aggregate_panel(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     agg: dict[str, tuple[str, str]] = {
-        "candidate_rows": ("trade_eligible_flag", "sum") if "trade_eligible_flag" in frame.columns else ("product", "size"),
+        "candidate_rows": ("product", "size"),
         "oi_ge1000_rows": ("oi_ge1000_flag", "sum"),
         "total_premium_pool_1lot": ("entry_premium_cash_1lot", "sum"),
         "oi_ge1000_premium_pool": ("oi_ge1000_premium_cash", "sum"),
@@ -1501,9 +1505,20 @@ def build_product_side_observations_from_contract_fields(
 
 
 def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
-    cols = [col for col in ["option_code", "trade_date", "option_close", "option_high", "expiry_date"] if col in snapshot.columns]
+    contract_cols = [
+        "option_code",
+        "trade_date",
+        "option_close",
+        "option_high",
+        "expiry_date",
+        "option_type",
+        "strike",
+        "spot_close",
+        "multiplier",
+    ]
+    cols = [col for col in contract_cols if col in snapshot.columns]
     if not cols:
-        return pd.DataFrame(columns=["option_code", "trade_date", "option_close", "option_high", "expiry_date"])
+        return pd.DataFrame(columns=contract_cols)
     out = snapshot[cols].copy()
     if "option_code" not in out.columns:
         out["option_code"] = ""
@@ -1522,6 +1537,11 @@ def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
         out["option_high"] = pd.to_numeric(out["option_high"], errors="coerce")
     if "expiry_date" in out.columns:
         out["expiry_date"] = out["expiry_date"].astype(str).str[:10]
+    if "option_type" in out.columns:
+        out["option_type"] = out["option_type"].astype(str).str.upper().str[:1]
+    for col in ["strike", "spot_close", "multiplier"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
 
 
@@ -1536,8 +1556,9 @@ def _load_snapshot_cached(data_dir: Path, date: str, snapshot_cache: dict[str, p
     key = str(date)[:10]
     if key not in snapshot_cache:
         snapshot_cache[key] = _load_snapshot_for_date(data_dir, key)
-        if len(snapshot_cache) > 32:
-            for old_key in sorted(snapshot_cache)[: len(snapshot_cache) - 32]:
+        if len(snapshot_cache) > SNAPSHOT_CACHE_MAX_DATES:
+            evictable = [old_key for old_key in sorted(snapshot_cache) if old_key != key]
+            for old_key in evictable[: len(snapshot_cache) - SNAPSHOT_CACHE_MAX_DATES]:
                 snapshot_cache.pop(old_key, None)
     return snapshot_cache[key]
 
@@ -1546,7 +1567,7 @@ def _available_snapshot_dates(data_dir: Path) -> list[str]:
     out = []
     for path in sorted((data_dir / "daily_snapshots").glob("option_chain_*.csv")):
         tag = path.stem.replace("option_chain_", "")
-        if len(tag) == 8 and tag.isdigit():
+        if len(tag) == 8 and tag.isdigit() and _csv_has_rows(path):
             out.append(f"{tag[:4]}-{tag[4:6]}-{tag[6:8]}")
     return out
 
@@ -1630,17 +1651,26 @@ def _mature_observation_labels(
         if entry.empty:
             continue
         entry["_entry_price"] = _safe_numeric(entry, "option_close")
+        if "expiry_date" in entry.columns:
+            entry["expiry_date"] = entry["expiry_date"].astype(str).str[:10]
+        else:
+            entry["expiry_date"] = ""
+        entry["_entry_multiplier"] = _safe_numeric(entry, "multiplier").fillna(1.0) if "multiplier" in entry.columns else 1.0
 
         future_5_dates = future_dates[: min(5, len(future_dates))]
-        future_5_parts = [
-            _contract_key_frame(_load_snapshot_cached(data_dir, date, snapshot_cache))
-            for date in future_5_dates
-        ]
+        future_5_parts = []
+        for future_date in future_5_dates:
+            part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
+            if not part.empty:
+                part["trade_date"] = future_date
+                future_5_parts.append(part)
         future_5 = pd.concat([part for part in future_5_parts if not part.empty], ignore_index=True, sort=False)
-        future_parts = [
-            _contract_key_frame(_load_snapshot_cached(data_dir, date, snapshot_cache))
-            for date in future_dates
-        ]
+        future_parts = []
+        for future_date in future_dates:
+            part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
+            if not part.empty:
+                part["trade_date"] = future_date
+                future_parts.append(part)
         future = pd.concat([part for part in future_parts if not part.empty], ignore_index=True, sort=False)
         if future.empty:
             continue
@@ -1651,18 +1681,92 @@ def _mature_observation_labels(
             ).reset_index()
         future_max = future.groupby("option_code").agg(
             future_max_high=("option_high", "max"),
-            future_last_close=("option_close", "last"),
         ).reset_index()
-        labeled = entry.merge(future_5_max, how="left", on="option_code").merge(future_max, how="left", on="option_code")
+        horizon_close = (
+            future[future["trade_date"].astype(str).str[:10].eq(future_dates[-1])]
+            .groupby("option_code", as_index=False)
+            .agg(future_horizon_close=("option_close", "last"))
+        )
+        expiry_candidates = entry[["option_code", "expiry_date"]].dropna().drop_duplicates("option_code").copy()
+        expiry_candidates = expiry_candidates[expiry_candidates["expiry_date"].astype(str).str.len().ge(10)]
+        expiry_labels = pd.DataFrame(
+            columns=["option_code", "expiry_option_type", "expiry_strike", "expiry_spot", "expiry_multiplier"]
+        )
+        if not expiry_candidates.empty:
+            max_needed_expiry = expiry_candidates["expiry_date"].max()
+            expiry_dates = [
+                future_date
+                for future_date in available_dates[start_idx + 1:]
+                if future_date <= max_needed_expiry and future_date <= max_date
+            ]
+            expiry_parts = []
+            for future_date in expiry_dates:
+                part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
+                if not part.empty:
+                    part["trade_date"] = future_date
+                    expiry_parts.append(part)
+            if expiry_parts:
+                expiry_tape = pd.concat(expiry_parts, ignore_index=True, sort=False)
+                expiry_tape = expiry_tape.merge(expiry_candidates, on="option_code", how="inner", suffixes=("", "_entry"))
+                expiry_tape = expiry_tape[
+                    expiry_tape["trade_date"].astype(str).str[:10].le(expiry_tape["expiry_date_entry"].astype(str).str[:10])
+                ].copy()
+                if not expiry_tape.empty:
+                    expiry_last = (
+                        expiry_tape.sort_values(["option_code", "trade_date"], kind="mergesort")
+                        .groupby("option_code", as_index=False)
+                        .tail(1)
+                    )
+                    expiry_labels = expiry_last[
+                        ["option_code", "option_type", "strike", "spot_close", "multiplier"]
+                    ].rename(
+                        columns={
+                            "option_type": "expiry_option_type",
+                            "strike": "expiry_strike",
+                            "spot_close": "expiry_spot",
+                            "multiplier": "expiry_multiplier",
+                        }
+                    )
+        labeled = (
+            entry.merge(future_5_max, how="left", on="option_code")
+            .merge(future_max, how="left", on="option_code")
+            .merge(horizon_close, how="left", on="option_code")
+            .merge(expiry_labels, how="left", on="option_code")
+        )
         max_high_5d = pd.to_numeric(labeled["future_5d_max_high"], errors="coerce")
         max_high = pd.to_numeric(labeled["future_max_high"], errors="coerce")
-        last_close = pd.to_numeric(labeled["future_last_close"], errors="coerce")
+        horizon_close_px = pd.to_numeric(labeled["future_horizon_close"], errors="coerce")
         entry_px = pd.to_numeric(labeled["_entry_price"], errors="coerce")
-        labeled["label_v3_stop_touch_5d"] = max_high_5d.ge(entry_px * stop_multiple).astype(float)
-        labeled["label_v3_stop_touch_10d"] = max_high.ge(entry_px * stop_multiple).astype(float)
-        labeled["label_v3_retention_10d"] = ((entry_px - last_close) / entry_px).clip(lower=0.0, upper=1.0)
-        labeled["label_v3_max_adverse_price_ratio_10d"] = ((max_high / entry_px) - 1.0).clip(lower=0.0)
-        labeled["label_v3_retention_to_expiry_clipped"] = labeled["label_v3_retention_10d"]
+        labeled["label_v3_stop_touch_5d"] = np.where(
+            max_high_5d.notna(),
+            max_high_5d.ge(entry_px * stop_multiple).astype(float),
+            np.nan,
+        )
+        labeled["label_v3_stop_touch_10d"] = np.where(
+            max_high.notna(),
+            max_high.ge(entry_px * stop_multiple).astype(float),
+            np.nan,
+        )
+        labeled["label_v3_retention_10d"] = 1.0 - horizon_close_px / entry_px
+        labeled["label_v3_max_adverse_price_ratio_10d"] = max_high / entry_px
+        expiry_spot = _safe_numeric(labeled, "expiry_spot")
+        expiry_strike = _safe_numeric(labeled, "expiry_strike")
+        expiry_multiplier = _safe_numeric(labeled, "expiry_multiplier")
+        expiry_multiplier = expiry_multiplier.where(expiry_multiplier.gt(0), labeled["_entry_multiplier"])
+        entry_multiplier = pd.to_numeric(labeled["_entry_multiplier"], errors="coerce").replace(0, np.nan)
+        entry_premium_cash = entry_px * entry_multiplier
+        expiry_type_source = labeled["expiry_option_type"] if "expiry_option_type" in labeled.columns else labeled["option_type"]
+        expiry_type = expiry_type_source.astype(str).str.upper().str[:1]
+        call_intrinsic = (expiry_spot - expiry_strike).clip(lower=0.0)
+        put_intrinsic = (expiry_strike - expiry_spot).clip(lower=0.0)
+        intrinsic = pd.Series(np.nan, index=labeled.index, dtype=float)
+        intrinsic.loc[expiry_type.eq("C")] = call_intrinsic.loc[expiry_type.eq("C")]
+        intrinsic.loc[expiry_type.eq("P")] = put_intrinsic.loc[expiry_type.eq("P")]
+        intrinsic_cash = intrinsic * expiry_multiplier
+        labeled["label_v3_retention_to_expiry_clipped"] = (
+            (entry_premium_cash - intrinsic_cash) / entry_premium_cash.replace(0, np.nan)
+        ).clip(lower=-3.0, upper=1.0)
+        labeled["label_v3_expire_otm_flag"] = intrinsic.le(1e-9).where(intrinsic.notna())
         product_daily = labeled.groupby("product", dropna=False).agg(
             product_stop_rate_5d=("label_v3_stop_touch_5d", "mean"),
         ).reset_index()
@@ -1841,6 +1945,7 @@ def update_rolling_product_side_panel(
     outcome_horizon: int = 10,
     write_outputs: bool = True,
     snapshot_cache: dict[str, pd.DataFrame] | None = None,
+    rebuild_contract_history: bool = False,
 ) -> RollingProductSideUpdateResult:
     """Upsert one date and refresh the full rolling S1 product-side panel."""
     date = str(signal_date)[:10]
@@ -1855,7 +1960,7 @@ def update_rolling_product_side_panel(
     manifest_path = manifest_dir / f"{ROLLING_MANIFEST_PREFIX}_{_date_tag(date)}.json"
 
     existing_contracts = _read_csv(contract_observation_path)
-    if existing_contracts.empty and (data_dir / "daily_snapshots").exists():
+    if (rebuild_contract_history or existing_contracts.empty) and (data_dir / "daily_snapshots").exists():
         existing_contracts = _bootstrap_contract_shadow_observations(data_dir, config, date)
     new_contracts = build_daily_contract_shadow_observations(l0_universe, config, date)
     contract_observations = _upsert_by_key(existing_contracts, new_contracts, ["date", "contract_code"])
@@ -1868,7 +1973,11 @@ def update_rolling_product_side_panel(
         "avg_v3_b6_plus_v3_score",
         "avg_underlying_har_garch_avg_rv_5d",
     ]
-    rebuild_observations = existing.empty or any(col not in existing.columns for col in exact_required_cols)
+    rebuild_observations = (
+        rebuild_contract_history
+        or existing.empty
+        or any(col not in existing.columns for col in exact_required_cols)
+    )
     if rebuild_observations:
         new_observations = build_product_side_observations_from_contract_fields(contract_fields, config)
         observations = new_observations.copy()
@@ -1896,6 +2005,7 @@ def update_rolling_product_side_panel(
                 "contract_observation_rows": int(len(contract_observations)),
                 "new_contract_observation_rows": int(len(new_contracts)),
                 "contract_fields_rows": int(len(day_contract_fields)),
+                "rebuilt_contract_shadow_history": bool(rebuild_contract_history),
                 "observation_rows": int(len(observations)),
                 "new_observation_rows": int(len(new_observations)),
                 "rebuilt_product_side_observation_history": bool(rebuild_observations),

@@ -19,6 +19,36 @@ The contract-shadow files are the audit layer for full-shadow V3/B6/VRP/regime
 fields.  They are computed only from stored Toolkit daily snapshots and prior
 snapshot history, then aggregated into the product-side panel.
 
+## Prehistory Warmup
+
+Full-shadow rolling percentiles and HAR inputs need history before the first
+formal tracking date.  Use `--prehistory-start-date` to fetch or reuse older
+Toolkit snapshots without writing formal L0/L1 partitions for those warmup
+dates:
+
+```powershell
+python .\s1_paper_trading_prepare\scripts\update_daily_data.py `
+  --signal-date 2022-04-01 `
+  --prehistory-start-date 2021-09-01 `
+  --rebuild-contract-history
+```
+
+The first formal signal date then rebuilds contract-shadow history once from all
+stored warmup and signal snapshots.  Later daily updates can omit
+`--rebuild-contract-history` and only append the new date.
+
+Latest h200 warmup check:
+
+```text
+signal_date: 2022-04-01
+prehistory_start_date: 2021-09-01
+prehistory_dates: 164
+rolling_panel_rows: 6970
+contract_shadow_observation_rows: 1421227
+research_scoring_missing_fields: []
+March 2022 rolling-vs-locked gate_match_rate: 93.27%
+```
+
 ## Loader Contract
 
 `rolling_product_side_panel.csv` is written with the columns required by the locked L1 loader:
@@ -41,6 +71,12 @@ The source aggregation keeps `option_type`; `side` is the loader-compatible alia
 ## No-Future Rule
 
 Outcome labels are updated only after enough stored future snapshots exist for the configured horizon.  Signal-day features use shifted rolling windows, so the current row's outcome is not included in its own score or bucket.
+
+The rolling label refresh uses the research convention for matured rows:
+
+- `retention_10d = 1 - T+10 close / entry_price`
+- `max_adverse_price_ratio_10d = max_future_high / entry_price`
+- expiry retention is written only after expiry can be observed from stored snapshots
 
 Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
 forecasts use the original research embargo: a signal date can train only on

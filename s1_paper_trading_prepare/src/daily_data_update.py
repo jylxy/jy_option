@@ -54,6 +54,9 @@ class DailyDataUpdateResult:
     rolling_matured_rows: int
     fetched_dates: list[str]
     reused_dates: list[str]
+    prehistory_dates: list[str]
+    prehistory_fetched_dates: list[str]
+    prehistory_reused_dates: list[str]
     partitions: list[DailyPartitionResult]
     meta: dict[str, Any]
 
@@ -72,6 +75,10 @@ def _count_csv_rows(path: Path) -> int:
     with path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
         rows = sum(1 for _ in handle)
     return max(rows - 1, 0)
+
+
+def _has_csv_rows(path: Path) -> bool:
+    return _count_csv_rows(path) > 0
 
 
 def _load_existing_csv(path: Path) -> pd.DataFrame:
@@ -179,9 +186,58 @@ def _available_stored_dates(data_dir: Path) -> list[str]:
     dates = []
     for path in sorted((data_dir / "daily_snapshots").glob("option_chain_*.csv")):
         tag = path.stem.replace("option_chain_", "")
-        if len(tag) == 8 and tag.isdigit():
+        if len(tag) == 8 and tag.isdigit() and _has_csv_rows(path):
             dates.append(f"{tag[:4]}-{tag[4:6]}-{tag[6:8]}")
     return dates
+
+
+def _snapshot_path_for_date(
+    data_dir: Path,
+    signal_date: str,
+    products: tuple[str, ...] | None,
+) -> Path:
+    return data_dir / "daily_snapshots" / f"option_chain_{_date_tag(signal_date, products)}.csv"
+
+
+def _load_or_fetch_snapshot(
+    signal_date: str,
+    *,
+    config_path: Path,
+    data_dir: Path,
+    products: tuple[str, ...] | None,
+    product_chunk_size: int,
+    force: bool,
+    write_outputs: bool,
+) -> tuple[str, pd.DataFrame, Path]:
+    snapshot_path = _snapshot_path_for_date(data_dir, signal_date, products)
+    if snapshot_path.exists() and not force:
+        return "reuse_existing_snapshot", _load_existing_csv(snapshot_path), snapshot_path
+    option_snapshot = load_signal_day_snapshot(
+        signal_date,
+        config_path,
+        products=products,
+        product_chunk_size=product_chunk_size,
+    )
+    if write_outputs and not option_snapshot.empty:
+        write_csv(snapshot_path, option_snapshot)
+    elif write_outputs and force and snapshot_path.exists():
+        snapshot_path.unlink()
+    return "fetch_from_toolkit", option_snapshot, snapshot_path
+
+
+def _resolve_prehistory_dates(
+    *,
+    prehistory_start_date: str | None,
+    prehistory_end_date: str | None,
+    first_signal_date: str,
+    data_dir: Path,
+) -> list[str]:
+    if not prehistory_start_date:
+        return []
+    end = str(prehistory_end_date or first_signal_date)[:10]
+    dates = _resolve_update_dates(None, prehistory_start_date, end, data_dir)
+    first = str(first_signal_date)[:10]
+    return [date for date in dates if date < first]
 
 
 def _write_store_index(index_path: Path, partitions: list[DailyPartitionResult], meta: dict[str, Any]) -> None:
@@ -231,6 +287,9 @@ def update_daily_data(
     products: tuple[str, ...] | None = None,
     product_chunk_size: int = 32,
     force: bool = False,
+    prehistory_start_date: str | None = None,
+    prehistory_end_date: str | None = None,
+    rebuild_contract_history: bool = False,
     write_outputs: bool = True,
 ) -> DailyDataUpdateResult:
     """Fetch and materialize the daily S1 input tables used by order generation.
@@ -244,12 +303,21 @@ def update_daily_data(
     out_dir = resolve_path(data_dir, default=DEFAULT_DATA_DIR)
     snapshot = load_effective_config(config_target)
     dates = _resolve_update_dates(signal_date, start_date, end_date, out_dir)
+    prehistory_dates = _resolve_prehistory_dates(
+        prehistory_start_date=prehistory_start_date,
+        prehistory_end_date=prehistory_end_date,
+        first_signal_date=dates[0],
+        data_dir=out_dir,
+    ) if dates else []
     locked_l1_panel = load_panel(snapshot.config)
     rolling_snapshot_cache: dict[str, pd.DataFrame] = {}
 
     base_meta = {
         "signal_date": dates[-1] if dates else None,
         "dates": dates,
+        "prehistory_dates": prehistory_dates,
+        "prehistory_start_date": prehistory_start_date,
+        "prehistory_end_date": prehistory_end_date,
         "config_path": str(snapshot.path),
         "config_sha256": snapshot.sha256,
         "strategy_version": snapshot.config.get("strategy_version"),
@@ -257,6 +325,7 @@ def update_daily_data(
         "products": list(products) if products else None,
         "product_chunk_size": int(product_chunk_size or 32),
         "force": bool(force),
+        "rebuild_contract_history": bool(rebuild_contract_history),
         "toolkit_sources": [
             "Toolkit option minute table via ToolkitDayLoader daily aggregation",
             "Toolkit futures/ETF spot tables via ToolkitDayLoader enrichment",
@@ -279,30 +348,46 @@ def update_daily_data(
     partitions: list[DailyPartitionResult] = []
     fetched_dates: list[str] = []
     reused_dates: list[str] = []
+    prehistory_fetched_dates: list[str] = []
+    prehistory_reused_dates: list[str] = []
     last_manifest: dict[str, Any] | None = None
 
-    for date in dates:
+    for date in prehistory_dates:
+        action, option_snapshot, _snapshot_path = _load_or_fetch_snapshot(
+            date,
+            config_path=snapshot.path,
+            data_dir=out_dir,
+            products=products,
+            product_chunk_size=product_chunk_size,
+            force=force,
+            write_outputs=write_outputs,
+        )
+        if action == "fetch_from_toolkit":
+            prehistory_fetched_dates.append(date)
+        else:
+            prehistory_reused_dates.append(date)
+        del option_snapshot
+
+    for index, date in enumerate(dates):
         tag = _date_tag(date, products)
-        snapshot_path = out_dir / "daily_snapshots" / f"option_chain_{tag}.csv"
+        snapshot_path = _snapshot_path_for_date(out_dir, date, products)
         l0_path = out_dir / "derived" / f"s1_l0_contract_universe_{tag}.csv"
         l1_path = out_dir / "product_side_panel" / f"l1_admission_{tag}.csv"
         manifest_path = out_dir / "manifests" / f"daily_data_update_{tag}.json"
 
-        if snapshot_path.exists() and not force:
-            action = "reuse_existing_snapshot"
-            option_snapshot = _load_existing_csv(snapshot_path)
-            reused_dates.append(date)
-        else:
-            action = "fetch_from_toolkit"
-            option_snapshot = load_signal_day_snapshot(
-                date,
-                snapshot.path,
-                products=products,
-                product_chunk_size=product_chunk_size,
-            )
+        action, option_snapshot, snapshot_path = _load_or_fetch_snapshot(
+            date,
+            config_path=snapshot.path,
+            data_dir=out_dir,
+            products=products,
+            product_chunk_size=product_chunk_size,
+            force=force,
+            write_outputs=write_outputs,
+        )
+        if action == "fetch_from_toolkit":
             fetched_dates.append(date)
-            if write_outputs:
-                write_csv(snapshot_path, option_snapshot)
+        else:
+            reused_dates.append(date)
 
         l0_universe = build_l0_contract_universe(option_snapshot, snapshot.config, date)
         l1_admission = audit_l1_admission_from_panel(date, snapshot.config, locked_l1_panel)
@@ -313,11 +398,17 @@ def update_daily_data(
             data_dir=out_dir,
             write_outputs=write_outputs,
             snapshot_cache=rolling_snapshot_cache,
+            rebuild_contract_history=bool(rebuild_contract_history or (prehistory_dates and index == 0)),
         )
         manifest = {
             **base_meta,
             "signal_date": date,
             "incremental_action": action,
+            "prehistory_action_summary": {
+                "dates": prehistory_dates,
+                "fetched_dates": prehistory_fetched_dates,
+                "reused_dates": prehistory_reused_dates,
+            },
             "materialized_tables": [
                 {
                     "name": "option_chain_daily_snapshot",
@@ -424,6 +515,9 @@ def update_daily_data(
         **(last_manifest or base_meta),
         "fetched_dates": fetched_dates,
         "reused_dates": reused_dates,
+        "prehistory_dates": prehistory_dates,
+        "prehistory_fetched_dates": prehistory_fetched_dates,
+        "prehistory_reused_dates": prehistory_reused_dates,
         "partition_count": len(partitions),
     }
 
@@ -444,6 +538,9 @@ def update_daily_data(
         rolling_matured_rows=last.rolling_matured_rows,
         fetched_dates=fetched_dates,
         reused_dates=reused_dates,
+        prehistory_dates=prehistory_dates,
+        prehistory_fetched_dates=prehistory_fetched_dates,
+        prehistory_reused_dates=prehistory_reused_dates,
         partitions=partitions,
         meta=meta,
     )

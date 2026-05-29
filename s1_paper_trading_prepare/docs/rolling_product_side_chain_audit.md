@@ -30,7 +30,7 @@ The current implementation fixes those costs:
 
 - Load the locked L1 panel once per update window.
 - Write each fetched snapshot once, using atomic CSV replacement.
-- Mature only newly eligible observation dates; keep a small snapshot cache for overlapping 10-day future windows.
+- Mature only newly eligible observation dates; keep a bounded snapshot cache for overlapping forward windows.
 - Default Toolkit product chunk size is now `32`, with `--product-chunk-size` still available for fallback.
 
 ## Measured Results
@@ -85,11 +85,19 @@ Toolkit snapshot carries enough information:
 - `add_rank_fields`: date, side-date, and sector-date rank/bucket outputs when
   the source fields are present.
 
-The 5-day product stop-cluster label now follows the full-shadow idea: after the
-future horizon is stored, each product is marked stopped if any of its contracts
-hit the stop threshold, then the product-side label receives the same-day count
-of other stopped products. This label is persisted only after the horizon is
-matured, and it enters signals only through a one-row-shifted rolling history.
+The outcome labels now follow the research label convention once the future
+horizon is stored:
+
+- `retention_10d = 1 - T+10 close / entry_price`, without clipping.
+- `max_adverse_price_ratio_10d = max_future_high / entry_price`.
+- the 5-day product stop-cluster label marks a product as stopped if any of its
+  contracts hit the stop threshold, then writes the same-day count of other
+  stopped products to each product-side row.
+- expiry retention is backfilled only after expiry is naturally observable in
+  stored snapshots, using expiry spot/intrinsic and clipping to `[-3, 1]`.
+
+These labels are persisted only after they are matured, and they enter signals
+only through shifted rolling history.
 
 The upstream full-shadow fields are now replayed before aggregation:
 
@@ -112,6 +120,7 @@ incremental contract-level history used to recompute rolling fields.
 | 2022-02-23 | 48 / 48 | 48 | 91.7% |
 | 2022-02-23..2022-03-18 | 894 / 894 | 894 | 90.5% |
 | 2022-03-01..2022-03-31 | 1144 / 1144 | 1144 | 91.1% |
+| 2022-03-01..2022-03-31, prehistory from 2021-09-01 | 1144 / 1144 | 1144 | 93.3% |
 
 After replaying the exact full-shadow fields from the available 2022 snapshots,
 the 2022-03-01..2022-03-31 window remains close at about 90.5% gate match:
@@ -125,7 +134,24 @@ gate_match_rate=0.9047202797202797
 
 The March mature-window comparison improved from about 74.5% gate match to
 about 91.1% after replacing the proxy tail feature with the product
-stop-cluster label.
+stop-cluster label.  After prehistory warmup, exact B6/VRP/regime aggregation,
+and research-style matured labels, the same March window reached:
+
+```text
+locked_rows=1144 rolling_rows=1144 overlap_rows=1144
+rolling_gate_ready_rows=1144
+diff_rows=534
+issues={'bucket_mismatch': 457, 'l1_gate_mismatch': 77}
+gate_match_rate=0.9326923076923077
+hist_bucket_match_rate=0.8094405594405595
+tail_bucket_match_rate=0.6713286713286714
+product_side_score_corr=0.831789174039538
+```
+
+For `2022-04-01`, the rolling manifest reported no missing research scoring
+fields.  Coverage was `100%` for B6 stress, GARCH, product-side scores, and
+L1 buckets; HAR and IV10 fields covered `44 / 48` product-side rows because a
+few product-side histories still lacked enough clean observations.
 
 ## Remaining Gap
 
@@ -144,6 +170,15 @@ intentionally unavailable until enough pre-signal training history exists.  In
 that early window, the full-shadow VRP core falls back to GARCH/RV20, matching
 the research fallback order without introducing future data.
 
-Next action is to add an initial prehistory backfill for the contract-shadow
-datamart, then rerun the same parity checks before switching order generation
-away from the locked mainline panel.
+The updater now supports that initial prehistory backfill through
+`--prehistory-start-date`.  Warmup dates only fetch or reuse Toolkit snapshots;
+the first formal signal date then rebuilds contract-shadow history once from all
+stored snapshots.  This keeps the HAR/VRP warmup auditable without creating
+formal daily order-generation partitions for prehistory dates.
+
+The remaining gap is now dominated by the candidate tape boundary.  On
+`2022-03-01`, locked `candidate_rows` averaged `110.6` per product-side, while
+rolling raw-chain aggregation averaged `204.0`.  The next action is to
+replicate the full-shadow research candidate-tape filter before aggregation,
+then rerun the same parity checks before switching order generation away from
+the locked mainline panel.
