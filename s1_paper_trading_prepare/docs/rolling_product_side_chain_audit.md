@@ -113,13 +113,21 @@ Toolkit snapshot carries enough information:
 The outcome labels now follow the research label convention once the future
 horizon is stored:
 
-- `retention_10d = 1 - T+10 close / entry_price`, without clipping.
-- `max_adverse_price_ratio_10d = max_future_high / entry_price`.
+- `retention_10d = 1 - T+10 close / entry_price`, where T+10 is the
+  contract's tenth valid daily observation after the T+1 entry date, without
+  clipping.
+- `max_adverse_price_ratio_10d = max_future_high / entry_price`, using the
+  same contract-observation path.
 - the 5-day product stop-cluster label marks a product as stopped if any of its
   contracts hit the stop threshold, then writes the same-day count of other
   stopped products to each product-side row.
-- expiry retention is backfilled only after expiry is naturally observable in
-  stored snapshots, using expiry spot/intrinsic and clipping to `[-3, 1]`.
+- signal-eligible contracts that are not T+1 entry-feasible stay in the
+  product-side aggregation with missing path labels. This matches the
+  full-shadow convention where an all-missing product stop rate is not a stop
+  event and therefore contributes a zero product stop-cluster label.
+- expiry retention is backfilled from a product-level expiry spot map with a
+  10-calendar-day backward asof tolerance, using expiry spot/intrinsic and
+  clipping to `[-3, 1]`.
 
 These labels are persisted only after they are matured, and they enter signals
 only through shifted rolling history.
@@ -148,6 +156,9 @@ incremental contract-level history used to recompute rolling fields.
 | 2022-03-01..2022-03-31, prehistory from 2021-09-01 | 1144 / 1144 | 1144 | 93.3% |
 | 2022-03-01..2022-03-31, DTE<=120 + T+1 labels + prehistory from 2021-07-01 | 1144 / 1144 | 1144 | 97.4% |
 | 2022-03-01..2022-03-31, plus Toolkit VWAP snapshot enrichment | 1144 / 1144 | 1144 | 96.6% |
+| 2022-03-01..2022-03-31, contract-observation path labels | 1144 / 1144 | 1144 | 98.6% |
+| 2022-03-01..2022-03-31, plus entry-infeasible candidates retained in cluster aggregation | 1144 / 1144 | 1144 | 99.8% |
+| 2022-03-01..2022-03-31, plus product-level expiry spot asof | 1144 / 1144 | 1144 | 99.8% |
 
 After replaying the full-shadow fields from the available 2022 snapshots,
 the 2022-03-01..2022-03-31 window initially remained close at about 90.5% gate match:
@@ -189,6 +200,32 @@ gate_match_rate=0.9659090909090909
 The VWAP change aligns the price source with the locked full-shadow tape, but it
 does not by itself eliminate the remaining label/bucket gap; the remaining
 audit still needs to isolate non-price label inputs.
+
+The non-price label audit then found two important full-shadow conventions:
+
+- Path labels use each contract's own next valid daily observations after the
+  T+1 entry date, not the next N global market dates. After this change, the
+  sample contract-level `v3_stop_touch_5d` and `v3_max_adverse_price_ratio_5d`
+  rows matched the locked enriched full-shadow tape to floating-point precision.
+- Entry-infeasible candidates remain in the aggregation. Their path labels are
+  missing, but the product stop-cluster flag is zero when the product has no
+  stopped feasible contracts. Keeping these rows reduced the March 2022 L1 gate
+  mismatch from 39 to 2. Replaying the product-level expiry spot asof convention
+  then reduced bucket-only differences slightly:
+
+```text
+locked_rows=1144 rolling_rows=1144 overlap_rows=1144
+rolling_gate_ready_rows=1144
+diff_rows=121
+issues={'bucket_mismatch': 119, 'l1_gate_mismatch': 2}
+gate_match_rate=0.9982517482517482
+```
+
+The remaining March L1 gate mismatches are both `ZN C` rows. They are driven by
+`hist_expiry_retention_63d` and current-day VRP/IV bucket boundaries. The locked
+offline panel has access to full future expiry outcomes, including later April
+and May 2022 expiry spots; the rolling paper panel must leave not-yet-observable
+expiry labels missing to avoid future leakage.
 
 The locked enriched full-shadow source and the rolling candidate tape now match
 exactly on `2022-03-01`: `5307 / 5307` contract rows and `48 / 48`

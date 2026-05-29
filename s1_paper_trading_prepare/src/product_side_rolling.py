@@ -1616,6 +1616,7 @@ def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
     contract_cols = [
         "option_code",
         "trade_date",
+        "product",
         "vwap",
         "option_close",
         "option_high",
@@ -1644,6 +1645,8 @@ def _contract_key_frame(snapshot: pd.DataFrame) -> pd.DataFrame:
         out["expiry_date"] = ""
     if "trade_date" in out.columns:
         out["trade_date"] = out["trade_date"].astype(str).str[:10]
+    if "product" in out.columns:
+        out["product"] = out["product"].astype(str).str.upper().str.strip()
     for col in ["vwap", "option_close", "option_high", "volume", "open_interest"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -1742,16 +1745,12 @@ def _mature_observation_labels(
             continue
         start_idx = date_pos[obs_date]
         entry_idx = start_idx + 1
-        end_idx = entry_idx + int(outcome_horizon)
-        if end_idx >= len(available_dates):
+        if entry_idx >= len(available_dates):
             continue
         entry_date = available_dates[entry_idx]
         obs_mask = out["date"].eq(obs_date)
         already_matured = pd.to_numeric(out.loc[obs_mask, "outcome_matured"], errors="coerce").fillna(0).eq(1).all()
         if already_matured:
-            continue
-        future_dates = available_dates[entry_idx + 1:end_idx + 1]
-        if not future_dates:
             continue
 
         signal_snapshot = _load_snapshot_cached(data_dir, obs_date, snapshot_cache)
@@ -1797,77 +1796,132 @@ def _mature_observation_labels(
         ]
         entry = entry.merge(entry_quotes[entry_quote_cols], on="option_code", how="left")
         entry["_entry_price"] = _safe_numeric(entry, "_entry_price")
-        entry = entry[entry["_entry_price"].gt(0)].copy()
-        if entry.empty:
-            continue
 
-        future_5_dates = future_dates[: min(5, len(future_dates))]
-        future_5_parts = []
-        for future_date in future_5_dates:
-            part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
-            if not part.empty:
-                part["trade_date"] = future_date
-                future_5_parts.append(part)
-        future_5 = pd.concat([part for part in future_5_parts if not part.empty], ignore_index=True, sort=False)
-        future_parts = []
-        for future_date in future_dates:
-            part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
-            if not part.empty:
-                part["trade_date"] = future_date
-                future_parts.append(part)
-        future = pd.concat([part for part in future_parts if not part.empty], ignore_index=True, sort=False)
-        if future.empty:
-            continue
+        path_entry = entry[entry["_entry_price"].gt(0)].copy()
+        entry_codes = pd.Index(path_entry["option_code"].dropna().astype(str).unique())
+        max_path_horizon = max(int(outcome_horizon), 5)
         future_5_max = pd.DataFrame(columns=["option_code", "future_5d_max_high"])
-        if not future_5.empty:
-            future_5_max = future_5.groupby("option_code").agg(
-                future_5d_max_high=("option_high", "max"),
-            ).reset_index()
-        future_max = future.groupby("option_code").agg(
-            future_max_high=("option_high", "max"),
-        ).reset_index()
-        horizon_close = (
-            future[future["trade_date"].astype(str).str[:10].eq(future_dates[-1])]
-            .groupby("option_code", as_index=False)
-            .agg(future_horizon_close=("vwap", "last"))
-        )
-        expiry_candidates = entry[["option_code", "expiry_date"]].dropna().drop_duplicates("option_code").copy()
+        future_max = pd.DataFrame(columns=["option_code", "future_max_high"])
+        horizon_close = pd.DataFrame(columns=["option_code", "future_horizon_close"])
+        if not entry_codes.empty:
+            entry_expiry_by_code = pd.to_datetime(
+                path_entry.drop_duplicates("option_code").set_index("option_code")["expiry_date"],
+                errors="coerce",
+            ).reindex(entry_codes)
+            future_parts = []
+            path_counts = pd.Series(0, index=entry_codes, dtype=int)
+            path_complete = pd.Series(False, index=entry_codes, dtype=bool)
+            for future_date in available_dates[entry_idx + 1:]:
+                part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
+                if not part.empty:
+                    part = part[part["option_code"].isin(entry_codes)].copy()
+                if not part.empty:
+                    part["trade_date"] = future_date
+                    future_parts.append(part)
+                    day_counts = part.drop_duplicates("option_code")["option_code"].value_counts()
+                    path_counts = path_counts.add(
+                        day_counts.reindex(entry_codes).fillna(0).astype(int),
+                        fill_value=0,
+                    ).astype(int)
+                future_ts = pd.Timestamp(future_date)
+                expired = entry_expiry_by_code.notna() & entry_expiry_by_code.le(future_ts)
+                path_complete = path_counts.ge(max_path_horizon) | expired.fillna(False)
+                if bool(path_complete.all()):
+                    break
+            complete_codes = pd.Index(path_complete[path_complete].index)
+            if future_parts and not complete_codes.empty:
+                future = pd.concat([part for part in future_parts if not part.empty], ignore_index=True, sort=False)
+                future = future[future["option_code"].isin(complete_codes)].copy()
+                if not future.empty:
+                    future = future.sort_values(["option_code", "trade_date"], kind="mergesort")
+                    future["_path_seq"] = future.groupby("option_code", sort=False).cumcount() + 1
+                    future_5 = future[future["_path_seq"].le(5)].copy()
+                    future_horizon = future[future["_path_seq"].le(int(outcome_horizon))].copy()
+                    if not future_5.empty:
+                        future_5_max = future_5.groupby("option_code").agg(
+                            future_5d_max_high=("option_high", "max"),
+                        ).reset_index()
+                    if not future_horizon.empty:
+                        future_max = future_horizon.groupby("option_code").agg(
+                            future_max_high=("option_high", "max"),
+                        ).reset_index()
+                        horizon_close = (
+                            future_horizon.sort_values(["option_code", "_path_seq"], kind="mergesort")
+                            .groupby("option_code", as_index=False)
+                            .tail(1)[["option_code", "vwap"]]
+                            .rename(columns={"vwap": "future_horizon_close"})
+                        )
+        expiry_candidates = path_entry[
+            ["option_code", "product", "option_type", "strike", "multiplier", "expiry_date"]
+        ].dropna(subset=["option_code", "product", "expiry_date"]).drop_duplicates("option_code").copy()
         expiry_candidates = expiry_candidates[expiry_candidates["expiry_date"].astype(str).str.len().ge(10)]
         expiry_labels = pd.DataFrame(
-            columns=["option_code", "expiry_option_type", "expiry_strike", "expiry_spot", "expiry_multiplier"]
+            columns=[
+                "option_code",
+                "expiry_option_type",
+                "expiry_strike",
+                "expiry_spot",
+                "expiry_multiplier",
+                "expiry_spot_stale_days",
+            ]
         )
         if not expiry_candidates.empty:
             max_needed_expiry = expiry_candidates["expiry_date"].max()
             expiry_dates = [
                 future_date
-                for future_date in available_dates[entry_idx + 1:]
+                for future_date in available_dates[start_idx:]
                 if future_date <= max_needed_expiry and future_date <= max_date
             ]
             expiry_parts = []
             for future_date in expiry_dates:
                 part = _contract_key_frame(_load_snapshot_cached(data_dir, future_date, snapshot_cache))
-                if not part.empty:
+                if not part.empty and {"product", "spot_close"}.issubset(part.columns):
                     part["trade_date"] = future_date
-                    expiry_parts.append(part)
+                    expiry_parts.append(part[["trade_date", "product", "spot_close"]])
             if expiry_parts:
-                expiry_tape = pd.concat(expiry_parts, ignore_index=True, sort=False)
-                expiry_tape = expiry_tape.merge(expiry_candidates, on="option_code", how="inner", suffixes=("", "_entry"))
-                expiry_tape = expiry_tape[
-                    expiry_tape["trade_date"].astype(str).str[:10].le(expiry_tape["expiry_date_entry"].astype(str).str[:10])
-                ].copy()
-                if not expiry_tape.empty:
-                    expiry_last = (
-                        expiry_tape.sort_values(["option_code", "trade_date"], kind="mergesort")
-                        .groupby("option_code", as_index=False)
-                        .tail(1)
+                spot_map = pd.concat(expiry_parts, ignore_index=True, sort=False)
+                spot_map["trade_date"] = pd.to_datetime(spot_map["trade_date"], errors="coerce")
+                spot_map["spot_close"] = pd.to_numeric(spot_map["spot_close"], errors="coerce")
+                spot_map = (
+                    spot_map.dropna(subset=["product", "trade_date", "spot_close"])
+                    .groupby(["product", "trade_date"], as_index=False)
+                    .agg(expiry_spot=("spot_close", "median"))
+                    .sort_values(["product", "trade_date"], kind="mergesort")
+                )
+                label_parts = []
+                candidates = expiry_candidates.copy()
+                candidates["expiry_date"] = pd.to_datetime(candidates["expiry_date"], errors="coerce")
+                candidates = candidates.dropna(subset=["expiry_date"])
+                for product, idx in candidates.groupby("product", sort=False).groups.items():
+                    right = spot_map[spot_map["product"].eq(product)][["trade_date", "expiry_spot"]]
+                    if right.empty:
+                        continue
+                    left = candidates.loc[idx].copy()
+                    left["_row"] = left.index
+                    merged = pd.merge_asof(
+                        left.sort_values("expiry_date", kind="mergesort"),
+                        right.sort_values("trade_date", kind="mergesort"),
+                        left_on="expiry_date",
+                        right_on="trade_date",
+                        direction="backward",
+                        tolerance=pd.Timedelta(days=10),
                     )
-                    expiry_labels = expiry_last[
-                        ["option_code", "option_type", "strike", "spot_close", "multiplier"]
+                    merged["expiry_spot_stale_days"] = (merged["expiry_date"] - merged["trade_date"]).dt.days
+                    label_parts.append(merged)
+                if label_parts:
+                    expiry_labels = pd.concat(label_parts, ignore_index=True, sort=False)[
+                        [
+                            "option_code",
+                            "option_type",
+                            "strike",
+                            "expiry_spot",
+                            "multiplier",
+                            "expiry_spot_stale_days",
+                        ]
                     ].rename(
                         columns={
                             "option_type": "expiry_option_type",
                             "strike": "expiry_strike",
-                            "spot_close": "expiry_spot",
                             "multiplier": "expiry_multiplier",
                         }
                     )
@@ -1945,13 +1999,7 @@ def _mature_observation_labels(
             out.loc[target_idx, col] = updates[col].where(updates[col].notna(), out.loc[target_idx, col])
         out.loc[target_idx, "outcome_matured"] = 1
 
-    out["outcome_matured"] = out["date"].astype(str).map(
-        lambda date: int(
-            date in date_pos
-            and date_pos[date] + 1 + int(outcome_horizon) < len(available_dates)
-            and max_date > date
-        )
-    )
+    out["outcome_matured"] = pd.to_numeric(out["outcome_matured"], errors="coerce").fillna(0).astype(int)
     return out
 
 

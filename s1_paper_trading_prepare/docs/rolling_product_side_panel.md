@@ -83,9 +83,10 @@ The rolling label refresh uses the research convention for matured rows:
 - `entry_price` is taken from the next stored trading snapshot, matching the T+1 research-entry convention.
 - the T+1 entry price uses Toolkit daily VWAP when available, matching the
   locked full-shadow research tape; close is only a missing-data fallback.
-- `retention_10d = 1 - exit_price / entry_price`, with the exit window beginning after that T+1 entry date.
-- `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured after that T+1 entry date.
-- expiry retention is written only after expiry can be observed from stored snapshots
+- `retention_10d = 1 - exit_price / entry_price`, with the exit window using the contract's next 10 valid daily observations after that T+1 entry date.
+- `max_adverse_price_ratio_10d = max_future_high / entry_price`, with highs measured over the contract's valid daily observations after that T+1 entry date.
+- contracts that are signal-eligible but not T+1 entry-feasible remain in the label aggregation with path labels as missing; this preserves the research product stop-cluster convention where all-missing stop rates map to a zero stop flag.
+- expiry retention uses a product-level expiry spot map with a 10-calendar-day backward asof tolerance, matching the report-slim full-shadow convention where available; labels whose expiry outcome is not yet observable remain missing.
 
 Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
 forecasts use the original research embargo: a signal date can train only on
