@@ -5,7 +5,16 @@ import sys
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-SKIP_DIRS = {"data", "output", "logs", "__pycache__", ".git", ".pytest_cache"}
+SKIP_DIRS = {
+    "data",
+    "data_pit",
+    "output",
+    "logs",
+    "state",
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+}
 
 
 def disallowed_tokens() -> list[str]:
