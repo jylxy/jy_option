@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import DEFAULT_PAPER_CONFIG, ensure_server_deploy_importable
+from .runtime_patches import install_s1_paper_runtime_patches
 
 
 RULE_KEYS = (
@@ -22,6 +23,15 @@ RULE_KEYS = (
     "s1_l1_min_primary_bucket",
     "s1_l1_min_secondary_bucket",
     "s1_l2_sort_weights",
+    "s1_l4_custom_score_enabled",
+    "s1_l4_custom_score_mode",
+    "s1_l4_custom_score_components",
+    "s1_l4_custom_keep_quantile",
+    "s1_l4_custom_gate_min_count",
+    "s1_l4_custom_gate_min_keep",
+    "s1_l4_custom_gate_missing_policy",
+    "s1_l4_custom_missing_score",
+    "s1_l4_product_side_fields",
     "s1_l1_sort_weights",
     "s1_l1_budget_multipliers",
     "s1_l3_product_side_ledger_enabled",
@@ -94,6 +104,7 @@ def apply_primary_strategy_only(config: dict[str, Any]) -> dict[str, Any]:
 def load_effective_config(config_path: str | Path | None = None) -> ConfigSnapshot:
     """Load the engine config exactly as the backtest engine loads it."""
     ensure_server_deploy_importable()
+    install_s1_paper_runtime_patches()
     from config_loader import load_engine_config
     from strategy_rules import DEFAULT_PARAMS
 

@@ -75,6 +75,12 @@ March 2022 research-parity check after future snapshots and maturity fix:
 - `tail_cluster_safety_score`
 - `tail_cluster_safety_score_rank_date`
 - `tail_cluster_safety_score_bucket5_date`
+- `premium_quality_score`
+- `avg_v3_contract_vrp_pct`
+- `capacity_premium_density`
+- `avg_v3_b6_premium_to_iv10_rank`
+- `neg_side_signed_pc_same_delta_log_price_ratio`
+- `side_signed_log_pc_side_total_oi`
 - `product_side_score`
 - `product_side_score_rank_date`
 - `avg_v3_b6_premium_to_stress_rank`
@@ -109,6 +115,12 @@ stored.
 Full-shadow rolling percentiles and z-scores also use prior dates only.  HAR
 forecasts use the original research embargo: a signal date can train only on
 targets whose forward horizon has already ended before that signal date.
+
+`opt_side_turnover_z60` is still computed as a research candidate factor, but it
+is no longer part of the current deployed L4 contract gate.  The current L4
+risk-buffer gate uses contract-level V3/B6 fields from the stored T snapshot:
+`v3_b6_premium_to_stress_rank`, `v3_b6_premium_to_iv10_rank`, and
+`v3_base_b6_score`.
 
 When exact `underlying_code` history is too short for HAR/VRP/regime fields,
 the updater now fills missing history features from the same product's stored

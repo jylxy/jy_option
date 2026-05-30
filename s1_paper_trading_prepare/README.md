@@ -33,9 +33,10 @@ config_s1_mainline_current.json
 Mainline rule summary:
 
 ```text
-L1 product-side gate: historical_retention_score_bucket5_date >= Q3
-L1 product-side gate: tail_cluster_safety_score_bucket5_date >= Q3
+L1 product-side gate: tail_cluster_safety_score_bucket5_date >= Q4
+L2 product-side score: risk-top4 clean factors 50% + same-delta P/C price 30% + side-signed P/C OI 20%
 L3 product-side ledger: enabled, no forced rebudget of failed sides
+L4 contract gate: risk-buffer score drops the bottom 20% when enough candidates exist, then keeps original B6/delta-band ranking
 Contract OI: >= 1000
 Total entry premium cap: 2.5% NAV
 Bucket/corr-group entry premium cap: 0.8% NAV

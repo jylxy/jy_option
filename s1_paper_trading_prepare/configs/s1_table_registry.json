@@ -1,7 +1,7 @@
 {
   "registry_version": "2026-05-29",
   "scope": "S1 paper-trading preparation only",
-  "current_mainline": "s1_sim_l1_tail_q3_trend_safe_q3_l2_clean6_20260530",
+  "current_mainline": "s1_sim_l1_tail_q4_l2_risk_top4clean_pcprice_oi_l4_riskbuffer_20260530",
   "tables": [
     {
       "name": "option_chain_daily_snapshot",
@@ -40,15 +40,28 @@
         "avg_v3_trend_breakout_score_safe",
         "avg_v3_trend_breakout_score_safe_rank_date",
         "avg_v3_trend_breakout_score_safe_bucket5_date",
+        "tail_clean6_soft_score",
+        "tail_clean6_soft_score_rank_date",
+        "tail_clean6_soft_score_bucket5_date",
         "premium_quality_score",
         "avg_v3_contract_vrp_pct",
-        "avg_implied_vol",
         "capacity_premium_density",
         "avg_v3_b6_premium_to_iv10_rank",
-        "far_002_006_delta_share",
+        "neg_side_signed_pc_same_delta_log_price_ratio",
+        "side_signed_log_pc_side_total_oi",
         "product_side_score",
         "product_side_score_rank_date",
         "avg_v3_b6_premium_to_stress_rank"
+      ],
+      "research_candidate_factor_columns": [
+        "iv_pos_rev10_logchg",
+        "iv_pos_rev10_logchg_rank_date",
+        "iv_pos_rev10_logchg_bucket5_date",
+        "iv_pos_rev10_th5_event",
+        "iv_pos_rev10_th5_event_rank_date",
+        "iv_pos_rev10_th5_event_bucket5_date",
+        "iv_pos_rev10_th5_short_iv_sign",
+        "opt_side_turnover_z60"
       ],
       "paper_path": "data/product_side_panel/rolling_product_side_panel.csv",
       "paper_action": "Maintain a rolling, point-in-time replacement from stored Toolkit snapshots. Keep the locked research panel only as a parity baseline until the rolling replacement is approved."

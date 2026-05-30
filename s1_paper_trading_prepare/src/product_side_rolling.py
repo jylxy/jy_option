@@ -32,6 +32,9 @@ CATEGORY_FIELDS = ["sector", "portfolio_bucket", "corr_group"]
 FULL_SHADOW_ROLLING_WINDOW = 252
 FULL_SHADOW_MIN_OBS = 60
 FULL_SHADOW_MAX_DTE = 120
+PC_SAME_DELTA_BIN_WIDTH = 0.02
+PC_SAME_DELTA_MIN_PAIR_WEIGHT = 1e-12
+OPT_SIDE_TURNOVER_Z60_COL = "opt_side_turnover_z60"
 HAR_HORIZON = 5
 HAR_TRAIN_WINDOW = 500
 HAR_MIN_TRAIN = 80
@@ -60,6 +63,7 @@ MEAN_FEATURES = [
     "v3_base_b6_score",
     "v3_b6_plus_v3_score",
     "v3_delta_ladder_score",
+    "pc_same_delta_log_price_ratio",
     "underlying_trend_z_20d",
     "underlying_rv_ratio_5_20",
     "underlying_rv_accel_5_20",
@@ -109,13 +113,24 @@ L1_PANEL_REQUIRED_COLUMNS = [
     "capacity_premium_density",
     "avg_v3_b6_premium_to_iv10_rank",
     "far_002_006_delta_share",
+    "neg_side_signed_pc_same_delta_log_price_ratio",
+    "side_signed_log_pc_side_total_oi",
     "product_side_score",
     "product_side_score_rank_date",
+    "tail_clean6_soft_score",
+    "tail_clean6_soft_score_rank_date",
+    "tail_clean6_soft_score_bucket5_date",
     "avg_v3_b6_premium_to_stress_rank",
 ]
 TREND_BREAKOUT_SAFE_COL = "avg_v3_trend_breakout_score_safe"
 TREND_BREAKOUT_SAFE_RANK_COL = f"{TREND_BREAKOUT_SAFE_COL}_rank_date"
 TREND_BREAKOUT_SAFE_BUCKET_COL = f"{TREND_BREAKOUT_SAFE_COL}_bucket5_date"
+TAIL_CLEAN6_SOFT_SCORE_COL = "tail_clean6_soft_score"
+IV_POS_REV10_WINDOW_DAYS = 10
+IV_POS_REV10_THRESHOLD_LOG = 0.05
+IV_POS_REV10_LOGCHG_COL = "iv_pos_rev10_logchg"
+IV_POS_REV10_EVENT_COL = "iv_pos_rev10_th5_event"
+IV_POS_REV10_SHORT_SIGN_COL = "iv_pos_rev10_th5_short_iv_sign"
 
 
 @dataclass(frozen=True)
@@ -727,6 +742,92 @@ def _add_side_surface_features(contract: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _add_pc_same_delta_pair_features(contract: pd.DataFrame) -> pd.DataFrame:
+    """Add same-day P/C price-ratio features matched by product, expiry, and delta bin."""
+    if contract.empty:
+        return contract
+    required = {"date", "product", "option_type", "expiry_date", "entry_price", "abs_delta"}
+    out = contract.copy()
+    out["pc_same_delta_log_price_ratio"] = np.nan
+    out["pc_same_delta_pair_weight"] = np.nan
+    out["pc_same_delta_valid_pair_count"] = np.nan
+    if not required.issubset(out.columns):
+        return out
+
+    part = out[
+        out["expiry_date"].notna()
+        & out["option_type"].isin(["C", "P"])
+        & pd.to_numeric(out["abs_delta"], errors="coerce").between(0.02, 0.50, inclusive="both")
+    ].copy()
+    if part.empty:
+        return out
+
+    part["_delta_bin"] = (
+        np.floor(pd.to_numeric(part["abs_delta"], errors="coerce") / PC_SAME_DELTA_BIN_WIDTH)
+        * PC_SAME_DELTA_BIN_WIDTH
+    ).round(4)
+    price = pd.to_numeric(part["entry_price"], errors="coerce")
+    if "multiplier" in part.columns:
+        multiplier = pd.to_numeric(part["multiplier"], errors="coerce").fillna(1.0)
+    else:
+        multiplier = pd.Series(1.0, index=part.index)
+    weight = (price * multiplier).clip(lower=0.0)
+    weight = weight.where(weight.gt(0), price.clip(lower=0.0))
+    part["_pair_weight"] = weight.where(weight.gt(0), 1.0)
+    part["_price_wsum"] = price * part["_pair_weight"]
+
+    side_sum = (
+        part.groupby(["date", "product", "expiry_date", "_delta_bin", "option_type"], dropna=False)
+        .agg(pair_side_weight=("_pair_weight", "sum"), pair_price_wsum=("_price_wsum", "sum"))
+        .reset_index()
+    )
+    side_sum["pair_price"] = side_sum["pair_price_wsum"] / side_sum["pair_side_weight"].replace(0, np.nan)
+    wide = side_sum.pivot_table(
+        index=["date", "product", "expiry_date", "_delta_bin"],
+        columns="option_type",
+        values=["pair_side_weight", "pair_price"],
+        aggfunc="first",
+    )
+    wide.columns = [f"{left}_{right}" for left, right in wide.columns]
+    wide = wide.reset_index()
+    if "pair_side_weight_P" not in wide.columns or "pair_side_weight_C" not in wide.columns:
+        return out
+
+    wide["pc_same_delta_pair_weight"] = np.minimum(wide["pair_side_weight_P"], wide["pair_side_weight_C"])
+    valid = wide["pc_same_delta_pair_weight"].gt(PC_SAME_DELTA_MIN_PAIR_WEIGHT)
+    price_p = (
+        pd.to_numeric(wide["pair_price_P"], errors="coerce")
+        if "pair_price_P" in wide.columns
+        else pd.Series(np.nan, index=wide.index)
+    )
+    price_c = (
+        pd.to_numeric(wide["pair_price_C"], errors="coerce")
+        if "pair_price_C" in wide.columns
+        else pd.Series(np.nan, index=wide.index)
+    )
+    wide["pc_same_delta_log_price_ratio"] = np.log(price_p / price_c.replace(0, np.nan))
+    pair = wide[valid & wide["pc_same_delta_log_price_ratio"].notna()].copy()
+    if pair.empty:
+        return out
+
+    pair["_weighted_log_price_ratio"] = pair["pc_same_delta_log_price_ratio"] * pair["pc_same_delta_pair_weight"]
+    product_pair = (
+        pair.groupby(["date", "product"], dropna=False)
+        .agg(
+            _weighted_log_price_ratio=("_weighted_log_price_ratio", "sum"),
+            pc_same_delta_pair_weight=("pc_same_delta_pair_weight", "sum"),
+            pc_same_delta_valid_pair_count=("pc_same_delta_pair_weight", "size"),
+        )
+        .reset_index()
+    )
+    product_pair["pc_same_delta_log_price_ratio"] = (
+        product_pair["_weighted_log_price_ratio"] / product_pair["pc_same_delta_pair_weight"].replace(0, np.nan)
+    )
+    product_pair = product_pair.drop(columns=["_weighted_log_price_ratio"])
+    out = out.drop(columns=["pc_same_delta_log_price_ratio", "pc_same_delta_pair_weight", "pc_same_delta_valid_pair_count"], errors="ignore")
+    return out.merge(product_pair, on=["date", "product"], how="left")
+
+
 def _add_contract_derived_features(contract: pd.DataFrame) -> pd.DataFrame:
     out = contract.copy()
     contract_iv = _safe_numeric(out, "contract_iv")
@@ -1118,6 +1219,7 @@ def _add_full_shadow_contract_fields(contract_observations: pd.DataFrame) -> pd.
     abs_delta = _safe_numeric(out, "abs_delta")
     for name, lo, hi in DELTA_BUCKETS:
         out[name] = ((abs_delta >= lo) & (abs_delta < hi)).astype(int)
+    out = _add_pc_same_delta_pair_features(out)
     out["side"] = out["option_type"]
     return out
 
@@ -1298,6 +1400,15 @@ def _research_add_derived_factors(panel: pd.DataFrame, side_level: bool) -> pd.D
     out["capacity_premium_density"] = capacity_pool / rows
     out["open_interest_per_candidate"] = total_oi / rows
     out["volume_oi_ratio"] = total_volume / total_oi
+    if side_level and {"date", "product", "side", "volume_oi_ratio"}.issubset(out.columns):
+        sort_cols = ["product", "side", "date"]
+        work = out.sort_values(sort_cols).copy()
+        turnover = pd.to_numeric(work["volume_oi_ratio"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        groups = turnover.groupby([work["product"], work["side"]], dropna=False)
+        rolling_mean = groups.transform(lambda series: series.rolling(60, min_periods=15).mean())
+        rolling_std = groups.transform(lambda series: series.rolling(60, min_periods=15).std(ddof=0))
+        z60 = (turnover - rolling_mean) / rolling_std.replace(0, np.nan)
+        out[OPT_SIDE_TURNOVER_Z60_COL] = z60.reindex(out.index)
 
     bucket_cols = [name for name, _, _ in DELTA_BUCKETS if name in out.columns]
     if bucket_cols:
@@ -1318,6 +1429,41 @@ def _research_add_derived_factors(panel: pd.DataFrame, side_level: bool) -> pd.D
         out["wing_iv_premium_to_atm"] = pd.to_numeric(out["avg_contract_iv"], errors="coerce") - pd.to_numeric(
             out["avg_atm_iv"], errors="coerce"
         )
+    if side_level and "avg_implied_vol" in out.columns:
+        sort_cols = ["product", "side", "date"] if "side" in out.columns else ["product", "date"]
+        work = out.sort_values(sort_cols).copy()
+        side_iv = pd.to_numeric(work["avg_implied_vol"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        group_keys = [work["product"], work["side"]] if "side" in work.columns else [work["product"]]
+        base_iv = side_iv.groupby(group_keys, dropna=False).shift(IV_POS_REV10_WINDOW_DAYS)
+        valid_iv = side_iv.gt(0) & base_iv.gt(0)
+        logchg = pd.Series(np.nan, index=work.index, dtype="float64")
+        logchg.loc[valid_iv] = np.log(side_iv.loc[valid_iv] / base_iv.loc[valid_iv])
+        event = logchg.ge(IV_POS_REV10_THRESHOLD_LOG).astype(float).where(logchg.notna(), np.nan)
+        out[IV_POS_REV10_LOGCHG_COL] = logchg.reindex(out.index)
+        out[IV_POS_REV10_EVENT_COL] = event.reindex(out.index)
+        out[IV_POS_REV10_SHORT_SIGN_COL] = -out[IV_POS_REV10_EVENT_COL]
+
+    if side_level and {"date", "product", "side", "total_open_interest"}.issubset(out.columns):
+        oi_wide = out.pivot_table(
+            index=["date", "product"],
+            columns="side",
+            values="total_open_interest",
+            aggfunc="first",
+        ).reset_index()
+        oi_p = pd.to_numeric(oi_wide["P"], errors="coerce") if "P" in oi_wide.columns else pd.Series(np.nan, index=oi_wide.index)
+        oi_c = pd.to_numeric(oi_wide["C"], errors="coerce") if "C" in oi_wide.columns else pd.Series(np.nan, index=oi_wide.index)
+        oi_wide["log_pc_side_total_oi"] = np.log(oi_p / oi_c.replace(0, np.nan))
+        out = out.merge(oi_wide[["date", "product", "log_pc_side_total_oi"]], on=["date", "product"], how="left")
+        sign = np.where(out["side"].eq("P"), 1.0, -1.0)
+        out["side_signed_log_pc_side_total_oi"] = sign * pd.to_numeric(out["log_pc_side_total_oi"], errors="coerce")
+
+    if side_level and "avg_pc_same_delta_log_price_ratio" in out.columns:
+        sign = np.where(out["side"].eq("P"), 1.0, -1.0)
+        out["side_signed_pc_same_delta_log_price_ratio"] = sign * pd.to_numeric(
+            out["avg_pc_same_delta_log_price_ratio"],
+            errors="coerce",
+        )
+        out["neg_side_signed_pc_same_delta_log_price_ratio"] = -out["side_signed_pc_same_delta_log_price_ratio"]
 
     if "avg_underlying_trend_z_20d" in out.columns:
         out["abs_trend_z_20d"] = pd.to_numeric(out["avg_underlying_trend_z_20d"], errors="coerce").abs()
@@ -1356,6 +1502,7 @@ def _research_add_rank_fields(panel: pd.DataFrame, side_level: bool) -> pd.DataF
         "tail_cluster_safety_score",
         "product_side_score",
         "product_score",
+        TAIL_CLEAN6_SOFT_SCORE_COL,
         "delta_ladder_depth_score",
         "iv_dulling_score",
         "premium_density_score",
@@ -1372,6 +1519,12 @@ def _research_add_rank_fields(panel: pd.DataFrame, side_level: bool) -> pd.DataF
         "avg_v3_b6_theta_vega_rank",
         "avg_v3_b6_premium_to_stress_rank",
         "far_002_006_delta_share",
+        OPT_SIDE_TURNOVER_Z60_COL,
+        "side_signed_log_pc_side_total_oi",
+        "neg_side_signed_pc_same_delta_log_price_ratio",
+        IV_POS_REV10_LOGCHG_COL,
+        IV_POS_REV10_EVENT_COL,
+        IV_POS_REV10_SHORT_SIGN_COL,
         TREND_BREAKOUT_SAFE_COL,
     ]
     for col in rank_cols:
@@ -1602,6 +1755,9 @@ def scoring_feature_coverage(panel: pd.DataFrame, signal_date: str) -> dict[str,
         "avg_underlying_har_garch_avg_rv_5d",
         "avg_v3_side_iv_change_3d",
         "avg_v3_side_skew_change_3d",
+        OPT_SIDE_TURNOVER_Z60_COL,
+        "side_signed_log_pc_side_total_oi",
+        "neg_side_signed_pc_same_delta_log_price_ratio",
     ]
     coverage = {}
     missing = []
@@ -2412,6 +2568,23 @@ def _add_hist_and_scores(observations: pd.DataFrame, hist_window: int) -> pd.Dat
         cluster_penalty = _rank_by_date(out, "hist_stop_cluster_63d", higher_good=False)
         out["tail_cluster_safety_score"] = cluster_penalty
         out["product_side_score"] = 0.90 * out["product_side_score"] + 0.10 * cluster_penalty
+    tail_clean6_components: dict[str, pd.Series] = {}
+    if "tail_cluster_safety_score" in out:
+        tail_clean6_components["tail"] = _rank_by_date(out, "tail_cluster_safety_score")
+    for name, col in [
+        ("premium", "premium_quality_score"),
+        ("vrp_pct", "avg_v3_contract_vrp_pct"),
+        ("iv", "avg_implied_vol"),
+        ("capacity_density", "capacity_premium_density"),
+        ("premium_iv10", "avg_v3_b6_premium_to_iv10_rank"),
+        ("far_delta", "far_002_006_delta_share"),
+    ]:
+        if col in out:
+            tail_clean6_components[name] = _rank_by_date(out, col)
+    out[TAIL_CLEAN6_SOFT_SCORE_COL] = _mean_existing(
+        pd.DataFrame(tail_clean6_components, index=out.index),
+        list(tail_clean6_components),
+    )
     if "delta_ladder_depth_score_raw" in out:
         out["delta_ladder_depth_score"] = _rank_by_date(out, "delta_ladder_depth_score_raw")
     if "iv_dulling_raw" in out:
