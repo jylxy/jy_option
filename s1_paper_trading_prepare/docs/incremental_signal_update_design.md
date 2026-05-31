@@ -1,0 +1,116 @@
+# Incremental Signal Update Design
+
+This note defines the production path for keeping
+`data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv`
+fresh without rerunning the full historical backtest every day.
+
+## Objective
+
+Daily paper trading should:
+
+1. Fetch only the missing Toolkit daily partition for signal date `T`.
+2. Append or refresh point-in-time intermediate panels through `T`.
+3. Generate only `T` external-intent rows.
+4. Replace rows where `entry_date == T` in the external-intent schedule.
+5. Generate `T+1` planned orders from the schedule.
+
+The order generator remains a lookup reader. The signal updater owns all
+factor refresh, candidate generation, sizing, and audit.
+
+## Canonical Historical Reference
+
+The current committed schedule is the gold reference for historical parity.
+
+Key provenance:
+
+```text
+main + overlay1:
+  output/reverse_lowjump_cluster_budget_plus_overlay_include_etf_daily_20260531/
+  broad_sector_margin45_new075_plus_iv95_pullback_overlay002/open_signals.csv
+  filtered to exclude SSE/SZSE
+
+overlay2 + overlay3:
+  output/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20220104_20260331/
+  open_signals.csv
+  filtered to strategy_layer in overlay2/overlay3
+```
+
+The source-key audit command is:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_signal_schedule_sources.py
+```
+
+Strict field parity for a future incremental builder must compare generated
+rows against the committed gold schedule on historical dates.
+
+The strict gold audit command is:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated path/to/generated_open_signals.csv
+```
+
+Execution replay changes such as `no_valid_minute_price`, pending carry, and
+farther-contract reroute must not mutate the schedule's intent fields
+(`qty`, `target_qty`, `premium_cash`, `target_premium_cash`, `margin_cash`).
+If those fields differ from the gold schedule, the cause is in signal sizing,
+NAV/account state, margin-budget state, or source-version selection before
+execution, not in the minute fill path.
+
+## Daily Incremental State
+
+Persist these small rolling tables locally and append `T` only:
+
+```text
+data/daily_snapshots/option_chain_YYYYMMDD.csv
+data/reverse_lowjump/iv_daily_panel.csv
+data/reverse_lowjump/side_flow_guard_panel.csv
+data/reverse_lowjump/side_iv_pressure_panel.csv
+data/reverse_lowjump/product_side_opportunities.csv
+data/iv_pullback_overlay/atm_iv_percentile_panel.csv
+data/iv_pullback_overlay/contract_candidates_YYYYMMDD.csv
+data/risk_reversal_sidecar/risk_reversal_panel.csv
+data/risk_reversal_sidecar/contract_candidates_YYYYMMDD.csv
+data/term_structure_sidecar/term_structure_panel.csv
+data/term_structure_sidecar/contract_candidates_YYYYMMDD.csv
+state/sidecar_week_exchange_side_ledger.csv
+state/overlay_opened_expiry_ledger.csv
+```
+
+For speed, expanding percentiles and rolling windows should be calculated from
+these stored panels, not by querying all historical Toolkit rows each day.
+
+## Daily Flow
+
+```text
+update_daily_data(T)
+  -> fetch Toolkit T snapshot if missing
+  -> update PIT rolling panels from stored history + T
+  -> build main monthly intent rows for T if T is a schedule day
+  -> build overlay1/2/3 intent rows for T if lagged triggers fire
+  -> apply current paper-account NAV, margin, opened-expiry, and weekly sidecar ledgers
+  -> replace schedule rows where entry_date == T
+  -> write audit with row counts, source snapshots, config hash, and future-function guard status
+generate_orders(T)
+  -> read the schedule
+  -> write T+1 planned orders
+```
+
+## Future-Function Guard
+
+- Main L1/L2/L3/L4 may use the completed `T` daily snapshot because execution is `T+1`.
+- Rolling history that summarizes prior labels must be shifted before scoring `T`.
+- Overlay1 trigger uses `T-4` through `T-1` ATM IV and percentile fields.
+- Overlay2 trigger uses `lag3` through `lag1` risk-reversal fields and `lag3` percentile.
+- Overlay3 trigger uses `lag3` through `lag1` term-spread fields; side choice and trend conflict use `T-1`.
+- No `T+1` minute data may enter signal generation.
+
+## Performance Rule
+
+Normal daily mode should not run the minute replay and should not scan the full
+2018-present history from Toolkit. Full replay is reserved for validation,
+repairs, and backfills.
+
+If historical data is corrected, rerun only from the first corrected date with
+an explicit `--force-from YYYY-MM-DD` style backfill, then re-diff the rebuilt
+schedule against the gold historical reference where overlap exists.
