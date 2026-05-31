@@ -52,6 +52,8 @@ Execution:
 ```text
 T signal, T+1 Toolkit minute VWAP, 10% volume cap,
 keep no-price/no-bar opens pending, and allow limited farther-OTM reroute.
+Expiry uses intrinsic settlement from same-day underlying futures settlement first,
+then futures close, then underlying daily close; stale cached spot is never used.
 ```
 
 ## Daily Commands

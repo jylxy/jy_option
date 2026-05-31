@@ -47,6 +47,11 @@
   "s1_deferred_intent_enabled": false,
   "pre_expiry_exit_dte": 0,
   "expiry_dte": 0,
+  "expiry_underlying_price_priority": [
+    "future_daily_settlement",
+    "future_daily_close",
+    "underlying_daily_close"
+  ],
   "margin_cap": 0.7,
   "s1_margin_cap": 0.7,
   "main_sleeve": {
@@ -171,6 +176,7 @@
     "iv_pullback_overlay_atm_iv_panel",
     "iv_pullback_overlay_contract_candidates",
     "overlay_opened_expiry_ledger",
+    "expiry_underlying_settlement_price",
     "paper_account_state",
     "paper_close_mark",
     "external_intent_schedule"

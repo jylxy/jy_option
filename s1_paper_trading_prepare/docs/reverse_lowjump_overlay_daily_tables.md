@@ -233,7 +233,35 @@ daily_return = daily_pnl / input_nav
 short-option daily_pnl = signed_quantity * (mark_price - previous_mark_price) * multiplier
 ```
 
-### 11. external_intent_schedule
+### 11. expiry_underlying_settlement_price
+
+Purpose: exact expiry intrinsic settlement when the option itself has no tradable minute price.
+
+Lookup:
+
+```text
+underlying_code from option metadata / position state
+date = expiry processing date
+```
+
+Price priority:
+
+```text
+1. Toolkit future_daily_quote settlement
+2. Toolkit future_daily_quote close
+3. Toolkit underlying daily close map
+```
+
+Rules:
+
+```text
+call intrinsic = max(underlying_price - strike, 0)
+put intrinsic  = max(strike - underlying_price, 0)
+do not use previous cached spot if all same-day sources are missing
+write expiry_settlement_blocked_missing_spot when blocked
+```
+
+### 12. external_intent_schedule
 
 Purpose: clean handoff from daily signal generation to order review and minute replay.
 

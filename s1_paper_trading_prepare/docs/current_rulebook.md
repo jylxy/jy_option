@@ -292,10 +292,14 @@ min reroute contract volume = 1
 Expiry settlement:
 
 ```text
-settlement value = intrinsic value from T underlying close
-call intrinsic = max(underlying_close - strike, 0)
-put intrinsic  = max(strike - underlying_close, 0)
-if T underlying close is unavailable:
+settlement value = intrinsic value from same-day underlying settlement source
+underlying price priority:
+    1. Toolkit future_daily_quote settlement for the exact underlying_code
+    2. Toolkit future_daily_quote close for the exact underlying_code
+    3. Toolkit same-day underlying daily close
+call intrinsic = max(underlying_price - strike, 0)
+put intrinsic  = max(strike - underlying_price, 0)
+if same-day underlying price is unavailable:
     do not fall back to previous cached spot
     block expiry settlement and write expiry_settlement_blocked_missing_spot
 ```

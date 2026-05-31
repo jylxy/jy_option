@@ -908,7 +908,7 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     pos.dte = dte
                 if dte > expiry_dte:
                     continue
-                spot = self._expiry_spot_close(pos, date_str)
+                spot, spot_source, spot_lookup_code = self._expiry_spot_close(pos, date_str)
                 if not np.isfinite(spot) or spot <= 0:
                     self.diagnostics_records.append({
                         "date": date_str,
@@ -918,6 +918,8 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                         "code": getattr(pos, "code", ""),
                         "underlying_code": getattr(pos, "underlying_code", ""),
                         "expiry": str(getattr(pos, "expiry", ""))[:10],
+                        "spot_source": spot_source,
+                        "spot_lookup_code": spot_lookup_code,
                     })
                     continue
                 pos.cur_spot = float(spot)
@@ -932,13 +934,82 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     option_price=intrinsic,
                     spot_price=spot,
                     option_source="expiry_intrinsic",
-                    spot_source="expiry_underlying_close",
+                    spot_source=spot_source or "expiry_underlying_close",
                 )
+                meta = getattr(pos, "entry_meta", {}) or {}
+                meta["external_expiry_spot_source"] = spot_source or "unknown"
+                meta["external_expiry_spot_lookup_code"] = spot_lookup_code or ""
+                pos.entry_meta = meta
                 to_close.append(pos)
             if to_close:
                 self._close_positions(to_close, date_str, "expiry", fee)
 
-        def _expiry_spot_close(self, pos, date_str: str) -> float:
+        def _query_expiry_future_daily_price(self, date_str: str, underlying_code: str) -> tuple[float, str, str]:
+            try:
+                from query_filters import quote_sql_literal  # type: ignore
+                from spot_provider import build_underlying_alias_map  # type: ignore
+                from toolkit.selector import select_bars_sql  # type: ignore
+            except Exception:
+                return np.nan, "future_daily_quote_import_failed", ""
+
+            suffix = str(underlying_code).rsplit(".", 1)[-1].upper() if "." in str(underlying_code) else ""
+            if suffix in {"SH", "SZ"}:
+                return np.nan, "future_daily_quote_skipped_etf_underlying", ""
+
+            alias_map = build_underlying_alias_map([underlying_code])
+            lookup_codes = list(alias_map.get(underlying_code, []))
+            if not lookup_codes:
+                return np.nan, "future_daily_quote_no_alias", ""
+
+            code_sql = ", ".join(quote_sql_literal(code) for code in lookup_codes)
+            date_sql = quote_sql_literal(str(date_str)[:10])
+            tables = (
+                "future_daily_quote",
+                "future_daily_quote_local",
+                "future_history_quote",
+            )
+            for table_name in tables:
+                query = f"""
+                    SELECT
+                        ths_code,
+                        toFloat64OrZero(toString(settlement)) AS settlement,
+                        toFloat64OrZero(toString(close)) AS close
+                    FROM {table_name}
+                    WHERE toString(date) = {date_sql}
+                      AND ths_code IN ({code_sql})
+                """
+                try:
+                    frame = select_bars_sql(query)
+                except Exception as exc:
+                    self.diagnostics_records.append({
+                        "date": date_str,
+                        "scope": "external_intent_minute_replay",
+                        "name": "expiry_future_daily_quote_lookup_failed",
+                        "underlying_code": underlying_code,
+                        "table": table_name,
+                        "error": str(exc),
+                    })
+                    continue
+                if frame is None or frame.empty:
+                    continue
+                frame = frame.copy()
+                frame["settlement"] = pd.to_numeric(frame.get("settlement"), errors="coerce")
+                frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
+                for lookup_code in lookup_codes:
+                    rows = frame[frame["ths_code"].astype(str) == lookup_code]
+                    if rows.empty:
+                        continue
+                    row = rows.iloc[-1]
+                    settlement = safe_float(row.get("settlement"), np.nan)
+                    if np.isfinite(settlement) and settlement > 0:
+                        return settlement, f"expiry_future_daily_settlement:{table_name}", lookup_code
+                    close = safe_float(row.get("close"), np.nan)
+                    if np.isfinite(close) and close > 0:
+                        return close, f"expiry_future_daily_close:{table_name}", lookup_code
+
+            return np.nan, "future_daily_quote_missing", ""
+
+        def _expiry_spot_close(self, pos, date_str: str) -> tuple[float, str, str]:
             info = self.ci.lookup(pos.code) or {}
             underlying_code = getattr(pos, "underlying_code", "") or info.get("underlying_code", "")
             if not underlying_code:
@@ -949,7 +1020,10 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     "product": getattr(pos, "product", ""),
                     "code": getattr(pos, "code", ""),
                 })
-                return np.nan
+                return np.nan, "underlying_code_missing", ""
+            future_price, future_source, lookup_code = self._query_expiry_future_daily_price(date_str, underlying_code)
+            if np.isfinite(future_price) and future_price > 0:
+                return future_price, future_source, lookup_code
             try:
                 if hasattr(self.loader, "_get_spot_daily_ohlc_maps"):
                     spot_map, _, _ = self.loader._get_spot_daily_ohlc_maps(date_str, [underlying_code])
@@ -965,7 +1039,7 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     "underlying_code": underlying_code,
                     "error": str(exc),
                 })
-                return np.nan
+                return np.nan, "underlying_daily_close_lookup_failed", ""
             spot = safe_float(spot_map.get(underlying_code, np.nan), np.nan)
             if not np.isfinite(spot) or spot <= 0:
                 self.diagnostics_records.append({
@@ -976,9 +1050,10 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     "code": getattr(pos, "code", ""),
                     "underlying_code": underlying_code,
                     "previous_spot": safe_float(getattr(pos, "cur_spot", np.nan), np.nan),
+                    "future_daily_source": future_source,
                 })
-                return np.nan
-            return spot
+                return np.nan, "underlying_daily_close_missing", ""
+            return spot, "expiry_underlying_daily_close", underlying_code
 
         def _apply_overlay_portfolio_loss_stop(self, date_str: str, fee: float) -> None:
             stop_pct = float(
