@@ -1,124 +1,111 @@
 {
-  "registry_version": "2026-05-29",
-  "scope": "S1 paper-trading preparation only",
-  "current_mainline": "s1_sim_l1_tail_q4_l2_risk_top4clean_pcprice_oi_l4_riskbuffer_20260530",
+  "registry_version": "2026-05-31",
+  "scope": "current S1 paper-trading line only",
+  "current_mainline": "s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531",
   "tables": [
     {
       "name": "option_chain_daily_snapshot",
       "status": "paper_required",
-      "layer": "Layer 0",
+      "layer": "L0",
       "source": "Toolkit daily option-chain aggregation",
       "paper_path": "data/daily_snapshots/option_chain_YYYYMMDD.csv",
-      "paper_action": "Fetch only missing trading-date partitions from Toolkit; reuse existing partitions unless forced."
+      "paper_action": "Fetch missing trading-day partitions only; reuse stored partitions unless force is requested."
     },
     {
-      "name": "s1_l0_contract_universe",
-      "status": "paper_required",
-      "layer": "Layer 0",
-      "source": "Computed from option_chain_daily_snapshot",
-      "paper_path": "data/derived/s1_l0_contract_universe_YYYYMMDD.csv",
-      "paper_action": "Recompute every refresh from the stored daily snapshot."
-    },
-    {
-      "name": "l1_product_side_date_panel",
+      "name": "reverse_lowjump_iv_daily_panel",
       "status": "active_mainline_input",
-      "layer": "Layer 1 / Layer 2 / Layer 3 budget overlay",
-      "source": "Historical research output used by the locked mainline",
-      "config_path_key": "s1_l1_product_side_panel_path",
-      "configured_source_path": "server_deploy/output/analysis_product_scoring_v3_71prod_20260525/product_side_date_panel_v3_71prod_20260522_rerun1.csv",
-      "required_columns": [
-        "date",
-        "product",
-        "side",
-        "historical_retention_score",
-        "historical_retention_score_rank_date",
-        "historical_retention_score_bucket5_date",
-        "tail_cluster_safety_score",
-        "tail_cluster_safety_score_rank_date",
-        "tail_cluster_safety_score_bucket5_date",
-        "avg_v3_trend_breakout_score",
-        "avg_v3_trend_breakout_score_safe",
-        "avg_v3_trend_breakout_score_safe_rank_date",
-        "avg_v3_trend_breakout_score_safe_bucket5_date",
-        "tail_clean6_soft_score",
-        "tail_clean6_soft_score_rank_date",
-        "tail_clean6_soft_score_bucket5_date",
-        "premium_quality_score",
-        "avg_v3_contract_vrp_pct",
-        "capacity_premium_density",
-        "avg_v3_b6_premium_to_iv10_rank",
-        "neg_side_signed_pc_same_delta_log_price_ratio",
-        "side_signed_log_pc_side_total_oi",
-        "product_side_score",
-        "product_side_score_rank_date",
-        "avg_v3_b6_premium_to_stress_rank"
-      ],
-      "research_candidate_factor_columns": [
-        "iv_pos_rev10_logchg",
-        "iv_pos_rev10_logchg_rank_date",
-        "iv_pos_rev10_logchg_bucket5_date",
-        "iv_pos_rev10_th5_event",
-        "iv_pos_rev10_th5_event_rank_date",
-        "iv_pos_rev10_th5_event_bucket5_date",
-        "iv_pos_rev10_th5_short_iv_sign",
-        "opt_side_turnover_z60"
-      ],
-      "paper_path": "data/product_side_panel/rolling_product_side_panel.csv",
-      "paper_action": "Maintain a rolling, point-in-time replacement from stored Toolkit snapshots. Keep the locked research panel only as a parity baseline until the rolling replacement is approved."
+      "layer": "L1",
+      "source": "Toolkit product ATM-IV history and daily option snapshots",
+      "config_gate_key": "s1_reverse_lowjump_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/reverse_lowjump/iv_daily_panel.csv",
+      "paper_action": "Append T after the daily snapshot is complete. Rolling fields must use observations through T only."
     },
     {
-      "name": "rolling_l1_admission",
+      "name": "reverse_lowjump_product_side_opportunities",
+      "status": "active_mainline_input",
+      "layer": "L1/L2/L3/L4",
+      "source": "Daily reverse-lowjump/high-IV-pressure signal builder",
+      "config_gate_key": "s1_reverse_lowjump_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/reverse_lowjump/product_side_opportunities.csv",
+      "paper_action": "Append T product-side opportunities and write approved external S1 sell intents."
+    },
+    {
+      "name": "reverse_lowjump_side_flow_guard_panel",
+      "status": "active_mainline_input",
+      "layer": "L1",
+      "source": "Toolkit option-side OI/volume and underlying futures OI/volume",
+      "config_gate_key": "s1_reverse_lowjump_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/reverse_lowjump/side_flow_guard_panel.csv",
+      "paper_action": "Update T-day flow guard fields using same-day and trailing observations only."
+    },
+    {
+      "name": "reverse_lowjump_side_iv_pressure_panel",
+      "status": "active_mainline_input",
+      "layer": "L2/L4",
+      "source": "T-day near-month OTM put/call IV pressure candidates",
+      "config_gate_key": "s1_reverse_lowjump_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/reverse_lowjump/side_iv_pressure_panel.csv",
+      "paper_action": "Recompute after the T snapshot to choose the higher-IV-pressure side and weak-pressure delta cut."
+    },
+    {
+      "name": "iv_pullback_overlay_atm_iv_panel",
+      "status": "active_overlay_input",
+      "layer": "Overlay L1",
+      "source": "Toolkit option snapshots from 2018-01-01 for the sidecar scan universe",
+      "config_gate_key": "s1_iv_pullback_overlay_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/iv_pullback_overlay/atm_iv_percentile_panel.csv",
+      "paper_action": "Append product-day ATM IV and expanding percentile. Trigger columns use lag1 through lag4 only."
+    },
+    {
+      "name": "iv_pullback_overlay_contract_candidates",
+      "status": "active_overlay_input",
+      "layer": "Overlay L2/L4",
+      "source": "T-day near-month OTM contract candidates when an overlay trigger is active",
+      "config_gate_key": "s1_iv_pullback_overlay_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/iv_pullback_overlay/contract_candidates_YYYYMMDD.csv",
+      "paper_action": "Recompute from the T snapshot; select the higher-IV-pressure side."
+    },
+    {
+      "name": "overlay_opened_expiry_ledger",
       "status": "paper_required",
-      "layer": "Layer 1 diagnostics",
-      "source": "Computed from rolling_product_side_panel",
-      "paper_path": "data/product_side_panel/rolling_l1_admission_YYYYMMDD.csv",
-      "paper_action": "Recompute after each rolling product-side panel refresh."
-    },
-    {
-      "name": "full_shadow_v3_lookup",
-      "status": "inactive_research_output",
-      "layer": "Layer 4 optional contract enrichment",
-      "source": "Historical full-shadow research output",
-      "config_gate_key": "s1_full_shadow_v3_lookup_enabled",
+      "layer": "Overlay risk state",
+      "source": "Paper account state",
+      "config_gate_key": "s1_iv_pullback_overlay_enabled",
       "config_gate_expected": true,
-      "config_path_key": "s1_full_shadow_v3_lookup_path",
-      "paper_action": "Do not load under the current mainline. If a later approved mainline enables it, rebuild feature columns daily from Toolkit and allow only point-in-time feature or lagged hist fields."
+      "paper_path": "state/overlay_opened_expiry_ledger.csv",
+      "paper_action": "Persist product+expiry keys so the sidecar opens at most once per product expiry."
     },
     {
-      "name": "b14_layered_signal_map",
-      "status": "inactive_research_output",
-      "layer": "Optional candidate rerank",
-      "source": "Historical layered-model signal research output",
-      "config_gate_key": "s1_b14_layered_model_enabled",
+      "name": "paper_account_state",
+      "status": "paper_required",
+      "layer": "Portfolio controls",
+      "source": "Fills, positions, NAV, fees, and current margin",
+      "paper_path": "state/account_YYYYMMDD.json plus state ledgers",
+      "paper_action": "Refresh before daily order generation; used for margin and overlay stop audit."
+    },
+    {
+      "name": "paper_close_mark",
+      "status": "paper_required",
+      "layer": "Daily PnL",
+      "source": "Paper account positions and Toolkit T-day option close snapshot",
+      "paper_path": "output/audit/close_mark_positions_YYYYMMDD.csv and close_mark_summary_YYYYMMDD.json",
+      "paper_action": "Compute T close mark, daily PnL, daily return, stale marks, and margin estimate before T+1 order generation."
+    },
+    {
+      "name": "external_intent_schedule",
+      "status": "paper_required",
+      "layer": "Order handoff",
+      "source": "Approved S1 daily signal builder output",
+      "config_gate_key": "s1_external_intent_minute_replay_enabled",
       "config_gate_expected": true,
-      "config_path_key": "s1_b14_signal_path",
-      "paper_action": "Do not load under the current mainline. If enabled later, train and score with a rolling embargoed process before the signal date."
-    },
-    {
-      "name": "env_portfolio_score",
-      "status": "inactive_research_output",
-      "layer": "Optional portfolio budget scaling",
-      "source": "Historical environment prediction research output",
-      "config_gate_key": "s1_env_portfolio_budget_enabled",
-      "config_gate_expected": true,
-      "config_path_key": "s1_env_portfolio_score_path",
-      "paper_action": "Do not load under the current mainline. If enabled later, recompute daily from point-in-time portfolio and market-regime features."
-    },
-    {
-      "name": "candidate_universe_and_shadow_outcomes",
-      "status": "inactive_research_output",
-      "layer": "Offline research diagnostics",
-      "source": "Candidate universe, outcome, B5 panel, and B23D attribution writers",
-      "config_gate_key": "s1_candidate_universe_dump_enabled",
-      "config_gate_expected": true,
-      "paper_action": "Do not copy into paper order generation. Keep only the live order candidates and diagnostics needed for audit."
-    },
-    {
-      "name": "baseline_nav_orders_diagnostics",
-      "status": "parity_reference_only",
-      "layer": "Audit",
-      "source": "Locked historical backtest output",
-      "paper_action": "Use only for same-day parity comparison. Exclude from live data refresh and from Git payloads."
+      "paper_path": "data/external_signals/*.csv",
+      "paper_action": "Clean S1-only handoff into order review and Toolkit minute replay. Generated schedules are local data artifacts."
     }
   ]
 }

@@ -1,6 +1,0 @@
-{
-  "extends": "config_s1_mainline_locked_50m_liq10_20260527.json",
-  "strategy_version": "s1_mainline_current_locked_50m_liq10_20260527",
-  "_mainline_name": "S1 current mainline: locked 50m liq10 execution version",
-  "_mainline_note": "This current mainline points to the locked 50m liq10 capacity backtest version. Do not edit the locked baseline or this pointer for experiments; create a new experiment config instead."
-}

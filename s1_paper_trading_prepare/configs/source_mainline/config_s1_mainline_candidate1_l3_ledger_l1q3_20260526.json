@@ -1,9 +1,0 @@
-{
-  "extends": "config_s1_mainline_candidate1_l3_ledger_20260526.json",
-  "strategy_version": "s1_mainline_candidate1_l3_ledger_l1q3_20260526",
-  "_candidate_role": "l3_ledger_l1_q3_relaxed",
-  "_candidate_name": "L3 ledger with relaxed L1 Q3/Q3 product-side gate",
-  "_candidate_note": "Only relaxes Layer 1 hard gate from historical_retention Q4 / tail_cluster Q3 to Q3 / Q3. L2/L3 ledger, contract selection, stop logic and portfolio constraints remain unchanged.",
-  "s1_l1_min_hist_bucket": 3,
-  "s1_l1_min_tail_bucket": 3
-}

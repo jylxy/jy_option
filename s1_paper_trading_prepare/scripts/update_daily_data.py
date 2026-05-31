@@ -30,25 +30,6 @@ def main() -> int:
     parser.add_argument("--products", default=None, help="Optional comma-separated product list.")
     parser.add_argument("--product-chunk-size", type=int, default=32, help="Products per Toolkit query chunk.")
     parser.add_argument("--force", action="store_true", help="Re-fetch existing date partitions from Toolkit.")
-    parser.add_argument(
-        "--prehistory-start-date",
-        default=None,
-        help="Fetch/reuse earlier snapshots for rolling contract-shadow warmup.",
-    )
-    parser.add_argument(
-        "--prehistory-end-date",
-        default=None,
-        help="Optional inclusive warmup end date; defaults to the day before the first signal date.",
-    )
-    parser.add_argument(
-        "--rebuild-contract-history",
-        action="store_true",
-        help=(
-            "Rebuild rolling contract-shadow history from stored snapshots before scoring. "
-            "For a date window this rebuild runs once on the first formal date, then later "
-            "dates append incrementally."
-        ),
-    )
     args = parser.parse_args()
 
     result = update_daily_data(
@@ -60,31 +41,14 @@ def main() -> int:
         products=parse_products(args.products),
         product_chunk_size=args.product_chunk_size,
         force=args.force,
-        prehistory_start_date=args.prehistory_start_date,
-        prehistory_end_date=args.prehistory_end_date,
-        rebuild_contract_history=args.rebuild_contract_history,
     )
     print(f"DATA_UPDATE_OK dates={len(result.dates)} last_signal_date={result.signal_date}")
-    print(f"prehistory_dates={len(result.prehistory_dates)}")
-    print(
-        "prehistory_fetched_dates="
-        f"{','.join(result.prehistory_fetched_dates) if result.prehistory_fetched_dates else '-'}"
-    )
-    print(
-        "prehistory_reused_dates="
-        f"{','.join(result.prehistory_reused_dates) if result.prehistory_reused_dates else '-'}"
-    )
     print(f"fetched_dates={','.join(result.fetched_dates) if result.fetched_dates else '-'}")
     print(f"reused_dates={','.join(result.reused_dates) if result.reused_dates else '-'}")
+    print(f"empty_dates={','.join(result.empty_dates) if result.empty_dates else '-'}")
     print(f"snapshot_rows={result.snapshot_rows} path={result.snapshot_path}")
-    print(f"l0_universe_rows={result.l0_universe_rows} path={result.l0_universe_path}")
-    print(f"l1_admission_rows={result.l1_admission_rows} path={result.l1_admission_path}")
-    print(
-        "rolling_l1_admission_rows="
-        f"{result.rolling_l1_admission_rows} path={result.rolling_l1_admission_path}"
-    )
-    print(f"rolling_panel_rows={result.rolling_panel_rows} path={result.rolling_panel_path}")
-    print(f"rolling_matured_rows={result.rolling_matured_rows}")
+    active_tables = [row["name"] for row in result.table_status if row.get("active_under_effective_config")]
+    print(f"active_tables={','.join(active_tables) if active_tables else '-'}")
     print(f"manifest_path={result.manifest_path}")
     return 0
 

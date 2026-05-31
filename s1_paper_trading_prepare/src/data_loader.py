@@ -17,7 +17,7 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 
 def _query_option_daily_vwap(signal_date: str, like_sql: str | None) -> pd.DataFrame:
-    """Fetch the research-style option VWAP partition for one trading date."""
+    """Fetch the Toolkit option VWAP partition for one S1 signal date."""
     from data_tables import OPTION_MINUTE_TABLE
     from query_filters import build_time_eq_sql
     from toolkit.selector import select_bars_sql

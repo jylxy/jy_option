@@ -4,10 +4,10 @@ Date: 2026-05-29
 
 ## Purpose
 
-The paper order generator must know the paper account state before each daily
-run.  In the current parity phase, the locked replay adapter still owns the
-historical position path, but the daily pipeline now validates and records the
-paper-account files so the live-state handoff has a stable contract.
+The paper order generator records paper account state before each daily run.
+The current line generates external S1 sell intents and uses Toolkit minute
+replay for paper fills, pending orders, reroute, expiry, margin, and overlay
+stop diagnostics.
 
 ## Runtime location
 
@@ -67,4 +67,22 @@ python s1_paper_trading_prepare/scripts/run_daily_paper_pipeline.py --signal-dat
 ```
 
 The pipeline validates account state, refreshes Toolkit daily inputs, generates
-T+1 paper orders, and writes a run manifest under `output/audit/`.
+the T close mark and daily return, generates T+1 paper orders, and writes a run
+manifest under `output/audit/`.
+
+Run only the close mark:
+
+```powershell
+python s1_paper_trading_prepare/scripts/mark_close_pnl.py --as-of-date 2026-05-29
+```
+
+The close mark writes:
+
+```text
+output/audit/close_mark_positions_YYYYMMDD.csv
+output/audit/close_mark_summary_YYYYMMDD.json
+```
+
+For forced exits and expiry replay, stale marks are not treated as executable
+prices.  Expiry settlement uses same-day underlying close to compute intrinsic
+value and is blocked with diagnostics if that price is missing.

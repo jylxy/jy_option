@@ -1,4 +1,4 @@
-"""Schemas and stable column lists for S1 paper-trading outputs."""
+"""Schemas and stable column lists for current S1 paper outputs."""
 
 from __future__ import annotations
 
@@ -25,27 +25,30 @@ ORDER_FRONT_COLUMNS = [
     "order_status",
     "action",
     "strategy",
+    "entry_reason",
     "product",
+    "exchange",
     "code",
+    "source_contract_code",
     "option_type",
     "strike",
     "expiry",
+    "dte",
     "quantity",
     "signal_ref_price",
     "gross_premium_cash",
     "net_premium_cash",
+    "target_premium_cash",
+    "target_premium_pct",
     "margin",
     "one_contract_margin",
-    "stress_loss",
-    "selection_score",
-    "l1_hist_bucket",
-    "l1_tail_bucket",
-    "l1_sort_bucket",
-    "l1_budget_mult",
-    "l3_ledger_enabled",
-    "l3_ledger_base_side_budget_pct",
-    "l3_ledger_total_final_budget_pct",
-    "side_budget_mult",
-    "effective_strategy_margin_cap",
+    "budget_group",
+    "side_rule",
+    "selected_side_iv_pressure",
+    "other_side_iv_pressure",
+    "side_iv_pressure_diff",
+    "l1_rule",
+    "l2_rule",
+    "l3_rule",
+    "l4_rule",
 ]
-

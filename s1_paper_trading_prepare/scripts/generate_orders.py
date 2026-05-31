@@ -26,7 +26,7 @@ def main() -> int:
     parser.add_argument(
         "--replay-start-date",
         default=None,
-        help="Start date for historical state replay. Use the locked backtest start date for parity checks.",
+        help="Optional historical replay start date when reconstructing paper-account state.",
     )
     parser.add_argument("--products", default=None, help="Optional comma-separated product list.")
     parser.add_argument("--config", default=None, help="Optional config path. Defaults to configs/s1_paper_mainline.json.")
@@ -52,4 +52,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

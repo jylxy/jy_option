@@ -1,54 +1,63 @@
-# S1 daily paper-trading runbook
+# Current S1 Daily Paper Runbook
 
-## Daily sequence
+## Daily Sequence
 
-1. Prepare the paper-account state files for T date under `state/`.
-2. Validate the account state.
-3. Refresh Toolkit-backed daily data for T.
-4. Recompute S1 derived tables and rolling product-side tables.
-5. Generate T+1 planned orders.
-6. Review `output/orders/`, `output/diagnostics/`, and the pipeline manifest.
-7. After T+1 execution, write fills and any pending remainder back into
-   `state/` for the next run.
+1. Refresh or validate the paper-account state for T.
+2. Fetch missing Toolkit daily snapshots for T.
+3. Recompute current-line daily signal tables.
+4. Update the external S1 intent schedule.
+5. Mark the paper account to the T close and calculate daily return.
+6. Generate T+1 paper orders for review.
+7. Optionally replay the date through Toolkit minute bars to audit fill, pending, reroute, expiry, and overlay stop.
+8. Carry unfilled or partial orders forward in paper state.
 
-## Command
+## Commands
+
+Initialize paper state:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/init_account_state.py ^
-  --as-of-date 2026-05-29 ^
-  --nav 50000000
+python s1_paper_trading_prepare/scripts/init_account_state.py --as-of-date 2026-05-29 --nav 50000000
 ```
 
-Then run:
+Refresh T data:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/run_daily_paper_pipeline.py ^
-  --signal-date 2026-05-29 ^
-  --account-date 2026-05-29 ^
-  --require-account-state
+python s1_paper_trading_prepare/scripts/update_daily_data.py --signal-date 2026-05-29
 ```
 
-For historical parity checks, provide the locked replay start:
+Mark T close PnL:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/run_daily_paper_pipeline.py ^
-  --signal-date 2022-04-14 ^
-  --replay-start-date 2022-01-04
+python s1_paper_trading_prepare/scripts/mark_close_pnl.py --as-of-date 2026-05-29
+```
+
+Generate T+1 orders:
+
+```powershell
+python s1_paper_trading_prepare/scripts/generate_orders.py --signal-date 2026-05-29
+```
+
+Replay a validation range:
+
+```powershell
+python s1_paper_trading_prepare/scripts/minute_replay_external_signals.py --config s1_paper_trading_prepare/configs/s1_paper_mainline.json --start-date 2024-10-01 --end-date 2024-10-31 --tag s1_current_202410
 ```
 
 ## Outputs
 
 | Output | Meaning |
 | --- | --- |
-| `output/orders/orders_*.csv` | T+1 planned orders for manual confirmation |
-| `output/diagnostics/diagnostics_*.csv` | S1 funnel and rule diagnostics |
-| `output/audit/daily_pipeline_*.json` | Daily run manifest |
-| `data/manifests/daily_data_update_*.json` | Data refresh manifest |
-| `output/audit/account_state_validation_*.json` | Account-state validation manifest |
+| `output/orders/orders_*.csv` | T+1 planned S1 orders |
+| `output/diagnostics/diagnostics_*.csv` | L0-L4 order diagnostics |
+| `output/audit/audit_*.json` | Order-generation audit manifest |
+| `output/audit/close_mark_summary_*.json` | T close NAV, daily PnL, daily return, stale mark count |
+| `output/audit/close_mark_positions_*.csv` | Position-level T close marks and PnL |
+| `data/manifests/daily_data_update_*.json` | Daily data refresh manifest |
 
-## Current limitation
+## Operating Notes
 
-The phase-1 order path is intentionally still driven by the locked replay
-adapter to preserve exact historical parity.  The account-state contract is now
-validated and archived every run; directly wiring live NAV, live positions, and
-pending-order remainders into sizing/execution is the next engineering phase.
+- The approved external intent schedule is the order handoff.
+- Generated schedules and replay outputs are local artifacts and are not committed.
+- The order generator does not place broker orders.
+- Minute replay is the only fill simulator in this project.
+- Stale marks are allowed only for valuation reporting and are flagged; forced exits and expiry settlement require same-day marks or same-day underlying close.

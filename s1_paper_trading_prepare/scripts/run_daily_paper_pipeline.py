@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from s1_paper_trading_prepare.src.account_state import validate_account_state
 from s1_paper_trading_prepare.src.daily_data_update import update_daily_data
+from s1_paper_trading_prepare.src.daily_mark import mark_account_to_close
 from s1_paper_trading_prepare.src.diagnostics import write_json
 from s1_paper_trading_prepare.src.order_generator import generate_orders
 from s1_paper_trading_prepare.src.paths import DEFAULT_OUTPUT_DIR, resolve_path
@@ -28,7 +29,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the daily S1 paper-trading preparation pipeline.")
     parser.add_argument("--signal-date", required=True, help="T date used for signal generation, YYYY-MM-DD.")
     parser.add_argument("--account-date", default=None, help="Account-state date. Defaults to signal date.")
-    parser.add_argument("--replay-start-date", default=None, help="Historical replay start date for parity-style generation.")
+    parser.add_argument("--replay-start-date", default=None, help="Optional historical replay start date for paper-account state.")
     parser.add_argument("--state-dir", default=None, help="Optional paper-account state directory.")
     parser.add_argument("--config", default=None, help="Optional paper mainline config.")
     parser.add_argument("--data-dir", default=None, help="Optional data output directory.")
@@ -37,6 +38,7 @@ def main() -> int:
     parser.add_argument("--product-chunk-size", type=int, default=8)
     parser.add_argument("--force-data", action="store_true", help="Re-fetch existing Toolkit partitions.")
     parser.add_argument("--require-account-state", action="store_true", help="Fail if paper-account state files are missing.")
+    parser.add_argument("--write-marked-state", action="store_true", help="Persist close marks back into paper-account state files.")
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
 
@@ -64,6 +66,16 @@ def main() -> int:
         product_chunk_size=args.product_chunk_size,
         force=args.force_data,
     )
+    mark_result = mark_account_to_close(
+        signal_date,
+        state_dir=args.state_dir,
+        config_path=args.config,
+        data_dir=args.data_dir,
+        output_dir=output_dir,
+        products=products,
+        product_chunk_size=args.product_chunk_size,
+        write_state=args.write_marked_state,
+    )
     order_result = generate_orders(
         signal_date,
         replay_start_date=args.replay_start_date,
@@ -86,13 +98,19 @@ def main() -> int:
             "data_manifest": str(data_result.manifest_path) if data_result.manifest_path else None,
             "fetched_dates": data_result.fetched_dates,
             "reused_dates": data_result.reused_dates,
+            "close_mark_summary_path": str(mark_result.summary_path) if mark_result.summary_path else None,
+            "close_mark_positions_path": str(mark_result.positions_path) if mark_result.positions_path else None,
+            "close_mark_daily_pnl": mark_result.daily_pnl,
+            "close_mark_daily_return": mark_result.daily_return,
+            "close_mark_stale_rows": mark_result.stale_rows,
+            "close_mark_missing_rows": mark_result.missing_rows,
             "orders_path": str(order_result.orders_path) if order_result.orders_path else None,
             "diagnostics_path": str(order_result.diagnostics_path) if order_result.diagnostics_path else None,
             "order_audit_path": str(order_result.audit_path) if order_result.audit_path else None,
             "generated_order_count": int(len(order_result.orders)),
             "notes": [
-                "Phase-1 order generation still follows the locked replay adapter for backtest parity.",
-                "Paper-account state is validated and recorded for audit; direct live-state sizing hookup is the next phase.",
+                "Order generation follows the approved S1 external-intent schedule for the current line.",
+                "Toolkit minute replay remains the validation path for fills, pending, reroute, expiry, and overlay stop.",
             ],
         },
     )
@@ -100,6 +118,7 @@ def main() -> int:
     print(f"DAILY_PIPELINE_OK signal_date={signal_date} execute_date={order_result.execute_date}")
     print(f"account_state_ok={account_state.ok} account_manifest={account_state.manifest_path}")
     print(f"data_manifest={data_result.manifest_path}")
+    print(f"close_mark_daily_pnl={mark_result.daily_pnl:.2f} daily_return={mark_result.daily_return:.8f} summary={mark_result.summary_path}")
     print(f"orders={len(order_result.orders)} path={order_result.orders_path}")
     print(f"pipeline_manifest={manifest_path}")
     return 0

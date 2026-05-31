@@ -1,8 +1,0 @@
-{
-  "extends": "config_s1_mainline_candidate1_l3_ledger_l1q3_20260526.json",
-  "strategy_version": "s1_mainline_candidate1_l3_ledger_l1q3_oi1000_20260526",
-  "_candidate_role": "l3_ledger_l1_q3_relaxed_oi1000",
-  "_candidate_name": "L3 ledger L1 Q3/Q3 with L0 OI>=1000 eligibility",
-  "_candidate_note": "Pure L0 liquidity eligibility test. Keeps L3 Q3/Q3 unchanged and only requires candidate contract open interest >= 1000 before entry.",
-  "s1_min_oi": 1000
-}

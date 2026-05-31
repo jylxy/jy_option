@@ -1,9 +1,0 @@
-{
-  "extends": "config_s1_candidate3_oi1000_premium25_bucket08_20260527.json",
-  "strategy_version": "s1_candidate3_oi1000_premium25_bucket08_margin70_20260527",
-  "_candidate_role": "candidate3_liquidity_live_premium_budget_relaxed_margin70",
-  "_candidate_name": "Candidate 3 OI>=1000 with premium budget 2.5%, bucket/corr 0.8%, and margin cap 70%",
-  "_candidate_note": "Based on Candidate 3 premium-relaxed version. Only raises the total margin hard cap from 60% to 70%; all L1/L2/L3/L4 rules, OI>=1000, premium caps, and product/product-side constraints remain unchanged.",
-  "margin_cap": 0.70,
-  "s1_margin_cap": 0.70
-}

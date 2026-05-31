@@ -1,129 +1,97 @@
 # S1 Paper Trading Prepare
 
-This folder is the independent preparation workspace for the S1 paper-trading order generator.
-
-The current first-stage implementation deliberately calls the locked S1 backtest mainline through a narrow adapter, instead of rewriting the strategy. This keeps the paper-trading output auditable against the historical engine while we extract the order-generation path step by step.
-
-## Locked Mainline
-
-Current source config snapshot:
+This workspace is the clean paper-trading preparation project for the current S1 line:
 
 ```text
-s1_paper_trading_prepare/configs/source_mainline/config_s1_mainline_current.json
+s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531
 ```
 
-The snapshot is copied from the local locked mainline so remote runs do not drift if
-`server_deploy/config_s1_mainline_current.json` points to an older candidate.
+It contains only the approved S1 external-intent order flow:
 
-Effective chain:
+1. Refresh Toolkit daily data.
+2. Update the current reverse-lowjump/high-IV-pressure daily signal tables.
+3. Write the S1 external sell-intent schedule.
+4. Mark the paper account to the T close and calculate daily return.
+5. Generate T+1 paper orders for review.
+6. Replay the same intents through Toolkit minute bars for fill, pending, reroute, expiry, margin, and overlay-stop diagnostics.
+
+The rulebook is in:
 
 ```text
-config_s1_mainline_current.json
--> config_s1_mainline_locked_50m_liq10_20260527.json
--> config_s1_candidate3_oi1000_premium25_bucket08_margin70_20260527.json
--> config_s1_candidate3_oi1000_premium25_bucket08_20260527.json
--> config_s1_mainline_candidate1_l3_ledger_l1q3_oi1000_20260526.json
--> config_s1_mainline_candidate1_l3_ledger_l1q3_20260526.json
--> config_s1_mainline_candidate1_l3_ledger_20260526.json
--> config_s1_mainline_candidate1_l1_first_20260526.json
--> config_s1_mainline_candidate1_l1_clean_20260526.json
--> config_s1_mainline_l1_clean_20260526.json
+docs/current_rulebook.md
 ```
 
-Mainline rule summary:
+The daily table contract is in:
 
 ```text
-L1 product-side gate: tail_cluster_safety_score_bucket5_date >= Q4
-L2 product-side score: risk-top4 clean factors 50% + same-delta P/C price 30% + side-signed P/C OI 20%
-L3 product-side ledger: enabled, no forced rebudget of failed sides
-L4 contract gate: risk-buffer score drops the bottom 20% when enough candidates exist, then keeps original B6/delta-band ranking
-Contract OI: >= 1000
-Total entry premium cap: 2.5% NAV
-Bucket/corr-group entry premium cap: 0.8% NAV
-Total margin hard cap: 70% NAV
-Execution participation cap: 10%
+docs/reverse_lowjump_overlay_daily_tables.md
 ```
 
-## Usage
+## Current Rule Summary
 
-Refresh T-day input tables from Toolkit:
+Main sleeve:
+
+```text
+L1: rule_l1_oi03_flow_guard
+L2: sell the higher-IV-pressure side
+L3: l3eff015 budget tilt, broad-sector margin45 new075
+L4: l4_diff02_delta04_l3eff015
+```
+
+Overlay sidecar:
+
+```text
+L1: T-4 IV percentile >= 95%, then ATM IV pulls back for 3 days
+L2: sell the higher-IV-pressure side
+L3: 0.02% NAV target premium per signal
+L4: nearest expiry, DTE >= 7, OTM, abs(delta) < 0.05, OI >= 1000, volume > 0
+```
+
+Execution:
+
+```text
+T signal, T+1 Toolkit minute VWAP, 10% volume cap,
+keep no-price/no-bar opens pending, and allow limited farther-OTM reroute.
+```
+
+## Daily Commands
+
+Refresh the T-day Toolkit snapshot and write a manifest:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/update_daily_data.py --signal-date 2022-04-14
+python s1_paper_trading_prepare/scripts/update_daily_data.py --signal-date 2026-05-29
 ```
 
-Refresh only missing trading-day partitions in a date window:
+Calculate the T close paper-account mark and daily return:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/update_daily_data.py --start-date 2022-04-14 --end-date 2022-04-20
+python s1_paper_trading_prepare/scripts/mark_close_pnl.py --as-of-date 2026-05-29
 ```
 
-The default Toolkit product chunk size is `32`; pass `--product-chunk-size 8`
-if a data source needs smaller queries.
-
-Check deployable files remain S1-only:
+Generate T+1 paper orders from the approved external-intent schedule:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/check_s1_only_scope.py
+python s1_paper_trading_prepare/scripts/generate_orders.py --signal-date 2024-10-24
 ```
 
-Generate T+1 planned orders from a signal date:
-
-```powershell
-python s1_paper_trading_prepare/scripts/generate_orders.py --signal-date 2022-04-14 --replay-start-date 2022-01-04
-```
-
-Run the default one-day smoke:
+Run a small order-generation smoke:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/smoke_one_day.py
 ```
 
-Validate paper-account state files:
+Replay a date range through Toolkit minute bars:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/init_account_state.py --as-of-date 2026-05-29 --nav 50000000
-python s1_paper_trading_prepare/scripts/validate_account_state.py --as-of-date 2026-05-29 --require-files
+python s1_paper_trading_prepare/scripts/minute_replay_external_signals.py --config s1_paper_trading_prepare/configs/s1_paper_mainline.json --start-date 2024-10-01 --end-date 2024-10-31 --tag s1_current_202410
 ```
 
-Run the daily preparation pipeline:
+Check the workspace remains scoped to this S1 line:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/run_daily_paper_pipeline.py --signal-date 2026-05-29 --require-account-state
+python s1_paper_trading_prepare/scripts/check_s1_only_scope.py
 ```
 
-Compare generated pending orders with the locked historical backtest output:
+## Local Artifacts
 
-```powershell
-python s1_paper_trading_prepare/scripts/compare_with_backtest.py --generated s1_paper_trading_prepare/output/orders/orders_s1_paper_20220414.csv
-```
-
-Compare the daily rolling product-side panel candidate with the locked mainline panel:
-
-```powershell
-python s1_paper_trading_prepare/scripts/compare_rolling_product_side_panel.py --signal-date 2022-04-14
-```
-
-Outputs are written under:
-
-```text
-s1_paper_trading_prepare/output/orders/
-s1_paper_trading_prepare/output/diagnostics/
-s1_paper_trading_prepare/output/audit/
-```
-
-## Principle
-
-This project is an order generator, not a new backtester. For any historical date, a full-state replay with the same data snapshot, NAV, positions, and config should produce the same S1 target/pending opens as the locked backtest. Differences must be explainable by candidate pool, product-side admission, ledger budget, contract ranking, premium/margin constraints, or execution-cap handling.
-
-The deployable GitHub scope is S1-only.  Non-S1 side-strategy files are not
-kept in this project; the phase-1 adapter installs in-memory no-op import guards
-only because the historical engine imports those modules at load time. See:
-
-```text
-docs/s1_only_scope_and_daily_data.md
-docs/rolling_product_side_panel.md
-docs/rolling_product_side_chain_audit.md
-docs/paper_account_state_contract.md
-docs/daily_runbook.md
-```
+Generated data, signals, output, logs, and paper-account state stay local and are ignored by Git. Keep only source code, configs, docs, templates, and empty directory anchors in the repository.

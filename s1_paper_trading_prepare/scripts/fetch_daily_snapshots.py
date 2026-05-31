@@ -125,7 +125,7 @@ def load_signal_snapshots_batch(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch/reuse Toolkit daily option snapshots for S1 PIT replay.")
+    parser = argparse.ArgumentParser(description="Fetch/reuse Toolkit daily option snapshots for the current S1 paper line.")
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--config", default=str(DEFAULT_PAPER_CONFIG))

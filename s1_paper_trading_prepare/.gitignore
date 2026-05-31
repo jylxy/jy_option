@@ -3,9 +3,10 @@ output/orders/*
 output/diagnostics/*
 output/audit/*
 data/daily_snapshots/*
-data/derived/*
-data/product_side_panel/*
+data/reverse_lowjump/*
+data/iv_pullback_overlay/*
 data/manifests/*
+data/external_signals/*
 state/*
 logs/
 
@@ -14,9 +15,11 @@ logs/
 !output/diagnostics/.gitkeep
 !output/audit/.gitkeep
 !data/daily_snapshots/.gitkeep
-!data/derived/.gitkeep
-!data/product_side_panel/.gitkeep
+!data/reverse_lowjump/.gitkeep
+!data/iv_pullback_overlay/.gitkeep
 !data/manifests/.gitkeep
+!data/external_signals/.gitkeep
+!data/external_signals/broad_sector_margin45_new075_plus_iv95_pullback_overlay002_open_signals.csv
 !state/.gitkeep
 
 # Large or sensitive data
