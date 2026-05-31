@@ -21,33 +21,28 @@ factor refresh, candidate generation, sizing, and audit.
 
 The current committed schedule is the gold reference for historical parity.
 
-Key provenance:
-
-```text
-main + overlay1:
-  output/reverse_lowjump_cluster_budget_plus_overlay_include_etf_daily_20260531/
-  broad_sector_margin45_new075_plus_iv95_pullback_overlay002/open_signals.csv
-  filtered to exclude SSE/SZSE
-
-overlay2 + overlay3:
-  output/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20220104_20260331/
-  open_signals.csv
-  filtered to strategy_layer in overlay2/overlay3
-```
-
-The source-key audit command is:
+The source-key audit command is self-integrity only by default:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_sources.py
 ```
 
-Strict field parity for a future incremental builder must compare generated
-rows against the committed gold schedule on historical dates.
+Historical lookup sources may be supplied explicitly for archaeology, but they
+must not be treated as field-parity references unless they were generated under
+the same clean account state. Strict field parity for a future incremental
+builder must compare generated rows against the committed gold schedule on
+historical dates.
 
 The strict gold audit command is:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated path/to/generated_open_signals.csv
+```
+
+The point-in-time guard audit command is:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule path/to/generated_open_signals.csv
 ```
 
 Execution replay changes such as `no_valid_minute_price`, pending carry, and
@@ -57,14 +52,14 @@ If those fields differ from the gold schedule, the cause is in signal sizing,
 NAV/account state, margin-budget state, or source-version selection before
 execution, not in the minute fill path.
 
-The historical main + overlay1 source is an `include_etf` research output.
-After excluding `SSE/SZSE` rows, it still carries ETF trades in account-state
-fields such as NAV, current margin, and margin budget. Therefore that source is
-valid for signal-key provenance, but not for strict account-state field parity.
-For example, the source opens an SSE ETF sidecar on `2022-04-29` with
-`premium_cash=10032` and `margin_cash=382432`; after the ETF row is excluded,
-its realized premium still lifts the source margin budget by `10032 * 70% =
-7022.4`, causing the `2022-05-26` ZN target quantity to differ by one lot.
+The old main + overlay1 source came from an `include_etf` research output.
+After excluding `SSE/SZSE` rows, it still carried ETF trades in account-state
+fields such as NAV, current margin, and margin budget. For example, that source
+opened an SSE ETF sidecar on `2022-04-29` with `premium_cash=10032` and
+`margin_cash=382432`; after the ETF row was excluded, its realized premium
+still lifted the source margin budget by `10032 * 70% = 7022.4`, causing the
+`2022-05-26` ZN target quantity to differ by one lot. That source is therefore
+removed from default audits and must not drive regenerated paper schedules.
 
 ## Daily Incremental State
 
@@ -123,3 +118,21 @@ repairs, and backfills.
 If historical data is corrected, rerun only from the first corrected date with
 an explicit `--force-from YYYY-MM-DD` style backfill, then re-diff the rebuilt
 schedule against the gold historical reference where overlap exists.
+
+## Backfill Validation Sequence
+
+When the clean incremental signal builder is ready, rebuild the full historical
+schedule without the old `include_etf` account state:
+
+```powershell
+python s1_paper_trading_prepare/scripts/update_daily_data.py --start-date 2022-01-01 --end-date 2026-03-31
+# planned clean builder entrypoint:
+python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-date 2022-01-01 --end-date 2026-03-31 --output data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated data/external_signals/regenerated_open_signals.csv
+```
+
+After these pass, rerun the full minute replay from `2022-01-01` through
+`2026-03-31` and compare NAV, annual return, drawdown, open counts, pending
+fills, no-price diagnostics, margin usage, and main/overlay sleeve PnL against
+the last clean baseline.

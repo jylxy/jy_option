@@ -20,13 +20,6 @@ from s1_paper_trading_prepare.src.diagnostics import write_csv, write_json
 from s1_paper_trading_prepare.src.paths import DEFAULT_OUTPUT_DIR, DEFAULT_PAPER_CONFIG, resolve_path
 
 
-DEFAULT_MAIN_OVERLAY1_REFERENCE = (
-    REPO_ROOT
-    / "output"
-    / "reverse_lowjump_cluster_budget_plus_overlay_include_etf_daily_20260531"
-    / "broad_sector_margin45_new075_plus_iv95_pullback_overlay002"
-    / "open_signals.csv"
-)
 DEFAULT_OVERLAY23_REFERENCE = (
     REPO_ROOT
     / "output"
@@ -34,10 +27,11 @@ DEFAULT_OVERLAY23_REFERENCE = (
     / "open_signals.csv"
 )
 REFERENCE_FIELD_PARITY_NOTE = (
-    "The default main+overlay1 reference is an include_etf research output. "
-    "After filtering SSE/SZSE rows, ETF trades can still affect NAV, current margin, "
-    "and margin budget fields. Treat this audit as source-key provenance unless "
-    "--strict-fields is explicitly requested for a same-account-state reference."
+    "Historical source references are optional. Do not use the old include_etf "
+    "main+overlay1 research output as a field-parity source: after filtering "
+    "SSE/SZSE rows, ETF trades can still affect NAV, current margin, and margin "
+    "budget fields. Strict parity must be checked against the regenerated clean "
+    "schedule with audit_signal_schedule_gold.py."
 )
 
 OVERLAY23_LAYERS = {
@@ -210,8 +204,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit the current S1 paper signal schedule against reference lookup tables.")
     parser.add_argument("--config", default=str(DEFAULT_PAPER_CONFIG))
     parser.add_argument("--schedule", default=None, help="Override current schedule path.")
-    parser.add_argument("--main-overlay1-reference", default=str(DEFAULT_MAIN_OVERLAY1_REFERENCE))
-    parser.add_argument("--overlay23-reference", default=str(DEFAULT_OVERLAY23_REFERENCE))
+    parser.add_argument(
+        "--main-overlay1-reference",
+        default=None,
+        help="Optional historical source for key provenance. No default is used to avoid include_etf leakage.",
+    )
+    parser.add_argument(
+        "--overlay23-reference",
+        default=None,
+        help=f"Optional overlay2/3 source for key provenance, e.g. {DEFAULT_OVERLAY23_REFERENCE}",
+    )
     parser.add_argument("--exclude-exchanges", default="SSE,SZSE")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--tag", default="signal_schedule_source_audit")
@@ -228,8 +230,8 @@ def main() -> int:
     args = parse_args()
     snapshot = load_effective_config(args.config)
     schedule_path = resolve_path(args.schedule or snapshot.config.get("external_signal_path"))
-    main_ref_path = resolve_path(args.main_overlay1_reference)
-    overlay23_ref_path = resolve_path(args.overlay23_reference)
+    main_ref_path = resolve_path(args.main_overlay1_reference) if args.main_overlay1_reference else None
+    overlay23_ref_path = resolve_path(args.overlay23_reference) if args.overlay23_reference else None
     output_dir = resolve_path(args.output_dir)
     excluded_exchanges = {
         item.strip().upper()
@@ -240,20 +242,25 @@ def main() -> int:
     current = _read_csv(schedule_path)
     current_main, current_23 = _split_current_schedule(current)
     duplicates = _duplicate_key_rows(current, "current_schedule")
-    reference_available = main_ref_path.exists() and overlay23_ref_path.exists()
+    reference_available = (
+        main_ref_path is not None
+        and overlay23_ref_path is not None
+        and main_ref_path.exists()
+        and overlay23_ref_path.exists()
+    )
     if not reference_available:
         audit = {
             "tag": args.tag,
             "config_path": str(snapshot.path),
             "config_sha256": snapshot.sha256,
             "schedule_path": str(schedule_path),
-            "main_overlay1_reference": str(main_ref_path),
-            "overlay23_reference": str(overlay23_ref_path),
+            "main_overlay1_reference": str(main_ref_path) if main_ref_path else None,
+            "overlay23_reference": str(overlay23_ref_path) if overlay23_ref_path else None,
             "reference_available": False,
             "missing_references": [
                 str(path)
                 for path in (main_ref_path, overlay23_ref_path)
-                if not path.exists()
+                if path is None or not path.exists()
             ],
             "current_rows": int(len(current)),
             "current_main_overlay1_rows": int(len(current_main)),
@@ -302,8 +309,8 @@ def main() -> int:
         "config_path": str(snapshot.path),
         "config_sha256": snapshot.sha256,
         "schedule_path": str(schedule_path),
-        "main_overlay1_reference": str(main_ref_path),
-        "overlay23_reference": str(overlay23_ref_path),
+        "main_overlay1_reference": str(main_ref_path) if main_ref_path else None,
+        "overlay23_reference": str(overlay23_ref_path) if overlay23_ref_path else None,
         "reference_available": True,
         "exclude_exchanges": sorted(excluded_exchanges),
         "current_rows": int(len(current)),

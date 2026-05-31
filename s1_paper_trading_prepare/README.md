@@ -112,7 +112,7 @@ Check the workspace remains scoped to this S1 line:
 python s1_paper_trading_prepare/scripts/check_s1_only_scope.py
 ```
 
-Audit the current signal schedule against the historical lookup sources:
+Audit the current signal schedule for self-integrity:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_sources.py
@@ -122,6 +122,12 @@ Strictly audit a generated schedule against the committed gold schedule:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated path/to/generated_open_signals.csv
+```
+
+Audit point-in-time guardrails for the current schedule:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_future_function_guards.py
 ```
 
 ## Local Artifacts
