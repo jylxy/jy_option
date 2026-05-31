@@ -24,7 +24,7 @@ logs/
 !data/term_structure_sidecar/.gitkeep
 !data/manifests/.gitkeep
 !data/external_signals/.gitkeep
-!data/external_signals/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv
+!data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv
 !state/.gitkeep
 
 # Large or sensitive data

@@ -1,8 +1,8 @@
 {
-  "strategy_version": "s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531",
+  "strategy_version": "s1_strict_main_overlay1_plus_overlay23_20260531",
   "_paper_trading_prepare": true,
   "_order_generation_mode": "external_intent_minute_replay",
-  "_order_generation_objective": "Use daily point-in-time S1 signal tables to produce external S1 sell intents, then replay fills, marking, margin, expiry, and overlay portfolio stop through the Toolkit minute engine.",
+  "_order_generation_objective": "Preserve the strict 20260531 broad-sector main sleeve plus IV pullback sidecar signals, then append overlay2 risk-reversal and overlay3 term-structure sidecars for minute replay and paper-trading order generation.",
   "capital": 50000000,
   "s1_external_intent_minute_replay_enabled": true,
   "s1_reverse_lowjump_enabled": true,
@@ -10,7 +10,7 @@
   "s1_overlay2_risk_reversal_enabled": true,
   "s1_overlay3_term_structure_enabled": true,
   "external_replay_disable_intraday_exit_scans": true,
-  "external_signal_path": "s1_paper_trading_prepare/data/external_signals/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv",
+  "external_signal_path": "s1_paper_trading_prepare/data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv",
   "external_signal_date_column": "entry_date",
   "external_signal_default_execution_lag": "T_plus_1",
   "iv_warmup_enabled": false,
@@ -61,7 +61,7 @@
   "margin_cap": 0.7,
   "s1_margin_cap": 0.7,
   "main_sleeve": {
-    "name": "broad_sector_margin45_new075",
+    "name": "broad_sector_margin45_new075_strict_preserved",
     "target_premium_pct_nav": 0.001,
     "side_rule": "high_iv_pressure",
     "opportunity_rule": "rule_l1_oi03_flow_guard",
@@ -75,7 +75,7 @@
   },
   "iv_pullback_sidecar": {
     "enabled": true,
-    "strategy_layer": "overlay1_high_iv_pullback",
+    "strategy_layer": "iv_extreme_overlay",
     "scan_universe": "all_non_etf_options",
     "exclude_exchanges": [
       "SSE",
@@ -117,7 +117,7 @@
     "rr_sample_dte_min": 10,
     "rr_sample_dte_max": 90,
     "rr_sample_abs_delta_min": 0.01,
-    "rr_sample_abs_delta_max": 0.30,
+    "rr_sample_abs_delta_max": 0.3,
     "iv_min": 0.01,
     "iv_max": 2.5,
     "min_iv_history_days": 252,
@@ -276,5 +276,6 @@
     "term_structure_sidecar": "Trigger uses lag3-lag1 term-spread repair fields and lag3 IV percentile only; side choice and trend-conflict filter use lag1/T-1 information for the T signal.",
     "sidecar_stops": "Overlay portfolio loss stop is evaluated independently by strategy_layer; a loss in one sidecar cannot force another sidecar to close.",
     "minute_replay": "Default replay treats the signal date as T and opens with Toolkit minute bars on T+1."
-  }
+  },
+  "external_pending_no_price_counts_carry_days": false
 }

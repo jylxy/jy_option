@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
+import json
 import logging
 import math
 from pathlib import Path
@@ -455,9 +456,14 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 })
                 return
 
-            carry_days = int(item.get("external_pending_carry_days", 0) or 0) + 1
+            prior_carry_days = int(item.get("external_pending_carry_days", 0) or 0)
+            no_price_no_carry = (
+                reason == "no_valid_minute_price"
+                and not bool(self.config.get("external_pending_no_price_counts_carry_days", False))
+            )
+            carry_days = prior_carry_days if no_price_no_carry else prior_carry_days + 1
             max_carry_days = self._external_pending_max_carry_days()
-            if max_carry_days >= 0 and carry_days > max_carry_days:
+            if not no_price_no_carry and max_carry_days >= 0 and carry_days > max_carry_days:
                 self.diagnostics_records.append({
                     "date": date_str,
                     "scope": "external_intent_minute_replay",
@@ -1559,8 +1565,8 @@ def make_external_engine_class(base_cls, estimate_margin_func):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay S1 external daily intents with Toolkit minute execution.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--signals", default=str(DEFAULT_SIGNALS))
-    parser.add_argument("--signal-date-column", default="entry_date")
+    parser.add_argument("--signals", default="")
+    parser.add_argument("--signal-date-column", default="")
     parser.add_argument("--start-date", default="2022-01-04")
     parser.add_argument("--end-date", default="2026-03-31")
     parser.add_argument("--products", default="")
@@ -1580,8 +1586,11 @@ def main() -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
 
     config_path = resolve_repo_path(args.config, DEFAULT_CONFIG)
-    signals_path = resolve_repo_path(args.signals, DEFAULT_SIGNALS)
-    signals = load_signal_schedule(signals_path, args.signal_date_column)
+    config_data = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    config_signal_path = config_data.get("external_signal_path")
+    signals_path = resolve_repo_path(args.signals or config_signal_path, DEFAULT_SIGNALS)
+    signal_date_column = args.signal_date_column or config_data.get("external_signal_date_column", "entry_date")
+    signals = load_signal_schedule(signals_path, signal_date_column)
 
     base_cls, estimate_margin_func = import_toolkit_components()
     engine_cls = make_external_engine_class(base_cls, estimate_margin_func)
