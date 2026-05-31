@@ -133,6 +133,11 @@ def _orders_from_signals(signals: pd.DataFrame, signal_date: str, execute_date: 
     out["strategy"] = "S1"
     if "strategy_layer" not in out.columns:
         out["strategy_layer"] = out["entry_reason"].fillna("").replace("", "external_signal")
+    else:
+        entry_reason = out["entry_reason"].fillna("").astype(str)
+        entry_reason = entry_reason.mask(entry_reason.eq(""), "external_signal")
+        strategy_layer = out["strategy_layer"].fillna("").astype(str)
+        out["strategy_layer"] = strategy_layer.mask(strategy_layer.eq(""), entry_reason)
     out["code"] = out["toolkit_code"]
     out["source_contract_code"] = out["contract_code"].astype(str)
     out["expiry"] = out["target_expiry"].astype(str).str[:10]
@@ -227,7 +232,10 @@ class PaperTradingOrderGenerator:
 
         snapshot = load_effective_config(config_path)
         config = snapshot.config
-        signal_path = resolve_path(config.get("external_signal_path"), default=DEFAULT_PAPER_CONFIG)
+        signal_path_value = config.get("external_signal_path")
+        if not signal_path_value:
+            raise ValueError("s1 paper config must define external_signal_path")
+        signal_path = resolve_path(signal_path_value)
         date_col = str(config.get("external_signal_date_column", "entry_date") or "entry_date")
         all_signals = _load_external_signals(signal_path, date_col)
         day_signals = all_signals[all_signals["signal_date_key"].eq(signal_date)].copy()
@@ -237,6 +245,37 @@ class PaperTradingOrderGenerator:
         execute_date = _next_execution_date(signal_date, str(config.get("external_signal_default_execution_lag", "T_plus_1")))
         orders = _orders_from_signals(day_signals, signal_date, execute_date)
         diagnostics = _diagnostics_from_orders(orders)
+        schedule_dates = all_signals["signal_date_key"].dropna().astype(str)
+        schedule_min = schedule_dates.min() if not schedule_dates.empty else ""
+        schedule_max = schedule_dates.max() if not schedule_dates.empty else ""
+        if not schedule_min or signal_date < schedule_min or signal_date > schedule_max:
+            schedule_status = "outside_schedule_range"
+            diagnostics = pd.concat(
+                [
+                    diagnostics,
+                    pd.DataFrame(
+                        [
+                            {
+                                "signal_date": signal_date,
+                                "product": "",
+                                "code": "",
+                                "entry_reason": "external_intent_schedule",
+                                "strategy_layer": "schedule_audit",
+                                "reason": schedule_status,
+                                "schedule_min_date": schedule_min,
+                                "schedule_max_date": schedule_max,
+                                "external_signal_path": str(signal_path),
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+                sort=False,
+            )
+        elif day_signals.empty:
+            schedule_status = "inside_range_no_signal"
+        else:
+            schedule_status = "covered"
 
         orders_path = output_dir / "orders" / f"orders_{tag}.csv"
         diagnostics_path = output_dir / "diagnostics" / f"diagnostics_{tag}.csv"
@@ -249,6 +288,9 @@ class PaperTradingOrderGenerator:
             "config_sha256": snapshot.sha256,
             "external_signal_path": str(signal_path),
             "external_signal_rows": int(len(all_signals)),
+            "external_signal_min_date": schedule_min,
+            "external_signal_max_date": schedule_max,
+            "external_signal_schedule_status": schedule_status,
             "generated_order_count": int(len(orders)),
             "diagnostic_row_count": int(len(diagnostics)),
             "products": list(request.products) if request.products else None,

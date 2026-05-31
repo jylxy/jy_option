@@ -3,7 +3,7 @@
 This workspace is the clean paper-trading preparation project for the current S1 line:
 
 ```text
-s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
+s1_strict_main_overlay1_plus_overlay23_20260531
 ```
 
 It contains only the approved S1 external-intent order flow:

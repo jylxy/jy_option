@@ -30,7 +30,7 @@ DEFAULT_SIGNALS = (
     / "s1_paper_trading_prepare"
     / "data"
     / "external_signals"
-    / "four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv"
+    / "strict_main_overlay1_plus_overlay23_open_signals.csv"
 )
 
 EXCHANGE_TO_SUFFIX = {
@@ -1570,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="2022-01-04")
     parser.add_argument("--end-date", default="2026-03-31")
     parser.add_argument("--products", default="")
-    parser.add_argument("--tag", default="s1_four_layer_overlay123_extintent_minute_20260531")
+    parser.add_argument("--tag", default="s1_strict_main_overlay123_extintent_minute_20260531")
     parser.add_argument(
         "--same-day-execution",
         action="store_true",

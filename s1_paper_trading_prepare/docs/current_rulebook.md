@@ -3,7 +3,7 @@
 Version:
 
 ```text
-s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
+s1_strict_main_overlay1_plus_overlay23_20260531
 ```
 
 This document is the source-of-truth description for the current paper-trading engineering line. It describes the rule implemented by `configs/s1_paper_mainline.json` and consumed by the external-intent order generator and Toolkit minute replay.

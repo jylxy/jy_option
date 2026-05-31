@@ -121,8 +121,8 @@ def update_daily_data(
         "empty_dates": empty,
         "table_status": status,
         "notes": [
-            "This refresh is scoped to the approved S1 four-layer external-intent line.",
-            "Daily signal tables must be point-in-time and then update external_signal_path before order generation.",
+            "This refresh is scoped to the approved S1 strict main + overlay1/2/3 external-intent line.",
+            "Daily signal tables must be point-in-time and then refresh the file referenced by external_signal_path before order generation.",
         ],
     }
     if write_outputs:

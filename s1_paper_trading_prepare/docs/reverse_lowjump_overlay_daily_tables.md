@@ -3,7 +3,7 @@
 This document lists the daily tables needed by the current S1 paper line:
 
 ```text
-s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
+s1_strict_main_overlay1_plus_overlay23_20260531
 ```
 
 All rolling statistics must be point-in-time. A T signal may use the T close snapshot and trailing history through T, then paper execution starts on T+1.
@@ -440,7 +440,7 @@ Purpose: clean handoff from daily signal generation to order review and minute r
 Configured path:
 
 ```text
-data/external_signals/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv
+data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv
 ```
 
 Generated schedules are local data artifacts and are not committed.
