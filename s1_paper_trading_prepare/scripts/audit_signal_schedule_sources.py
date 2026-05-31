@@ -33,6 +33,12 @@ DEFAULT_OVERLAY23_REFERENCE = (
     / "four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20220104_20260331"
     / "open_signals.csv"
 )
+REFERENCE_FIELD_PARITY_NOTE = (
+    "The default main+overlay1 reference is an include_etf research output. "
+    "After filtering SSE/SZSE rows, ETF trades can still affect NAV, current margin, "
+    "and margin budget fields. Treat this audit as source-key provenance unless "
+    "--strict-fields is explicitly requested for a same-account-state reference."
+)
 
 OVERLAY23_LAYERS = {
     "overlay2_risk_reversal_same_sign",
@@ -254,6 +260,7 @@ def main() -> int:
             "current_overlay23_rows": int(len(current_23)),
             "duplicate_key_rows": int(len(duplicates)),
             "strict_fields": bool(args.strict_fields),
+            "field_parity_note": REFERENCE_FIELD_PARITY_NOTE,
             "passed": bool(duplicates.empty and not current.empty),
         }
         audit_dir = output_dir / "audit"
@@ -311,6 +318,7 @@ def main() -> int:
         "column_diff_rows_sampled": int(len(column_diffs)),
         "duplicate_key_rows": int(len(duplicates)),
         "strict_fields": bool(args.strict_fields),
+        "field_parity_note": REFERENCE_FIELD_PARITY_NOTE,
     }
     audit["passed"] = bool(
         key_diffs.empty

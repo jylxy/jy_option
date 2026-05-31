@@ -57,6 +57,15 @@ If those fields differ from the gold schedule, the cause is in signal sizing,
 NAV/account state, margin-budget state, or source-version selection before
 execution, not in the minute fill path.
 
+The historical main + overlay1 source is an `include_etf` research output.
+After excluding `SSE/SZSE` rows, it still carries ETF trades in account-state
+fields such as NAV, current margin, and margin budget. Therefore that source is
+valid for signal-key provenance, but not for strict account-state field parity.
+For example, the source opens an SSE ETF sidecar on `2022-04-29` with
+`premium_cash=10032` and `margin_cash=382432`; after the ETF row is excluded,
+its realized premium still lifts the source margin budget by `10032 * 70% =
+7022.4`, causing the `2022-05-26` ZN target quantity to differ by one lot.
+
 ## Daily Incremental State
 
 Persist these small rolling tables locally and append `T` only:
