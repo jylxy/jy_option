@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import math
 from pathlib import Path
@@ -1109,6 +1109,135 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     return spot, "expiry_daily_snapshot_spot_close", code
             return np.nan, "daily_snapshot_spot_missing", ""
 
+        def _query_expiry_option_chain_pcp_spot(
+            self,
+            pos,
+            date_str: str,
+            underlying_code: str,
+        ) -> tuple[float, str, str]:
+            if not bool(self.config.get("expiry_option_chain_pcp_fallback_enabled", True)):
+                return np.nan, "expiry_option_chain_pcp_disabled", ""
+            try:
+                from query_filters import quote_sql_literal  # type: ignore
+                from spot_provider import estimate_spot_pcp  # type: ignore
+                from toolkit.selector import select_bars_sql  # type: ignore
+            except Exception:
+                return np.nan, "expiry_option_chain_pcp_import_failed", ""
+
+            product = str(getattr(pos, "product", "") or "").upper()
+            expiry = str(getattr(pos, "expiry", "") or "")[:10]
+            if not product or not expiry:
+                return np.nan, "expiry_option_chain_pcp_missing_meta", ""
+
+            codes = []
+            for code in sorted(self.ci.get_product_codes(product)):
+                info = self.ci.lookup(code) or {}
+                if str(info.get("expiry_date", ""))[:10] == expiry:
+                    codes.append(code)
+            if not codes:
+                return np.nan, "expiry_option_chain_pcp_no_contracts", ""
+
+            try:
+                max_lookback = int(self.config.get("expiry_option_chain_pcp_lookback_days", 3) or 0)
+            except (TypeError, ValueError):
+                max_lookback = 3
+            max_lookback = max(max_lookback, 0)
+            try:
+                expiry_dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return np.nan, "expiry_option_chain_pcp_bad_date", ""
+            start_dt = expiry_dt - timedelta(days=max_lookback)
+
+            frames = []
+            chunk_size = 400
+            for offset in range(0, len(codes), chunk_size):
+                code_chunk = codes[offset: offset + chunk_size]
+                code_sql = ", ".join(quote_sql_literal(code) for code in code_chunk)
+                query = f"""
+                    SELECT
+                        ths_code,
+                        toString(toDate(time)) AS trade_date,
+                        argMax(toFloat64OrZero(close), time) AS option_close,
+                        sum(toInt64OrZero(volume)) AS volume
+                    FROM option_hf_1min_non_ror
+                    WHERE toDate(time) <= toDate('{expiry_dt:%Y-%m-%d}')
+                      AND toDate(time) >= toDate('{start_dt:%Y-%m-%d}')
+                      AND ths_code IN ({code_sql})
+                      AND toFloat64OrZero(close) > 0
+                    GROUP BY ths_code, trade_date
+                """
+                try:
+                    part = select_bars_sql(query)
+                except Exception as exc:
+                    self.diagnostics_records.append({
+                        "date": date_str,
+                        "scope": "external_intent_minute_replay",
+                        "name": "expiry_option_chain_pcp_lookup_failed",
+                        "product": product,
+                        "code": getattr(pos, "code", ""),
+                        "underlying_code": underlying_code,
+                        "expiry": expiry,
+                        "error": str(exc),
+                    })
+                    continue
+                if part is not None and not part.empty:
+                    frames.append(part)
+            if not frames:
+                return np.nan, "expiry_option_chain_pcp_no_minute_chain", ""
+
+            frame = pd.concat(frames, ignore_index=True)
+            frame["option_close"] = pd.to_numeric(frame["option_close"], errors="coerce")
+            frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+            frame = frame[frame["option_close"].notna() & frame["option_close"].gt(0)].copy()
+            if frame.empty:
+                return np.nan, "expiry_option_chain_pcp_no_valid_price", ""
+
+            meta_rows = []
+            for row in frame.itertuples(index=False):
+                info = self.ci.lookup(str(row.ths_code)) or {}
+                if str(info.get("expiry_date", ""))[:10] != expiry:
+                    continue
+                meta_rows.append({
+                    "trade_date": str(row.trade_date)[:10],
+                    "option_code": str(row.ths_code),
+                    "option_type": info.get("option_type", ""),
+                    "strike": safe_float(info.get("strike"), np.nan),
+                    "option_close": safe_float(row.option_close, np.nan),
+                    "volume": safe_float(row.volume, 0.0),
+                    "dte": max((datetime.strptime(expiry, "%Y-%m-%d").date() - datetime.strptime(str(row.trade_date)[:10], "%Y-%m-%d").date()).days, 0),
+                })
+            chain = pd.DataFrame(meta_rows)
+            if chain.empty:
+                return np.nan, "expiry_option_chain_pcp_no_valid_contract_meta", ""
+            chain = chain[
+                chain["option_type"].isin(["C", "P"])
+                & chain["strike"].notna()
+                & chain["strike"].gt(0)
+                & chain["option_close"].notna()
+                & chain["option_close"].gt(0)
+            ].copy()
+            if chain.empty:
+                return np.nan, "expiry_option_chain_pcp_no_valid_chain_rows", ""
+
+            for trade_date in sorted(chain["trade_date"].dropna().unique(), reverse=True):
+                day_chain = chain[chain["trade_date"].eq(trade_date)].copy()
+                if day_chain["option_type"].nunique() < 2:
+                    continue
+                spot = estimate_spot_pcp(
+                    day_chain,
+                    price_col="option_close",
+                    volume_col="volume",
+                    dte_col="dte",
+                )
+                if spot and np.isfinite(spot) and spot > 0:
+                    return (
+                        float(spot),
+                        f"expiry_option_chain_pcp:{trade_date}",
+                        f"{product}:{expiry}",
+                    )
+
+            return np.nan, "expiry_option_chain_pcp_no_pair_estimate", ""
+
         def _expiry_spot_close(self, pos, date_str: str, daily_df: pd.DataFrame | None = None) -> tuple[float, str, str]:
             info = self.ci.lookup(pos.code) or {}
             underlying_code = getattr(pos, "underlying_code", "") or info.get("underlying_code", "")
@@ -1151,6 +1280,13 @@ def make_external_engine_class(base_cls, estimate_margin_func):
             )
             if np.isfinite(snapshot_price) and snapshot_price > 0:
                 return snapshot_price, snapshot_source, snapshot_code
+            pcp_price, pcp_source, pcp_code = self._query_expiry_option_chain_pcp_spot(
+                pos,
+                date_str,
+                underlying_code,
+            )
+            if np.isfinite(pcp_price) and pcp_price > 0:
+                return pcp_price, pcp_source, pcp_code
             if not np.isfinite(spot) or spot <= 0:
                 self.diagnostics_records.append({
                     "date": date_str,
@@ -1162,6 +1298,7 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     "previous_spot": safe_float(getattr(pos, "cur_spot", np.nan), np.nan),
                     "future_daily_source": future_source,
                     "daily_snapshot_source": snapshot_source,
+                    "option_chain_pcp_source": pcp_source,
                 })
                 return np.nan, "underlying_daily_close_missing", ""
             return np.nan, "underlying_daily_close_missing", ""

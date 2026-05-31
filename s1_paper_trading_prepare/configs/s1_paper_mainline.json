@@ -53,8 +53,11 @@
     "future_daily_settlement",
     "future_daily_close",
     "underlying_daily_close",
-    "exact_daily_snapshot_spot_close_or_pcp"
+    "exact_daily_snapshot_spot_close_or_pcp",
+    "same_expiry_option_chain_pcp_spot"
   ],
+  "expiry_option_chain_pcp_fallback_enabled": true,
+  "expiry_option_chain_pcp_lookback_days": 3,
   "margin_cap": 0.7,
   "s1_margin_cap": 0.7,
   "main_sleeve": {
