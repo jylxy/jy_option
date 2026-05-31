@@ -3,7 +3,7 @@
 This document lists the daily tables needed by the current S1 paper line:
 
 ```text
-s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531
+s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
 ```
 
 All rolling statistics must be point-in-time. A T signal may use the T close snapshot and trailing history through T, then paper execution starts on T+1.
@@ -182,15 +182,146 @@ Filters:
 
 ```text
 nearest expiry
-DTE >= 7
+DTE >= 10
 OTM
-abs(delta) < 0.05
+abs(delta) < 0.04
 open_interest >= 1000
 volume > 0
 close > 0
 ```
 
-### 8. overlay_opened_expiry_ledger
+### 8. risk_reversal_sidecar_panel
+
+Purpose: Overlay2 skew/RR trigger.
+
+Path:
+
+```text
+data/risk_reversal_sidecar/risk_reversal_panel.csv
+```
+
+Required fields:
+
+```text
+risk_reversal
+abs_risk_reversal
+iv_percentile
+iv_prior_days
+risk_reversal_lag1, risk_reversal_lag2, risk_reversal_lag3
+abs_risk_reversal_lag1, abs_risk_reversal_lag2, abs_risk_reversal_lag3
+iv_percentile_lag1, iv_percentile_lag2, iv_percentile_lag3
+put_iv_lag1, call_iv_lag1
+forced_sell_side
+```
+
+Trigger:
+
+```text
+iv_percentile_lag3 >= 95%
+AND abs_risk_reversal_lag3 > 0
+AND abs_risk_reversal_lag2 < abs_risk_reversal_lag3
+AND abs_risk_reversal_lag1 <= abs_risk_reversal_lag2
+AND sign(risk_reversal_lag1) == sign(risk_reversal_lag2) == sign(risk_reversal_lag3)
+```
+
+Guard: all trigger columns are lagged. The T row may be stored for audit but cannot be used to decide the T signal.
+
+### 9. risk_reversal_sidecar_contract_candidates
+
+Purpose: Overlay2 side and contract selection.
+
+Partition:
+
+```text
+data/risk_reversal_sidecar/contract_candidates_YYYYMMDD.csv
+```
+
+Filters:
+
+```text
+nearest expiry
+DTE >= 10
+OTM
+abs(delta) < 0.03
+open_interest >= 1000
+volume > 0
+close > 0
+```
+
+Sell side:
+
+```text
+risk_reversal_lag1 > 0 -> Call
+risk_reversal_lag1 < 0 -> Put
+```
+
+### 10. term_structure_sidecar_panel
+
+Purpose: Overlay3 term-structure trigger.
+
+Path:
+
+```text
+data/term_structure_sidecar/term_structure_panel.csv
+```
+
+Required fields:
+
+```text
+near_atm_iv
+next_atm_iv
+term_spread
+iv_percentile
+term_spread_lag1, term_spread_lag2, term_spread_lag3
+near_atm_iv_lag1, next_atm_iv_lag1
+iv_percentile_lag1, iv_percentile_lag2, iv_percentile_lag3
+t1_trend_20d
+t1_side
+t1_trend_conflict
+```
+
+Trigger:
+
+```text
+iv_percentile_lag3 >= 95%
+AND term_spread_lag3 > 0
+AND term_spread_lag2 < term_spread_lag3
+AND term_spread_lag1 <= term_spread_lag2
+AND term_spread_lag1 > 0
+```
+
+### 11. term_structure_sidecar_contract_candidates
+
+Purpose: Overlay3 side and contract selection.
+
+Partition:
+
+```text
+data/term_structure_sidecar/contract_candidates_YYYYMMDD.csv
+```
+
+Filters:
+
+```text
+nearest expiry
+DTE >= 10
+OTM
+abs(delta) < 0.03
+open_interest >= 1000
+volume > 0
+close > 0
+```
+
+Side and concentration:
+
+```text
+At T-1, choose the higher-IV-pressure side.
+If Call and 20d trend > 0, skip.
+If Put and 20d trend < 0, skip.
+same strategy_layer + week + exchange + sell side <= 2
+```
+
+### 12. overlay_opened_expiry_ledger
 
 Purpose: enforce one overlay open per product and expiry.
 
@@ -200,7 +331,46 @@ Path:
 state/overlay_opened_expiry_ledger.csv
 ```
 
-### 9. paper_account_state
+### 13. sidecar_week_exchange_side_ledger
+
+Purpose: enforce weekly sidecar concentration for overlay3 and any future layer that uses the same cap.
+
+Path:
+
+```text
+state/sidecar_week_exchange_side_ledger.csv
+```
+
+Key:
+
+```text
+strategy_layer, week, exchange, sell_side
+```
+
+Current cap:
+
+```text
+count <= 2
+```
+
+### 14. sidecar_layer_stop_diagnostics
+
+Purpose: evaluate the overlay stop independently by strategy layer.
+
+Output:
+
+```text
+output/audit/sidecar_layer_stop_YYYYMMDD.csv
+```
+
+Rule:
+
+```text
+if layer_unrealized_pnl < -0.20% NAV:
+    close only losing positions in that layer
+```
+
+### 15. paper_account_state
 
 Purpose: NAV, open positions, fills, fees, margin, pending orders.
 
@@ -213,7 +383,7 @@ state/fills.csv
 state/pending_orders.csv
 ```
 
-### 10. paper_close_mark
+### 16. paper_close_mark
 
 Purpose: T close paper-account valuation and return.
 
@@ -233,7 +403,7 @@ daily_return = daily_pnl / input_nav
 short-option daily_pnl = signed_quantity * (mark_price - previous_mark_price) * multiplier
 ```
 
-### 11. expiry_underlying_settlement_price
+### 17. expiry_underlying_settlement_price
 
 Purpose: exact expiry intrinsic settlement when the option itself has no tradable minute price.
 
@@ -263,14 +433,14 @@ do not use cross-month same-product substitutes
 write expiry_settlement_blocked_missing_spot when blocked
 ```
 
-### 12. external_intent_schedule
+### 18. external_intent_schedule
 
 Purpose: clean handoff from daily signal generation to order review and minute replay.
 
 Configured path:
 
 ```text
-data/external_signals/broad_sector_margin45_new075_plus_iv95_pullback_overlay002_open_signals.csv
+data/external_signals/four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv
 ```
 
 Generated schedules are local data artifacts and are not committed.
@@ -279,5 +449,7 @@ Generated schedules are local data artifacts and are not committed.
 
 - L1 low-jump and flow features use T or earlier data.
 - Overlay trigger uses lag1-lag4 fields only.
+- Overlay2 RR trigger uses lag1-lag3 fields only; sell side is forced from lag1 risk_reversal sign.
+- Overlay3 term trigger uses lag1-lag3 fields only; side pressure and trend conflict use T-1 information.
 - Contract selection and budget sizing use the T snapshot plus current paper-account state.
 - Minute replay may use T+1 minute data only for execution simulation, not for T signal selection.

@@ -1,7 +1,7 @@
 {
   "registry_version": "2026-05-31",
   "scope": "current S1 paper-trading line only",
-  "current_mainline": "s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531",
+  "current_mainline": "s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531",
   "tables": [
     {
       "name": "option_chain_daily_snapshot",
@@ -72,14 +72,74 @@
       "paper_action": "Recompute from the T snapshot; select the higher-IV-pressure side."
     },
     {
+      "name": "risk_reversal_sidecar_panel",
+      "status": "active_overlay_input",
+      "layer": "Overlay2 L1",
+      "source": "Toolkit option snapshots from 2018-01-01 for non-ETF nearest-expiry OTM put/call IV skew",
+      "config_gate_key": "s1_overlay2_risk_reversal_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/risk_reversal_sidecar/risk_reversal_panel.csv",
+      "paper_action": "Append T product-day risk_reversal = call_iv - put_iv and expanding percentile. Trigger fields must use lag1 through lag3 only."
+    },
+    {
+      "name": "risk_reversal_sidecar_contract_candidates",
+      "status": "active_overlay_input",
+      "layer": "Overlay2 L2/L4",
+      "source": "T-day nearest-expiry OTM contracts after a risk-reversal repair trigger",
+      "config_gate_key": "s1_overlay2_risk_reversal_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/risk_reversal_sidecar/contract_candidates_YYYYMMDD.csv",
+      "paper_action": "Recompute from the T snapshot. Sell call when lag1 risk_reversal is positive, otherwise sell put."
+    },
+    {
+      "name": "term_structure_sidecar_panel",
+      "status": "active_overlay_input",
+      "layer": "Overlay3 L1",
+      "source": "Toolkit option snapshots from 2018-01-01 for nearest and second-nearest ATM IV term spread",
+      "config_gate_key": "s1_overlay3_term_structure_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/term_structure_sidecar/term_structure_panel.csv",
+      "paper_action": "Append T product-day term_spread = near_atm_iv - next_atm_iv and expanding percentile. Trigger fields must use lag1 through lag3 only."
+    },
+    {
+      "name": "term_structure_sidecar_contract_candidates",
+      "status": "active_overlay_input",
+      "layer": "Overlay3 L2/L4",
+      "source": "T-1 nearest-expiry OTM side-pressure scan and T-day contract candidates after a term-structure repair trigger",
+      "config_gate_key": "s1_overlay3_term_structure_enabled",
+      "config_gate_expected": true,
+      "paper_path": "data/term_structure_sidecar/contract_candidates_YYYYMMDD.csv",
+      "paper_action": "Recompute from the T snapshot after the T-1 side and trend-conflict filter pass."
+    },
+    {
+      "name": "sidecar_week_exchange_side_ledger",
+      "status": "paper_required",
+      "layer": "Overlay risk state",
+      "source": "Paper account state and approved sidecar signal builder",
+      "config_gate_key": "sidecar_risk_controls.weekly_exchange_side_cap",
+      "config_gate_expected": 2,
+      "paper_path": "state/sidecar_week_exchange_side_ledger.csv",
+      "paper_action": "Persist strategy_layer + ISO week + exchange + sell side counts so each sidecar obeys the weekly concentration cap."
+    },
+    {
+      "name": "sidecar_layer_stop_diagnostics",
+      "status": "paper_required",
+      "layer": "Overlay risk state",
+      "source": "Paper account state and Toolkit daily close marks",
+      "config_gate_key": "sidecar_risk_controls.loss_stop_scope",
+      "config_gate_expected": "strategy_layer",
+      "paper_path": "output/audit/sidecar_layer_stop_YYYYMMDD.csv",
+      "paper_action": "Evaluate unrealized PnL independently by strategy_layer and close only losing positions in the triggered layer."
+    },
+    {
       "name": "overlay_opened_expiry_ledger",
       "status": "paper_required",
       "layer": "Overlay risk state",
       "source": "Paper account state",
-      "config_gate_key": "s1_iv_pullback_overlay_enabled",
+      "config_gate_key": "sidecar_risk_controls.one_open_per_product_expiry",
       "config_gate_expected": true,
       "paper_path": "state/overlay_opened_expiry_ledger.csv",
-      "paper_action": "Persist product+expiry keys so the sidecar opens at most once per product expiry."
+      "paper_action": "Persist product+expiry keys so the sidecars open at most once per product expiry."
     },
     {
       "name": "expiry_underlying_settlement_price",

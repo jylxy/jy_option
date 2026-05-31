@@ -33,6 +33,9 @@ RULE_KEYS = (
     "s1_margin_cap",
     "main_sleeve",
     "iv_pullback_sidecar",
+    "risk_reversal_sidecar",
+    "term_structure_sidecar",
+    "sidecar_risk_controls",
     "broad_sector_groups",
     "future_function_guards",
 )

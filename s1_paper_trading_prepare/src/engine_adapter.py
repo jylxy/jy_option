@@ -131,6 +131,8 @@ def _orders_from_signals(signals: pd.DataFrame, signal_date: str, execute_date: 
     out["order_status"] = "planned_external_intent"
     out["action"] = "open_sell"
     out["strategy"] = "S1"
+    if "strategy_layer" not in out.columns:
+        out["strategy_layer"] = out["entry_reason"].fillna("").replace("", "external_signal")
     out["code"] = out["toolkit_code"]
     out["source_contract_code"] = out["contract_code"].astype(str)
     out["expiry"] = out["target_expiry"].astype(str).str[:10]
@@ -143,6 +145,14 @@ def _orders_from_signals(signals: pd.DataFrame, signal_date: str, execute_date: 
     out["selected_side_iv_pressure"] = _safe_numeric(out, "selected_side_iv_pressure")
     out["other_side_iv_pressure"] = _safe_numeric(out, "other_side_iv_pressure")
     out["side_iv_pressure_diff"] = _safe_numeric(out, "side_iv_pressure_diff")
+    if "forced_sell_side" not in out.columns and "sell_side" in out.columns:
+        out["forced_sell_side"] = out["sell_side"]
+    if "overlay_signal_family" not in out.columns:
+        layer = out["strategy_layer"].astype(str)
+        out["overlay_signal_family"] = np.where(layer.str.startswith("overlay"), layer, "")
+    for column in ("overlay_strategy", "overlay_signal_rule", "overlay_side_rule", "overlay_priority"):
+        if column not in out.columns:
+            out[column] = ""
     out["l1_rule"] = "rule_l1_oi03_flow_guard"
     out["l2_rule"] = "high_iv_pressure_side"
     out["l3_rule"] = "l3eff015_budget_tilt_and_margin45_new075"
@@ -166,8 +176,18 @@ def _diagnostics_from_orders(orders: pd.DataFrame) -> pd.DataFrame:
         )
     out = orders.copy()
     entry_reason = out.get("entry_reason", pd.Series("", index=out.index)).astype(str)
-    min_oi = np.where(entry_reason.eq("iv_extreme_overlay"), 1000.0, 1000.0)
-    delta_cap = np.where(entry_reason.eq("iv_extreme_overlay"), 0.05, 0.08)
+    strategy_layer = out.get("strategy_layer", pd.Series("", index=out.index)).astype(str)
+    overlay_mask = entry_reason.eq("iv_extreme_overlay") | strategy_layer.str.startswith("overlay")
+    min_oi = np.where(overlay_mask, 1000.0, 1000.0)
+    delta_cap = np.where(overlay_mask, 0.04, 0.08)
+    delta_cap = np.where(
+        strategy_layer.isin(["overlay2_risk_reversal_same_sign", "overlay3_term_structure_cluster_cap2"]),
+        0.03,
+        delta_cap,
+    )
+    if "overlay_tier_max_abs_delta" in out.columns:
+        tier_cap = pd.to_numeric(out["overlay_tier_max_abs_delta"], errors="coerce")
+        delta_cap = np.where(tier_cap.notna(), tier_cap.to_numpy(), delta_cap)
     weak = _safe_numeric(out, "side_iv_pressure_diff").lt(0.02)
     delta_cap = np.where(entry_reason.eq("monthly") & weak.fillna(False), 0.04, delta_cap)
     abs_delta = _safe_numeric(out, "delta").abs()
@@ -177,6 +197,7 @@ def _diagnostics_from_orders(orders: pd.DataFrame) -> pd.DataFrame:
             "product": out["product"],
             "code": out["code"],
             "entry_reason": entry_reason,
+            "strategy_layer": strategy_layer,
             "l0_oi_ok": pd.to_numeric(out.get("close_oi", np.nan), errors="coerce").ge(min_oi),
             "l0_volume_ok": pd.to_numeric(out.get("volume", np.nan), errors="coerce").gt(0),
             "l0_delta_ok": abs_delta.lt(delta_cap),

@@ -121,7 +121,7 @@ def update_daily_data(
         "empty_dates": empty,
         "table_status": status,
         "notes": [
-            "This refresh is scoped to the approved reverse-lowjump/high-IV-pressure external-intent line.",
+            "This refresh is scoped to the approved S1 four-layer external-intent line.",
             "Daily signal tables must be point-in-time and then update external_signal_path before order generation.",
         ],
     }

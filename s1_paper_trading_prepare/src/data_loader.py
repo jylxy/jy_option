@@ -178,4 +178,10 @@ def load_trading_dates(start_date: str, end_date: str) -> list[str]:
     from day_loader import ToolkitDayLoader
 
     loader = ToolkitDayLoader(ContractInfo())
-    return [str(date)[:10] for date in loader.get_trading_dates(str(start_date)[:10], str(end_date)[:10])]
+    dates = []
+    for date in loader.get_trading_dates(str(start_date)[:10], str(end_date)[:10]):
+        key = str(date)[:10]
+        ts = pd.to_datetime(key, errors="coerce")
+        if pd.notna(ts) and ts.weekday() < 5:
+            dates.append(key)
+    return dates

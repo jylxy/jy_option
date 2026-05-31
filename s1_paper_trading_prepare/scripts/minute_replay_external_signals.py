@@ -29,7 +29,7 @@ DEFAULT_SIGNALS = (
     / "s1_paper_trading_prepare"
     / "data"
     / "external_signals"
-    / "broad_sector_margin45_new075_plus_iv95_pullback_overlay002_open_signals.csv"
+    / "four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_open_signals.csv"
 )
 
 EXCHANGE_TO_SUFFIX = {
@@ -51,6 +51,7 @@ EXTERNAL_META_FIELDS = (
     "external_execution_mode",
     "external_source_contract_code",
     "external_entry_reason",
+    "external_strategy_layer",
     "external_side_rule",
     "external_budget_group",
     "external_target_premium_pct",
@@ -61,9 +62,41 @@ EXTERNAL_META_FIELDS = (
     "external_selected_side_iv_pressure",
     "external_other_side_iv_pressure",
     "external_side_iv_pressure_diff",
+    "external_forced_sell_side",
+    "external_trend_20d",
+    "external_overlay_strategy",
+    "external_overlay_signal_family",
     "external_overlay_signal_rule",
+    "external_overlay_side_rule",
+    "external_overlay_priority",
+    "external_overlay_trigger_trade_date",
+    "external_overlay_trigger_iv_percentile",
+    "external_overlay_iv_percentile_lag1",
+    "external_overlay_iv_percentile_lag2",
+    "external_overlay_iv_percentile_lag3",
     "external_overlay_iv_percentile_lag4",
     "external_overlay_atm_iv_lag1",
+    "external_overlay_atm_iv_lag2",
+    "external_overlay_atm_iv_lag3",
+    "external_overlay_atm_iv_lag4",
+    "external_overlay_tier_threshold",
+    "external_overlay_tier_max_abs_delta",
+    "external_overlay_tier_target_premium_pct",
+    "external_risk_reversal_lag1",
+    "external_risk_reversal_lag2",
+    "external_risk_reversal_lag3",
+    "external_abs_risk_reversal_lag1",
+    "external_abs_risk_reversal_lag2",
+    "external_abs_risk_reversal_lag3",
+    "external_term_spread_lag1",
+    "external_term_spread_lag2",
+    "external_term_spread_lag3",
+    "external_near_atm_iv_lag1",
+    "external_next_atm_iv_lag1",
+    "external_t1_trend_20d",
+    "external_t1_side",
+    "external_t1_trend_conflict",
+    "external_t1_side_skip_reason",
     "external_pending_carry_days",
     "external_pending_last_defer_reason",
     "external_rerouted",
@@ -85,9 +118,18 @@ EXTERNAL_TEXT_FIELDS = {
     "external_execution_mode",
     "external_source_contract_code",
     "external_entry_reason",
+    "external_strategy_layer",
     "external_side_rule",
     "external_budget_group",
+    "external_forced_sell_side",
+    "external_overlay_strategy",
+    "external_overlay_signal_family",
     "external_overlay_signal_rule",
+    "external_overlay_side_rule",
+    "external_overlay_trigger_trade_date",
+    "external_t1_side",
+    "external_t1_trend_conflict",
+    "external_t1_side_skip_reason",
     "external_pending_last_defer_reason",
     "external_reroute_from_code",
     "external_reroute_reason",
@@ -121,6 +163,18 @@ def safe_int(value: Any, default: int = 0) -> int:
 def normalize_signal_date(value: Any) -> str:
     ts = pd.to_datetime(value, errors="coerce")
     return "" if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+
+
+def safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none", "nat"} else text
 
 
 def to_toolkit_code(contract_code: Any, exchange: Any = "") -> str:
@@ -1122,49 +1176,62 @@ def make_external_engine_class(base_cls, estimate_margin_func):
             )
             if stop_pct <= 0 or not self.positions:
                 return
-            overlay_positions = [
-                pos for pos in self.positions
-                if getattr(pos, "role", "") == "sell"
-                and (getattr(pos, "entry_meta", {}) or {}).get("external_entry_reason") == "iv_extreme_overlay"
-            ]
-            if not overlay_positions:
-                return
-            if not self._require_fresh_option_marks(
-                overlay_positions,
-                date_str,
-                "external_overlay_portfolio_loss_stop",
-            ):
+            layer_positions: dict[str, list[Any]] = defaultdict(list)
+            for pos in self.positions:
+                if getattr(pos, "role", "") != "sell":
+                    continue
+                meta = getattr(pos, "entry_meta", {}) or {}
+                entry_reason = safe_text(meta.get("external_entry_reason"))
+                strategy_layer = safe_text(meta.get("external_strategy_layer"))
+                signal_family = safe_text(meta.get("external_overlay_signal_family"))
+                layer = strategy_layer or signal_family or entry_reason
+                if (
+                    entry_reason == "iv_extreme_overlay"
+                    or strategy_layer.startswith("overlay")
+                    or signal_family.startswith("overlay")
+                ):
+                    layer_positions[layer or "iv_extreme_overlay"].append(pos)
+            if not layer_positions:
                 return
             nav = max(self._current_nav(), 1.0)
-            pnl_by_pos = {
-                pos: (float(pos.open_price or 0.0) - float(pos.cur_price or 0.0)) * float(pos.mult or 0.0) * int(pos.n or 0)
-                for pos in overlay_positions
-            }
-            overlay_unrealized = sum(pnl_by_pos.values())
-            if overlay_unrealized >= -stop_pct * nav:
-                return
-            losing = [
-                pos for pos, pnl in pnl_by_pos.items()
-                if pnl < 0 and not (self.config.get("skip_same_day_exit_for_vwap_opens", True) and pos.open_date == date_str)
-            ]
-            if not losing:
-                return
-            self.diagnostics_records.append({
-                "date": date_str,
-                "scope": "external_intent_minute_replay",
-                "name": "overlay_portfolio_loss_stop",
-                "overlay_unrealized_pnl": overlay_unrealized,
-                "nav": nav,
-                "threshold_cash": -stop_pct * nav,
-                "closed_positions": len(losing),
-            })
-            self._close_positions(
-                losing,
-                date_str,
-                "external_overlay_portfolio_loss_stop",
-                fee,
-                exec_time="close",
-            )
+            for strategy_layer, overlay_positions in layer_positions.items():
+                if not self._require_fresh_option_marks(
+                    overlay_positions,
+                    date_str,
+                    "external_overlay_portfolio_loss_stop",
+                ):
+                    continue
+                pnl_by_pos = {
+                    pos: (float(pos.open_price or 0.0) - float(pos.cur_price or 0.0)) * float(pos.mult or 0.0) * int(pos.n or 0)
+                    for pos in overlay_positions
+                }
+                overlay_unrealized = sum(pnl_by_pos.values())
+                if overlay_unrealized >= -stop_pct * nav:
+                    continue
+                losing = [
+                    pos for pos, pnl in pnl_by_pos.items()
+                    if pnl < 0 and not (self.config.get("skip_same_day_exit_for_vwap_opens", True) and pos.open_date == date_str)
+                ]
+                if not losing:
+                    continue
+                self.diagnostics_records.append({
+                    "date": date_str,
+                    "scope": "external_intent_minute_replay",
+                    "name": "overlay_portfolio_loss_stop",
+                    "strategy_layer": strategy_layer,
+                    "overlay_unrealized_pnl": overlay_unrealized,
+                    "nav": nav,
+                    "threshold_cash": -stop_pct * nav,
+                    "overlay_position_count": len(overlay_positions),
+                    "closed_positions": len(losing),
+                })
+                self._close_positions(
+                    losing,
+                    date_str,
+                    "external_overlay_portfolio_loss_stop",
+                    fee,
+                    exec_time="close",
+                )
 
         def _build_external_pending_item(self, row: pd.Series, queue_date: str) -> dict[str, Any] | None:
             code = str(row.get("toolkit_code", "") or "")
@@ -1207,9 +1274,10 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 underlying_code=underlying_code,
                 config=self.config,
             )
-            entry_reason = str(row.get("entry_reason", "external_signal") or "external_signal")
+            entry_reason = safe_text(row.get("entry_reason", "external_signal")) or "external_signal"
+            strategy_layer = safe_text(row.get("strategy_layer", "")) or entry_reason
             entry_date = str(row.get("external_signal_date", "") or "")
-            group_id = f"EXT|{entry_reason}|{product}|{opt_type}|{expiry}|{entry_date}"
+            group_id = f"EXT|{entry_reason}|{strategy_layer}|{product}|{opt_type}|{expiry}|{entry_date}"
             qty = safe_int(row.get("qty", 0), 0)
             item = {
                 "code": code,
@@ -1242,6 +1310,7 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 "external_execution_mode": row.get("external_execution_mode", ""),
                 "external_source_contract_code": row.get("contract_code", ""),
                 "external_entry_reason": entry_reason,
+                "external_strategy_layer": strategy_layer,
                 "external_side_rule": row.get("side_rule", ""),
                 "external_budget_group": row.get("budget_group", ""),
                 "external_target_premium_pct": safe_float(row.get("target_premium_pct", np.nan), np.nan),
@@ -1252,9 +1321,41 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 "external_selected_side_iv_pressure": safe_float(row.get("selected_side_iv_pressure", np.nan), np.nan),
                 "external_other_side_iv_pressure": safe_float(row.get("other_side_iv_pressure", np.nan), np.nan),
                 "external_side_iv_pressure_diff": safe_float(row.get("side_iv_pressure_diff", np.nan), np.nan),
+                "external_forced_sell_side": row.get("forced_sell_side", ""),
+                "external_trend_20d": safe_float(row.get("trend_20d", np.nan), np.nan),
+                "external_overlay_strategy": row.get("overlay_strategy", ""),
+                "external_overlay_signal_family": row.get("overlay_signal_family", strategy_layer if strategy_layer.startswith("overlay") else ""),
                 "external_overlay_signal_rule": row.get("overlay_signal_rule", ""),
+                "external_overlay_side_rule": row.get("overlay_side_rule", ""),
+                "external_overlay_priority": safe_float(row.get("overlay_priority", np.nan), np.nan),
+                "external_overlay_trigger_trade_date": row.get("overlay_trigger_trade_date", ""),
+                "external_overlay_trigger_iv_percentile": safe_float(row.get("overlay_trigger_iv_percentile", np.nan), np.nan),
+                "external_overlay_iv_percentile_lag1": safe_float(row.get("overlay_iv_percentile_lag1", np.nan), np.nan),
+                "external_overlay_iv_percentile_lag2": safe_float(row.get("overlay_iv_percentile_lag2", np.nan), np.nan),
+                "external_overlay_iv_percentile_lag3": safe_float(row.get("overlay_iv_percentile_lag3", np.nan), np.nan),
                 "external_overlay_iv_percentile_lag4": safe_float(row.get("overlay_iv_percentile_lag4", np.nan), np.nan),
                 "external_overlay_atm_iv_lag1": safe_float(row.get("overlay_atm_iv_lag1", np.nan), np.nan),
+                "external_overlay_atm_iv_lag2": safe_float(row.get("overlay_atm_iv_lag2", np.nan), np.nan),
+                "external_overlay_atm_iv_lag3": safe_float(row.get("overlay_atm_iv_lag3", np.nan), np.nan),
+                "external_overlay_atm_iv_lag4": safe_float(row.get("overlay_atm_iv_lag4", np.nan), np.nan),
+                "external_overlay_tier_threshold": safe_float(row.get("overlay_tier_threshold", row.get("overlay_tier_threshold_override", np.nan)), np.nan),
+                "external_overlay_tier_max_abs_delta": safe_float(row.get("overlay_tier_max_abs_delta", row.get("overlay_max_abs_delta_override", np.nan)), np.nan),
+                "external_overlay_tier_target_premium_pct": safe_float(row.get("overlay_tier_target_premium_pct", row.get("overlay_target_premium_pct_override", np.nan)), np.nan),
+                "external_risk_reversal_lag1": safe_float(row.get("risk_reversal_lag1", np.nan), np.nan),
+                "external_risk_reversal_lag2": safe_float(row.get("risk_reversal_lag2", np.nan), np.nan),
+                "external_risk_reversal_lag3": safe_float(row.get("risk_reversal_lag3", np.nan), np.nan),
+                "external_abs_risk_reversal_lag1": safe_float(row.get("abs_risk_reversal_lag1", np.nan), np.nan),
+                "external_abs_risk_reversal_lag2": safe_float(row.get("abs_risk_reversal_lag2", np.nan), np.nan),
+                "external_abs_risk_reversal_lag3": safe_float(row.get("abs_risk_reversal_lag3", np.nan), np.nan),
+                "external_term_spread_lag1": safe_float(row.get("term_spread_lag1", np.nan), np.nan),
+                "external_term_spread_lag2": safe_float(row.get("term_spread_lag2", np.nan), np.nan),
+                "external_term_spread_lag3": safe_float(row.get("term_spread_lag3", np.nan), np.nan),
+                "external_near_atm_iv_lag1": safe_float(row.get("near_atm_iv_lag1", np.nan), np.nan),
+                "external_next_atm_iv_lag1": safe_float(row.get("next_atm_iv_lag1", np.nan), np.nan),
+                "external_t1_trend_20d": safe_float(row.get("t1_trend_20d", np.nan), np.nan),
+                "external_t1_side": row.get("t1_side", ""),
+                "external_t1_trend_conflict": row.get("t1_trend_conflict", ""),
+                "external_t1_side_skip_reason": row.get("t1_side_skip_reason", ""),
             }
             if not code or qty <= 0 or opt_type not in {"P", "C"} or not expiry or not np.isfinite(strike):
                 self._unresolved_signal_codes.append({
@@ -1326,7 +1427,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="2022-01-04")
     parser.add_argument("--end-date", default="2026-03-31")
     parser.add_argument("--products", default="")
-    parser.add_argument("--tag", default="s1_reverse_overlay002_extintent_minute_20260531")
+    parser.add_argument("--tag", default="s1_four_layer_overlay123_extintent_minute_20260531")
     parser.add_argument(
         "--same-day-execution",
         action="store_true",

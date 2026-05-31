@@ -3,7 +3,7 @@
 Version:
 
 ```text
-s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531
+s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
 ```
 
 This document is the source-of-truth description for the current paper-trading engineering line. It describes the rule implemented by `configs/s1_paper_mainline.json` and consumed by the external-intent order generator and Toolkit minute replay.
@@ -145,11 +145,11 @@ volume desc
 close desc
 ```
 
-## IV Pullback Overlay L0-L4
+## Overlay Sidecars L0-L4
 
-The overlay is a sidecar. It does not participate in the main monthly rhythm and has its own trigger, sizing, and stop.
+The three overlays are sidecars. They do not participate in the main monthly rhythm and each has its own trigger, sizing, layer identity, and layer-level loss stop.
 
-### Overlay L0 Universe
+### Common Overlay L0 Universe
 
 Current approved config scans non-ETF options:
 
@@ -159,7 +159,18 @@ exclude exchanges: SSE, SZSE
 
 Commodity options and CFFEX index options remain in scope.
 
-### Overlay L1 Trigger
+Common tradability:
+
+```text
+nearest expiry
+DTE >= 10
+OTM
+open interest >= 1000
+volume > 0
+close > 0
+```
+
+### Overlay1 L1 Trigger
 
 Build product-day ATM IV:
 
@@ -181,14 +192,90 @@ T-1 ATM IV < T-2 ATM IV
 min historical IV observations = 252
 ```
 
+### Overlay2 Risk-Reversal Trigger
+
+Layer id:
+
+```text
+overlay2_risk_reversal_same_sign
+```
+
+Build nearest-expiry risk reversal:
+
+```text
+sample: DTE 10-90, OTM puts/calls, 0.01 <= abs(delta) <= 0.30
+implied_vol between 1% and 250%
+close > 0
+require at least 2 put observations and 2 call observations
+risk_reversal = median_call_iv - median_put_iv
+abs_risk_reversal = abs(risk_reversal)
+```
+
+Trigger `t3_p95_rr_2d_repair_same_sign`:
+
+```text
+iv_percentile_lag3 >= 95%
+abs_risk_reversal_lag3 > 0
+abs_risk_reversal_lag2 < abs_risk_reversal_lag3
+abs_risk_reversal_lag1 <= abs_risk_reversal_lag2
+sign(risk_reversal_lag1) == sign(lag2) == sign(lag3)
+min historical IV observations = 252
+```
+
+Side:
+
+```text
+risk_reversal_lag1 > 0 -> sell Call
+risk_reversal_lag1 < 0 -> sell Put
+```
+
+### Overlay3 Term-Structure Trigger
+
+Layer id:
+
+```text
+overlay3_term_structure_cluster_cap2
+```
+
+Build term spread:
+
+```text
+sample: DTE 7-90, moneyness 0.95-1.05
+implied_vol between 1% and 250%
+close > 0
+near_atm_iv = nearest-expiry ATM IV median
+next_atm_iv = second-nearest-expiry ATM IV median
+term_spread = near_atm_iv - next_atm_iv
+```
+
+Trigger `t3_p95_term_2d_repair_t1_no_trend_conflict_cluster_cap2`:
+
+```text
+iv_percentile_lag3 >= 95%
+term_spread_lag3 > 0
+term_spread_lag2 < term_spread_lag3
+term_spread_lag1 <= term_spread_lag2
+term_spread_lag1 > 0
+min historical IV observations = 252
+```
+
+Side and trend conflict:
+
+```text
+At T-1, compare nearest-expiry OTM put/call IV pressure and choose the richer side.
+If chosen side is Call and 20d trend > 0: skip.
+If chosen side is Put and 20d trend < 0: skip.
+Same strategy_layer + week + exchange + sell side <= 2 signals.
+```
+
 ### Overlay L2 Side Choice
 
-Within the nearest eligible expiry, compare eligible OTM put/call candidate median IV and sell the side with higher IV pressure. If both sides are tied, implementation preference is call.
+Overlay1 and Overlay3 compare eligible OTM put/call candidate median IV and sell the side with higher IV pressure. If both sides are tied, implementation preference is call. Overlay2 forces the rich side from the sign of lag1 risk reversal.
 
 ### Overlay L3 Sizing
 
 ```text
-target premium = 0.02% NAV per overlay signal
+target premium = 0.025% NAV per overlay signal
 ```
 
 The overlay shares the same portfolio margin hard line:
@@ -203,9 +290,10 @@ Filters:
 
 ```text
 nearest expiry
-DTE >= 7
+DTE >= 10
 OTM
-abs(delta) < 0.05
+overlay1: abs(delta) < 0.04
+overlay2/3: abs(delta) < 0.03
 open interest >= 1000
 volume > 0
 close > 0
@@ -237,8 +325,11 @@ no holiday-risk overlay
 Overlay stop:
 
 ```text
-if aggregate overlay unrealized PnL < -0.20% NAV:
-    close only losing overlay positions
+for each strategy_layer independently:
+    if layer unrealized PnL < -0.20% NAV:
+        close only losing positions in that layer
+        do not close profitable positions in that layer
+        do not close positions in other overlay layers
 ```
 
 ## Execution Rules

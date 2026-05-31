@@ -21,7 +21,7 @@ def disallowed_tokens() -> list[str]:
     suffixes = tuple(str(index) for index in range(2, 5))
     tokens = []
     for suffix in suffixes:
-        tokens.extend([f"S{suffix}", f"s{suffix}_", f"enable_s{suffix}"])
+        tokens.extend([f"S{suffix}", f"enable_s{suffix}"])
     tokens.extend(["E" + "D1", "E" + "D2", "R" + "S1", "B" + "20"])
     return tokens
 

@@ -3,7 +3,7 @@
 This workspace is the clean paper-trading preparation project for the current S1 line:
 
 ```text
-s1_reverse_lowjump_highiv_cluster_m45_new075_plus_iv95_pullback_overlay002_20260531
+s1_four_layer_main_s1p95_025_s2_025_s3_025_layerstop_cluster2_20260531
 ```
 
 It contains only the approved S1 external-intent order flow:
@@ -27,6 +27,12 @@ The daily table contract is in:
 docs/reverse_lowjump_overlay_daily_tables.md
 ```
 
+Overlay2/3 ported rule details are in:
+
+```text
+docs/overlay2_overlay3_rulebook.md
+```
+
 ## Current Rule Summary
 
 Main sleeve:
@@ -41,10 +47,14 @@ L4: l4_diff02_delta04_l3eff015
 Overlay sidecar:
 
 ```text
-L1: T-4 IV percentile >= 95%, then ATM IV pulls back for 3 days
-L2: sell the higher-IV-pressure side
-L3: 0.02% NAV target premium per signal
-L4: nearest expiry, DTE >= 7, OTM, abs(delta) < 0.05, OI >= 1000, volume > 0
+Overlay1: T-4 IV percentile >= 95%, then ATM IV pulls back for 3 days.
+Overlay2: T-3 risk-reversal percentile >= 95%, same-sign RR repairs for 2 days.
+Overlay3: T-3 near-minus-next ATM IV percentile >= 95%, term spread repairs for 2 days,
+          with T-1 side pressure and 20d trend-conflict filter.
+Sizing:   0.025% NAV target premium per signal.
+L4:       nearest expiry, DTE >= 10, OTM, OI >= 1000, volume > 0,
+          overlay1 abs(delta) < 0.04, overlay2/3 abs(delta) < 0.03.
+Stops:    overlay portfolio loss stop is independent by strategy_layer.
 ```
 
 Execution:
