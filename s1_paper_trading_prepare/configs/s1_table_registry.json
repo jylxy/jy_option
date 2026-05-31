@@ -85,9 +85,9 @@
       "name": "expiry_underlying_settlement_price",
       "status": "paper_required",
       "layer": "Expiry settlement",
-      "source": "Toolkit future_daily_quote settlement/close, with Toolkit underlying daily close as fallback",
+      "source": "Toolkit future_daily_quote settlement/close, Toolkit underlying daily close, and exact Toolkit daily snapshot spot_close/PCP fallback",
       "paper_path": "on-demand Toolkit lookup by underlying_code on expiry date",
-      "paper_action": "At expiry, settle by intrinsic value using same-day future settlement first, then same-day future close, then same-day underlying close. Do not use stale cached spot."
+      "paper_action": "At expiry, settle by intrinsic value using same-day future settlement first, then same-day future close, then same-day underlying close, then exact same-underlying or same-expiry daily snapshot spot_close/PCP fallback. Do not use stale cached spot or cross-month same-product substitutes."
     },
     {
       "name": "paper_account_state",

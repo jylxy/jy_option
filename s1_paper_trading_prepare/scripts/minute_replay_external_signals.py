@@ -888,14 +888,14 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 check_tp=False,
                 check_expiry=False,
             )
-            self._apply_external_expiry(date_str, fee)
+            self._apply_external_expiry(date_str, fee, daily_df)
             self._apply_overlay_portfolio_loss_stop(date_str, fee)
             for row in self._signals_by_queue_date.get(date_str, []):
                 item = self._build_external_pending_item(row, date_str)
                 if item is not None:
                     self._pending_opens.append(item)
 
-        def _apply_external_expiry(self, date_str: str, fee: float) -> None:
+        def _apply_external_expiry(self, date_str: str, fee: float, daily_df: pd.DataFrame | None = None) -> None:
             expiry_dte = int(self.config.get("expiry_dte", 0) or 0)
             try:
                 current_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -908,7 +908,7 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     pos.dte = dte
                 if dte > expiry_dte:
                     continue
-                spot, spot_source, spot_lookup_code = self._expiry_spot_close(pos, date_str)
+                spot, spot_source, spot_lookup_code = self._expiry_spot_close(pos, date_str, daily_df)
                 if not np.isfinite(spot) or spot <= 0:
                     self.diagnostics_records.append({
                         "date": date_str,
@@ -1009,7 +1009,53 @@ def make_external_engine_class(base_cls, estimate_margin_func):
 
             return np.nan, "future_daily_quote_missing", ""
 
-        def _expiry_spot_close(self, pos, date_str: str) -> tuple[float, str, str]:
+        def _expiry_daily_snapshot_spot(
+            self,
+            pos,
+            date_str: str,
+            daily_df: pd.DataFrame | None,
+            underlying_code: str,
+        ) -> tuple[float, str, str]:
+            if daily_df is None or daily_df.empty or "spot_close" not in daily_df.columns:
+                return np.nan, "daily_snapshot_spot_missing", ""
+            frame = daily_df.copy()
+            frame["spot_close"] = pd.to_numeric(frame["spot_close"], errors="coerce")
+            frame = frame[frame["spot_close"].notna() & frame["spot_close"].gt(0)].copy()
+            if frame.empty:
+                return np.nan, "daily_snapshot_spot_missing", ""
+
+            masks = []
+            if "underlying_code" in frame.columns and underlying_code:
+                masks.append(frame["underlying_code"].astype(str).eq(str(underlying_code)))
+            product = str(getattr(pos, "product", "") or "").upper()
+            expiry = str(getattr(pos, "expiry", "") or "")[:10]
+            if product and "product" in frame.columns:
+                product_mask = frame["product"].astype(str).str.upper().eq(product)
+                if expiry and "expiry_date" in frame.columns:
+                    masks.append(product_mask & frame["expiry_date"].astype(str).str[:10].eq(expiry))
+
+            for mask in masks:
+                rows = frame[mask].copy()
+                if rows.empty:
+                    continue
+                if "volume" in rows.columns:
+                    rows["_volume_for_sort"] = pd.to_numeric(rows["volume"], errors="coerce").fillna(0.0)
+                else:
+                    rows["_volume_for_sort"] = 0.0
+                if "open_interest" in rows.columns:
+                    rows["_oi_for_sort"] = pd.to_numeric(rows["open_interest"], errors="coerce").fillna(0.0)
+                elif "close_oi" in rows.columns:
+                    rows["_oi_for_sort"] = pd.to_numeric(rows["close_oi"], errors="coerce").fillna(0.0)
+                else:
+                    rows["_oi_for_sort"] = 0.0
+                rows = rows.sort_values(["_volume_for_sort", "_oi_for_sort"], ascending=False, kind="mergesort")
+                spot = safe_float(rows.iloc[0].get("spot_close"), np.nan)
+                if np.isfinite(spot) and spot > 0:
+                    code = str(rows.iloc[0].get("underlying_code", underlying_code) or underlying_code)
+                    return spot, "expiry_daily_snapshot_spot_close", code
+            return np.nan, "daily_snapshot_spot_missing", ""
+
+        def _expiry_spot_close(self, pos, date_str: str, daily_df: pd.DataFrame | None = None) -> tuple[float, str, str]:
             info = self.ci.lookup(pos.code) or {}
             underlying_code = getattr(pos, "underlying_code", "") or info.get("underlying_code", "")
             if not underlying_code:
@@ -1041,6 +1087,16 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 })
                 return np.nan, "underlying_daily_close_lookup_failed", ""
             spot = safe_float(spot_map.get(underlying_code, np.nan), np.nan)
+            if np.isfinite(spot) and spot > 0:
+                return spot, "expiry_underlying_daily_close", underlying_code
+            snapshot_price, snapshot_source, snapshot_code = self._expiry_daily_snapshot_spot(
+                pos,
+                date_str,
+                daily_df,
+                underlying_code,
+            )
+            if np.isfinite(snapshot_price) and snapshot_price > 0:
+                return snapshot_price, snapshot_source, snapshot_code
             if not np.isfinite(spot) or spot <= 0:
                 self.diagnostics_records.append({
                     "date": date_str,
@@ -1051,9 +1107,10 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                     "underlying_code": underlying_code,
                     "previous_spot": safe_float(getattr(pos, "cur_spot", np.nan), np.nan),
                     "future_daily_source": future_source,
+                    "daily_snapshot_source": snapshot_source,
                 })
                 return np.nan, "underlying_daily_close_missing", ""
-            return spot, "expiry_underlying_daily_close", underlying_code
+            return np.nan, "underlying_daily_close_missing", ""
 
         def _apply_overlay_portfolio_loss_stop(self, date_str: str, fee: float) -> None:
             stop_pct = float(

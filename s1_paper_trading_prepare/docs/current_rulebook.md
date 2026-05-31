@@ -296,11 +296,13 @@ settlement value = intrinsic value from same-day underlying settlement source
 underlying price priority:
     1. Toolkit future_daily_quote settlement for the exact underlying_code
     2. Toolkit future_daily_quote close for the exact underlying_code
-    3. Toolkit same-day underlying daily close
+    3. Toolkit same-day underlying daily close for the exact underlying_code
+    4. Exact same-underlying or same-expiry Toolkit daily snapshot spot_close, including PCP fallback when the futures table is missing
 call intrinsic = max(underlying_price - strike, 0)
 put intrinsic  = max(strike - underlying_price, 0)
 if same-day underlying price is unavailable:
     do not fall back to previous cached spot
+    do not use cross-month same-product substitutes
     block expiry settlement and write expiry_settlement_blocked_missing_spot
 ```
 

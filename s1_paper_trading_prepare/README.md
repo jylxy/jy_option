@@ -53,7 +53,9 @@ Execution:
 T signal, T+1 Toolkit minute VWAP, 10% volume cap,
 keep no-price/no-bar opens pending, and allow limited farther-OTM reroute.
 Expiry uses intrinsic settlement from same-day underlying futures settlement first,
-then futures close, then underlying daily close; stale cached spot is never used.
+then futures close, then same-day underlying daily close, then exact
+same-underlying or same-expiry daily snapshot/PCP spot; stale cached spot and
+cross-month same-product substitutes are never used.
 ```
 
 ## Daily Commands

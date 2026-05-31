@@ -250,6 +250,7 @@ Price priority:
 1. Toolkit future_daily_quote settlement
 2. Toolkit future_daily_quote close
 3. Toolkit underlying daily close map
+4. Exact same-underlying or same-expiry Toolkit daily snapshot spot_close, including same-day PCP fallback when the futures table is missing
 ```
 
 Rules:
@@ -258,6 +259,7 @@ Rules:
 call intrinsic = max(underlying_price - strike, 0)
 put intrinsic  = max(strike - underlying_price, 0)
 do not use previous cached spot if all same-day sources are missing
+do not use cross-month same-product substitutes
 write expiry_settlement_blocked_missing_spot when blocked
 ```
 
