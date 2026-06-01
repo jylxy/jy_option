@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections.abc import Iterable
+import re
 
 import pandas as pd
 
@@ -181,7 +182,106 @@ def load_trading_dates(start_date: str, end_date: str) -> list[str]:
     dates = []
     for date in loader.get_trading_dates(str(start_date)[:10], str(end_date)[:10]):
         key = str(date)[:10]
-        ts = pd.to_datetime(key, errors="coerce")
-        if pd.notna(ts) and ts.weekday() < 5:
+        if pd.notna(pd.to_datetime(key, errors="coerce")):
             dates.append(key)
     return dates
+
+
+def load_underlying_daily_flow(
+    signal_date: str,
+    config_path: str | Path | None = None,
+    *,
+    products: tuple[str, ...] | None = None,
+    product_chunk_size: int = 32,
+) -> pd.DataFrame:
+    """Fetch product-level futures volume and open-interest aggregates for one day.
+
+    The daily option snapshot already carries the underlying close, but not the
+    futures OI/volume terms used by the current L1 flow guard. This helper keeps
+    that query narrow: one date, optional product chunks, and only product-level
+    daily aggregates. Futures OI is sourced from Toolkit `future_daily_quote`;
+    the minute table is deliberately not used for OI because H200's
+    `future_hf_1min` schema does not expose an open-interest column.
+    """
+    ensure_server_deploy_importable()
+    from contract_provider import ContractInfo
+    from query_filters import build_product_like_sql, build_time_eq_sql
+    from strategy_rules import DEFAULT_PARAMS
+    from config_loader import load_engine_config
+    from toolkit.selector import select_bars_sql
+
+    ci = ContractInfo()
+    ci.load()
+    path = resolve_path(config_path, default=DEFAULT_PAPER_CONFIG)
+    config = load_engine_config(str(path), DEFAULT_PARAMS)
+    product_pool = products or config.get("product_pool") or config.get("products") or ci.get_all_products()
+    if isinstance(product_pool, str):
+        product_pool = [p.strip() for p in product_pool.split(",") if p.strip()]
+    product_list = sorted({str(p).upper().strip() for p in product_pool if str(p).strip()})
+    if not product_list:
+        return pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close"])
+
+    date = str(signal_date)[:10]
+    where_date = build_time_eq_sql(date)
+    parts: list[pd.DataFrame] = []
+    for chunk in _chunks(product_list, product_chunk_size):
+        like_sql = build_product_like_sql(chunk, ci._cache, ci.get_product_codes)
+        for table_name in ("future_daily_quote", "future_history_quote"):
+            query = f"""
+                SELECT
+                    toString(date) AS trade_date,
+                    ths_code AS underlying_code,
+                    toFloat64OrZero(toString(volume)) AS fut_volume,
+                    toFloat64OrZero(toString(open_interest)) AS fut_open_interest,
+                    toFloat64OrZero(toString(close)) AS fut_close,
+                    toFloat64OrZero(toString(settlement)) AS fut_settlement
+                FROM {table_name}
+                WHERE date = toDate('{date}')
+                  AND ({like_sql})
+            """
+            frame = select_bars_sql(query)
+            if frame is not None and not frame.empty:
+                frame["source_table"] = table_name
+                parts.append(frame)
+                break
+    if not parts:
+        return pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close", "fut_settlement", "futures_flow_source_table"])
+
+    out = pd.concat(parts, ignore_index=True, sort=False)
+    out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["underlying_code"] = out["underlying_code"].fillna("").astype(str)
+    out["product"] = out["underlying_code"].map(_product_from_underlying_code)
+    out["is_continuous_future"] = out["underlying_code"].map(_is_continuous_future_code)
+    for column in ("fut_volume", "fut_open_interest", "fut_close", "fut_settlement"):
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    if not out.empty:
+        has_dated = out.groupby(["trade_date", "product"])["is_continuous_future"].transform(lambda x: (~x).any())
+        out = out[(~out["is_continuous_future"]) | (~has_dated)].copy()
+    grouped = (
+        out[out["product"].ne("")]
+        .groupby(["trade_date", "product"], as_index=False)
+        .agg(
+            fut_volume=("fut_volume", "sum"),
+            fut_open_interest=("fut_open_interest", "sum"),
+            fut_close=("fut_close", "median"),
+            fut_settlement=("fut_settlement", "median"),
+            futures_flow_source_table=("source_table", lambda x: ",".join(sorted({str(v) for v in x if str(v)}))),
+        )
+    )
+    return grouped
+
+
+def _product_from_underlying_code(code: str) -> str:
+    base = str(code or "").split(".", 1)[0].upper()
+    match = re.match(r"([A-Z]+)", base)
+    if not match:
+        return ""
+    letters = match.group(1)
+    if letters.endswith("ZL") and len(letters) > 2:
+        return letters[:-2]
+    return letters
+
+
+def _is_continuous_future_code(code: str) -> bool:
+    base = str(code or "").split(".", 1)[0].upper()
+    return bool(base.endswith("ZL"))

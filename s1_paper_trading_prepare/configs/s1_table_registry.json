@@ -19,7 +19,7 @@
       "config_gate_key": "s1_reverse_lowjump_enabled",
       "config_gate_expected": true,
       "paper_path": "data/reverse_lowjump/iv_daily_panel.csv",
-      "paper_action": "Append T after the daily snapshot is complete. Rolling fields must use observations through T only."
+      "paper_action": "Append T after the daily snapshot is complete. Low-jump rolling fields used for L1 must be computed from observations strictly before T."
     },
     {
       "name": "reverse_lowjump_product_side_opportunities",
@@ -29,7 +29,7 @@
       "config_gate_key": "s1_reverse_lowjump_enabled",
       "config_gate_expected": true,
       "paper_path": "data/reverse_lowjump/product_side_opportunities.csv",
-      "paper_action": "Append T product-side opportunities and write approved external S1 sell intents."
+      "paper_action": "Append T product-side opportunities and write approved external S1 sell intents from PIT panels only; do not consume shadow/path/label research fields."
     },
     {
       "name": "reverse_lowjump_side_flow_guard_panel",

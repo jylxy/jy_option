@@ -17,6 +17,18 @@ Daily paper trading should:
 The order generator remains a lookup reader. The signal updater owns all
 factor refresh, candidate generation, sizing, and audit.
 
+The production updater is:
+
+```powershell
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --signal-date 2026-03-31 --fetch-missing
+```
+
+For a validation backfill, run the same appender sequentially:
+
+```powershell
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --start-date 2022-01-01 --end-date 2026-03-31 --fetch-missing --output-schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+```
+
 ## Canonical Historical Reference
 
 The current committed schedule is the gold reference for historical parity.
@@ -67,6 +79,24 @@ an unfinished prior opportunity could enter `shadow_*` history. The current
 0.15% boost rows are not hit by that subset, but the production generator must
 avoid `shadow_*` entirely or rebuild any historical-performance feature with an
 explicit maturity-date guard.
+
+`PitSignalAppender` enforces this in code:
+
+- raw inputs are rejected if they contain `shadow_*`, path label, terminal label,
+  or expiry-PnL style columns;
+- main L1 low-jump history uses shifted prior ATM-IV observations;
+- overlay triggers use only lag columns (`T-1` through `T-4`, depending on the
+  sidecar);
+- if a future historical-performance feature is added, the input rows must first
+  pass `prior_maturity_date < signal_date`, and the resulting feature must be
+  written as a new point-in-time panel field rather than read from old research
+  `shadow_*` columns.
+
+Current Toolkit note: `future_hf_1min` in the H200 environment does not expose a
+futures open-interest column, only OHLC/volume-style fields. The appender
+therefore sources daily futures volume/OI from `future_daily_quote` and falls
+back to `future_history_quote` if needed. `fut_oi_chg5/fut_oi_chg20` are then
+computed from the stored PIT flow panel.
 
 Execution replay changes such as `no_valid_minute_price`, pending carry, and
 farther-contract reroute must not mutate the schedule's intent fields
@@ -126,7 +156,12 @@ generate_orders(T)
 ## Future-Function Guard
 
 - Main L1/L2/L3/L4 may use the completed `T` daily snapshot because execution is `T+1`.
-- Rolling history that summarizes prior labels must be shifted before scoring `T`.
+- Rolling price/IV history is point-in-time. Main low-jump statistics are built
+  from observations strictly before `T`; same-day pressure/flow and contract
+  selection can use the completed `T` snapshot.
+- Rolling history that summarizes prior labels must be shifted and maturity
+  guarded before scoring `T`. The current production appender does not consume
+  any label-derived or `shadow_*` history.
 - Overlay1 trigger uses `T-4` through `T-1` ATM IV and percentile fields.
 - Overlay2 trigger uses `lag3` through `lag1` risk-reversal fields and `lag3` percentile.
 - Overlay3 trigger uses `lag3` through `lag1` term-spread fields; side choice and trend conflict use `T-1`.
@@ -160,10 +195,10 @@ After these pass, rerun the full minute replay from `2022-01-01` through
 fills, no-price diagnostics, margin usage, and main/overlay sleeve PnL against
 the last clean baseline.
 
-Current implementation note: `build_daily_signal_schedule.py` is the clean
-handoff-table builder. It rebuilds the unified schedule schema from the
-approved clean schedule and is the table consumed by order generation and
-minute replay. The remaining production work is to replace the historical
-source schedule input with Toolkit daily factor appenders that generate T rows
-directly from stored PIT panels, then write into this same schema and pass the
-same guard chain.
+Current implementation note: `build_daily_signal_schedule.py` remains the clean
+handoff-table normalizer for an approved source schedule. The daily production
+path is now `append_daily_signals.py`, backed by
+`src/pit_signal_appender.py`. It reads Toolkit raw snapshots, refreshes the
+stored PIT panels, generates same-date L1/L2/L3/L4 and overlay intent rows, and
+then writes those rows back into the same external-intent schedule consumed by
+order generation and minute replay.

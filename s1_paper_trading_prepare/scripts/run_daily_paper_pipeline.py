@@ -15,6 +15,7 @@ from s1_paper_trading_prepare.src.daily_data_update import update_daily_data
 from s1_paper_trading_prepare.src.daily_mark import mark_account_to_close
 from s1_paper_trading_prepare.src.diagnostics import write_json
 from s1_paper_trading_prepare.src.order_generator import generate_orders
+from s1_paper_trading_prepare.src.pit_signal_appender import PitSignalAppender
 from s1_paper_trading_prepare.src.paths import DEFAULT_OUTPUT_DIR, resolve_path
 
 
@@ -39,6 +40,7 @@ def main() -> int:
     parser.add_argument("--force-data", action="store_true", help="Re-fetch existing Toolkit partitions.")
     parser.add_argument("--require-account-state", action="store_true", help="Fail if paper-account state files are missing.")
     parser.add_argument("--write-marked-state", action="store_true", help="Persist close marks back into paper-account state files.")
+    parser.add_argument("--skip-signal-refresh", action="store_true", help="Use the existing external signal schedule without appending T factors.")
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
 
@@ -76,6 +78,20 @@ def main() -> int:
         product_chunk_size=args.product_chunk_size,
         write_state=args.write_marked_state,
     )
+    signal_result = None
+    if not args.skip_signal_refresh:
+        appender = PitSignalAppender(
+            config_path=args.config,
+            data_dir=args.data_dir,
+            output_dir=output_dir,
+        )
+        signal_result = appender.append_date(
+            signal_date,
+            products=products,
+            nav=mark_result.nav,
+            current_margin_cash=mark_result.margin_used,
+            tag=f"{tag}_signal_append",
+        )
     order_result = generate_orders(
         signal_date,
         replay_start_date=args.replay_start_date,
@@ -104,6 +120,10 @@ def main() -> int:
             "close_mark_daily_return": mark_result.daily_return,
             "close_mark_stale_rows": mark_result.stale_rows,
             "close_mark_missing_rows": mark_result.missing_rows,
+            "signal_refresh_enabled": not args.skip_signal_refresh,
+            "signal_refresh_rows": signal_result.rows_for_date if signal_result else None,
+            "signal_refresh_schedule_path": str(signal_result.schedule_path) if signal_result else None,
+            "signal_refresh_diagnostics": str(signal_result.diagnostics_path) if signal_result else None,
             "orders_path": str(order_result.orders_path) if order_result.orders_path else None,
             "diagnostics_path": str(order_result.diagnostics_path) if order_result.diagnostics_path else None,
             "order_audit_path": str(order_result.audit_path) if order_result.audit_path else None,
@@ -119,6 +139,8 @@ def main() -> int:
     print(f"account_state_ok={account_state.ok} account_manifest={account_state.manifest_path}")
     print(f"data_manifest={data_result.manifest_path}")
     print(f"close_mark_daily_pnl={mark_result.daily_pnl:.2f} daily_return={mark_result.daily_return:.8f} summary={mark_result.summary_path}")
+    if signal_result:
+        print(f"signal_refresh_rows={signal_result.rows_for_date} schedule={signal_result.schedule_path}")
     print(f"orders={len(order_result.orders)} path={order_result.orders_path}")
     print(f"pipeline_manifest={manifest_path}")
     return 0

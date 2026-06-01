@@ -39,6 +39,16 @@ The incremental daily signal-refresh design is in:
 docs/incremental_signal_update_design.md
 ```
 
+Daily signal refresh from Toolkit raw snapshots:
+
+```powershell
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --signal-date 2026-03-31 --fetch-missing
+```
+
+This appender is the production path for L1/L2/L3/L4 factor refresh. It rejects
+`shadow_*`, path, and outcome-label inputs; historical-performance fields must
+be rebuilt only after the prior opportunity has matured.
+
 ## Current Rule Summary
 
 Main sleeve:
@@ -145,6 +155,12 @@ python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-d
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+```
+
+Full PIT appender backfill command:
+
+```powershell
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --start-date 2022-01-01 --end-date 2026-03-31 --fetch-missing --output-schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 ```
 
 ## Local Artifacts
