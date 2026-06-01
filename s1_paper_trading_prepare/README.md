@@ -130,6 +130,23 @@ Audit point-in-time guardrails for the current schedule:
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py
 ```
 
+Run the deeper factor-lineage audit. This checks that the final schedule does
+not carry shadow/path/label columns, and that historical `shadow_*` lineage
+fields are not treated as live inputs unless their prior outcomes have matured:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py
+```
+
+Rebuild the unified external-intent handoff table and validate it:
+
+```powershell
+python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-date 2022-01-01 --end-date 2026-03-31 --output s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+```
+
 ## Local Artifacts
 
 Generated data, signals, output, logs, and paper-account state stay local and are ignored by Git. Keep only source code, configs, docs, templates, and empty directory anchors in the repository.

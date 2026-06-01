@@ -45,6 +45,29 @@ The point-in-time guard audit command is:
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule path/to/generated_open_signals.csv
 ```
 
+The deeper factor-lineage audit command is:
+
+```powershell
+python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule path/to/generated_open_signals.csv
+```
+
+This audit intentionally separates three cases:
+
+1. Final schedule columns. Any shadow/path/label column here is a blocker.
+2. Research lineage tables. They may contain labels for audit, but cannot be
+   consumed by the daily generator.
+3. Historical `shadow_*` summaries. They are shifted historical means, not the
+   current row's outcome, but they are still unsafe for live generation unless
+   every prior outcome included in the rolling window had already matured by
+   the current signal date.
+
+The current lineage audit found that the committed handoff schedule is clean,
+while the old research opportunity table contains a small number of rows where
+an unfinished prior opportunity could enter `shadow_*` history. The current
+0.15% boost rows are not hit by that subset, but the production generator must
+avoid `shadow_*` entirely or rebuild any historical-performance feature with an
+explicit maturity-date guard.
+
 Execution replay changes such as `no_valid_minute_price`, pending carry, and
 farther-contract reroute must not mutate the schedule's intent fields
 (`qty`, `target_qty`, `premium_cash`, `target_premium_cash`, `margin_cash`).
@@ -126,13 +149,21 @@ schedule without the old `include_etf` account state:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/update_daily_data.py --start-date 2022-01-01 --end-date 2026-03-31
-# planned clean builder entrypoint:
 python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-date 2022-01-01 --end-date 2026-03-31 --output data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated data/external_signals/regenerated_open_signals.csv
+python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule data/external_signals/regenerated_open_signals.csv
 ```
 
 After these pass, rerun the full minute replay from `2022-01-01` through
 `2026-03-31` and compare NAV, annual return, drawdown, open counts, pending
 fills, no-price diagnostics, margin usage, and main/overlay sleeve PnL against
 the last clean baseline.
+
+Current implementation note: `build_daily_signal_schedule.py` is the clean
+handoff-table builder. It rebuilds the unified schedule schema from the
+approved clean schedule and is the table consumed by order generation and
+minute replay. The remaining production work is to replace the historical
+source schedule input with Toolkit daily factor appenders that generate T rows
+directly from stored PIT panels, then write into this same schema and pass the
+same guard chain.
