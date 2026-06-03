@@ -48,15 +48,24 @@ def parse_products(value: str | None) -> tuple[str, ...] | None:
     return products or None
 
 
-def load_dates(start: str, end: str, config_path: str | Path) -> list[str]:
+def load_dates(start: str, end: str, data_dir: str | Path) -> list[str]:
+    root = Path(data_dir) / "daily_snapshots"
+    start_tag = str(start)[:10].replace("-", "")
+    end_tag = str(end)[:10].replace("-", "")
+    snapshot_dates = []
+    if root.exists():
+        for path in sorted(root.glob("option_chain_*.csv")):
+            tag = path.stem.replace("option_chain_", "")
+            if start_tag <= tag <= end_tag:
+                snapshot_dates.append(f"{tag[:4]}-{tag[4:6]}-{tag[6:]}")
+    if snapshot_dates:
+        return snapshot_dates
     try:
         dates = load_trading_dates(start, end)
     except Exception:
         dates = []
     if dates:
         return dates
-    root = Path(DEFAULT_DATA_DIR if config_path is None else DEFAULT_DATA_DIR)
-    del root
     return [d.strftime("%Y-%m-%d") for d in pd.date_range(start=start, end=end, freq="D")]
 
 
@@ -452,7 +461,7 @@ def main() -> int:
 
     products = parse_products(args.products)
     appender = PitSignalAppender(config_path=args.config, data_dir=args.data_dir, output_dir=args.output_dir)
-    dates = load_dates(str(args.start_date)[:10], str(args.end_date)[:10], args.config)
+    dates = load_dates(str(args.start_date)[:10], str(args.end_date)[:10], args.data_dir)
 
     snapshots: dict[str, pd.DataFrame] = {}
     iv_rows: list[pd.DataFrame] = []
