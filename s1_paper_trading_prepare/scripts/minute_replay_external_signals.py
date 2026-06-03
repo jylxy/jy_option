@@ -30,7 +30,7 @@ DEFAULT_SIGNALS = (
     / "s1_paper_trading_prepare"
     / "data"
     / "external_signals"
-    / "strict_main_overlay1_plus_overlay23_open_signals.csv"
+    / "s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv"
 )
 
 EXCHANGE_TO_SUFFIX = {

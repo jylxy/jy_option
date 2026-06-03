@@ -3,7 +3,7 @@
 This document lists the daily tables needed by the current S1 paper line:
 
 ```text
-s1_strict_main_overlay1_plus_overlay23_20260531
+s1_hsafe_addon025_sidecar1_t1lt95_20260603
 ```
 
 All rolling statistics must be point-in-time. A T signal may use the T close snapshot and trailing history through T, then paper execution starts on T+1.
@@ -53,10 +53,17 @@ candidate_oi_median_252
 ```
 
 Guard: trailing or expanding statistics only. No future outcome labels may score the current T row.
+The main low-jump gate uses `hist_iv_days_756 >= 120`.
 
 ### 3. reverse_lowjump_side_flow_guard_panel
 
 Purpose: L1 side-flow and OI guard.
+
+Important: this is the main-line eligible near-month candidate-side flow, not
+the full option-chain side flow. Each daily row is built from the same pool used
+for high-IV-pressure side choice: commodity options only, OTM, nearest valid
+expiry, `abs(delta) <= 0.08`, `OI >= 1000`, positive volume, positive price, and
+valid IV.
 
 Path:
 
@@ -75,15 +82,35 @@ fut_volume_x63
 fut_oi_x63
 fut_oi_chg5
 fut_oi_chg20
-rule_l1_oi03_flow_guard
+rule_l1_hsafe_addon025
 ```
 
 Current L1 rule:
 
 ```text
-pit_low_jump_strict
-AND opt_side_oi_x63 >= 0.3
-AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.0)
+rule_l1_hsafe_core OR addon025
+```
+
+Expanded:
+
+```text
+rule_l1_hsafe_core =
+  hist_iv_days_756 >= 120
+  AND hist_jump5pp_rate_756 <= 0.005
+  AND hist_p95_abs_iv_chg_756 <= 0.030
+  AND opt_side_oi_x63 >= 0.3
+  AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.5)
+  AND rolling_cs_rank <= 20
+  AND (side_iv_pressure_diff <= 0.06 OR side_iv_pressure_diff is missing)
+  AND (side_iv_pressure_diff is present OR fut_oi_chg5 > 0)
+
+addon025 =
+  hist_iv_days_756 >= 120
+  AND hist_jump5pp_rate_756 <= 0.025
+  AND hist_p95_abs_iv_chg_756 <= 0.030
+  AND opt_side_oi_x63 >= 0.5
+  AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.3)
+  AND rolling_cs_rank <= 15
 ```
 
 ### 4. reverse_lowjump_side_iv_pressure_panel
@@ -112,7 +139,8 @@ The chosen side is the side with higher candidate-pool median IV.
 
 ### 5. reverse_lowjump_product_side_opportunities
 
-Purpose: final daily main-sleeve intents.
+Purpose: final product-month main-sleeve intents. This table is generated from
+the product-month opportunity table, not from a free daily scan.
 
 Path:
 
@@ -162,10 +190,12 @@ iv_percentile_lag1, iv_percentile_lag2, iv_percentile_lag3, iv_percentile_lag4
 Trigger:
 
 ```text
-iv_percentile_lag4 >= 95%
+iv_percentile_lag4 >= 90%
 AND atm_iv_lag3 < atm_iv_lag4
 AND atm_iv_lag2 < atm_iv_lag3
 AND atm_iv_lag1 < atm_iv_lag2
+AND iv_percentile_lag1 < 95%
+AND abs(trend_20d_lag1) <= 15% when trend_20d_lag1 is available
 ```
 
 ### 7. iv_pullback_overlay_contract_candidates
@@ -440,7 +470,7 @@ Purpose: clean handoff from daily signal generation to order review and minute r
 Configured path:
 
 ```text
-data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv
+data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
 ```
 
 Generated schedules are local data artifacts and are not committed.

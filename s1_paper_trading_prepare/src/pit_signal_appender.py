@@ -29,6 +29,7 @@ from .config_snapshot import load_effective_config
 from .data_loader import load_underlying_daily_flow
 from .diagnostics import write_csv, write_json
 from .paths import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, DEFAULT_PAPER_CONFIG, ensure_server_deploy_importable, resolve_path
+from .signal_feature_utils import ensure_signal_iv, signal_iv_col
 
 
 EXCLUDED_EXCHANGES = {"SSE", "SZSE"}
@@ -45,9 +46,25 @@ FORBIDDEN_INPUT_TOKENS = (
 DEFAULT_MAIN_MIN_DTE = 15
 DEFAULT_MAIN_MAX_DTE = 90
 DEFAULT_LOWJUMP_LOOKBACK = 756
-DEFAULT_LOWJUMP_MIN_HISTORY = 252
+DEFAULT_LOWJUMP_MIN_HISTORY = 120
 DEFAULT_FLOW_LOOKBACK = 63
 DEFAULT_CAPITAL = 50_000_000.0
+
+SIDE_FLOW_PANEL_COLUMNS = [
+    "trade_date",
+    "exchange",
+    "product",
+    "sell_side",
+    "option_side_oi",
+    "option_side_volume",
+    "option_side_count",
+    "option_side_iv",
+    "fut_volume",
+    "fut_open_interest",
+    "fut_close",
+    "fut_settlement",
+    "futures_flow_source_table",
+]
 
 DEFAULT_SCHEDULE_COLUMNS = [
     "entry_date",
@@ -282,7 +299,7 @@ def _canonical_schedule(frame: pd.DataFrame) -> pd.DataFrame:
 def _merge_panel(path: Path, rows: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     old = _read_csv(path)
     if rows.empty:
-        return old
+        return old if not old.empty else rows.copy()
     if old.empty:
         merged = rows.copy()
     else:
@@ -302,9 +319,9 @@ def _expanding_percentile_including_current(values: pd.Series) -> tuple[pd.Serie
     for idx, value in enumerate(nums):
         clean = [x for x in history if np.isfinite(x)]
         prior[idx] = len(clean)
+        if np.isfinite(value) and clean:
+            out[idx] = sum(x <= value for x in clean) / len(clean)
         if np.isfinite(value):
-            sample = clean + [float(value)]
-            out[idx] = sum(x <= value for x in sample) / len(sample)
             history.append(float(value))
         else:
             history.append(np.nan)
@@ -428,9 +445,12 @@ def _otm_mask(frame: pd.DataFrame, side: str | None = None) -> pd.Series:
 
 
 def _valid_option_mask(frame: pd.DataFrame, *, min_oi: float = 0.0, min_volume: float = 0.0, max_abs_delta: float | None = None) -> pd.Series:
+    iv_col = signal_iv_col(frame)
+    iv_series = frame[iv_col] if iv_col in frame.columns else pd.Series(np.nan, index=frame.index)
     mask = (
         pd.to_numeric(frame.get("entry_price"), errors="coerce").gt(0)
-        & pd.to_numeric(frame.get("implied_vol"), errors="coerce").between(0.01, 2.5)
+        & pd.to_numeric(iv_series, errors="coerce").gt(0.01)
+        & pd.to_numeric(iv_series, errors="coerce").lt(2.5)
         & pd.to_numeric(frame.get("close_oi"), errors="coerce").ge(min_oi)
         & pd.to_numeric(frame.get("volume"), errors="coerce").ge(min_volume)
         & pd.to_numeric(frame.get("strike"), errors="coerce").gt(0)
@@ -443,12 +463,13 @@ def _valid_option_mask(frame: pd.DataFrame, *, min_oi: float = 0.0, min_volume: 
 
 
 def _select_contract(frame: pd.DataFrame, side: str, expiry: str, *, max_abs_delta: float, min_oi: float, min_volume: float) -> pd.Series | None:
-    subset = frame[
+    base = frame[
         frame["option_type"].eq(side)
         & frame["target_expiry"].eq(expiry)
         & _otm_mask(frame, side)
-        & _valid_option_mask(frame, min_oi=min_oi, min_volume=min_volume, max_abs_delta=max_abs_delta)
     ].copy()
+    subset = ensure_signal_iv(base, price_col="entry_price")
+    subset = subset[_valid_option_mask(subset, min_oi=min_oi, min_volume=min_volume, max_abs_delta=max_abs_delta)].copy()
     if subset.empty:
         return None
     subset = subset.sort_values(["abs_delta", "close_oi", "volume", "entry_price"], ascending=[False, False, False, False], kind="mergesort")
@@ -466,7 +487,29 @@ def _nearest_expiry(frame: pd.DataFrame, min_dte: float, max_dte: float | None =
     return str(values.iloc[0]["target_expiry"])[:10]
 
 
+def _front_expiry_if_eligible(frame: pd.DataFrame, min_dte: float, max_dte: float | None = None) -> str | None:
+    """Return the front live expiry only if that exact expiry passes DTE guards."""
+    values = frame[["target_expiry", "dte"]].dropna().drop_duplicates().copy()
+    if values.empty:
+        return None
+    values["dte"] = pd.to_numeric(values["dte"], errors="coerce")
+    values = values[values["dte"].notna()]
+    if values.empty:
+        return None
+    values = values.sort_values(["dte", "target_expiry"], kind="mergesort")
+    front = values.iloc[0]
+    dte = float(front["dte"])
+    if dte < float(min_dte):
+        return None
+    if max_dte is not None and dte > float(max_dte):
+        return None
+    return str(front["target_expiry"])[:10]
+
+
 def _estimate_margin(row: pd.Series, config: dict[str, Any]) -> float:
+    existing = _safe_float(row.get("one_lot_margin_cash", row.get("one_contract_margin")))
+    if np.isfinite(existing) and existing > 0:
+        return existing
     ensure_server_deploy_importable()
     from margin_model import estimate_margin
 
@@ -475,10 +518,10 @@ def _estimate_margin(row: pd.Series, config: dict[str, Any]) -> float:
             row.get("spot_close"),
             row.get("strike"),
             row.get("option_type"),
-            row.get("entry_price"),
+            row.get("entry_price", row.get("close")),
             row.get("multiplier"),
             exchange=row.get("exchange"),
-            product=row.get("product"),
+            product=row.get("product", row.get("product_label")),
         )
     )
 
@@ -547,6 +590,7 @@ class PitSignalAppender:
         self.data_dir = resolve_path(data_dir, default=DEFAULT_DATA_DIR)
         self.output_dir = resolve_path(output_dir, default=DEFAULT_OUTPUT_DIR)
         self.schedule_path = resolve_path(schedule_path or self.config.get("external_signal_path"))
+        self._panel_cache: dict[str, pd.DataFrame] | None = None
 
     def append_date(
         self,
@@ -558,6 +602,8 @@ class PitSignalAppender:
         nav: float | None = None,
         current_margin_cash: float | None = None,
         replace_existing_date: bool = True,
+        update_schedule: bool = True,
+        refresh_panels: bool = True,
         write_outputs: bool = True,
         tag: str | None = None,
     ) -> DailySignalAppendResult:
@@ -587,11 +633,27 @@ class PitSignalAppender:
 
         nav_value = float(nav or self.config.get("capital") or DEFAULT_CAPITAL)
         margin_before = float(current_margin_cash or 0.0)
-        panels = self._refresh_panels(date, snapshot, products=products, diagnostics=diag)
-        rows = self._build_all_intents(date, snapshot, panels, schedule, columns, nav_value, margin_before, diagnostics=diag)
+        panels = (
+            self._refresh_panels(date, snapshot, products=products, diagnostics=diag)
+            if refresh_panels
+            else self._load_panels(diagnostics=diag)
+        )
+        rows = (
+            self._build_all_intents(date, snapshot, panels, schedule, columns, nav_value, margin_before, diagnostics=diag)
+            if update_schedule
+            else []
+        )
         new_rows = pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
         _assert_no_forbidden_columns(new_rows, "generated intent rows")
-        if replace_existing_date:
+        if update_schedule and not new_rows.empty and "target_expiry" in new_rows.columns:
+            new_rows["target_expiry"] = _normalize_date_series(new_rows["target_expiry"]).fillna("")
+            missing_expiry = new_rows["target_expiry"].astype(str).str.strip().eq("")
+            if missing_expiry.any():
+                sample = new_rows.loc[missing_expiry, ["entry_date", "product", "contract_code", "entry_reason"]].head(10).to_dict("records")
+                raise ValueError(f"generated intent rows missing target_expiry from option maturity data: {sample}")
+        if not update_schedule:
+            output = schedule.copy()
+        elif replace_existing_date:
             output = _replace_date_rows(schedule, new_rows, date)
         else:
             output = _canonical_schedule(pd.concat([schedule, new_rows], ignore_index=True, sort=False))
@@ -606,6 +668,8 @@ class PitSignalAppender:
                 "current_margin_cash_before": margin_before,
                 "generated_rows_for_date": int(len(new_rows)),
                 "output_rows": int(len(output)),
+                "schedule_updated": bool(update_schedule),
+                "panels_refreshed": bool(refresh_panels),
                 "row_counts_by_entry_reason": new_rows.get("entry_reason", pd.Series(dtype=object)).fillna("").astype(str).value_counts().to_dict(),
                 "row_counts_by_strategy_layer": new_rows.get("strategy_layer", pd.Series(dtype=object)).fillna("").astype(str).value_counts().to_dict(),
                 "generated_columns": list(new_rows.columns),
@@ -614,7 +678,8 @@ class PitSignalAppender:
         )
         audit_path = self.output_dir / "audit" / f"{diag['tag']}.json"
         if write_outputs:
-            write_csv(output_path, output)
+            if update_schedule:
+                write_csv(output_path, output)
             write_json(audit_path, diag)
         return DailySignalAppendResult(
             signal_date=date,
@@ -625,6 +690,37 @@ class PitSignalAppender:
             intent_rows=new_rows,
             diagnostics=diag,
         )
+
+    def _panel_paths(self) -> dict[str, Path]:
+        main_cfg = self.config.get("main_sleeve", {})
+        return {
+            "iv_daily": self.data_dir / "reverse_lowjump" / "iv_daily_panel.csv",
+            "flow": self.data_dir / "reverse_lowjump" / "side_flow_guard_panel.csv",
+            "pressure": self.data_dir / "reverse_lowjump" / "side_iv_pressure_panel.csv",
+            "main_opportunities": self.data_dir / "reverse_lowjump" / "product_month_opportunities.csv",
+            "main_selected": resolve_path(
+                main_cfg.get("source_opportunity_file"),
+                default=self.data_dir / "reverse_lowjump" / "product_side_opportunities.csv",
+            ),
+            "overlay_atm": self.data_dir / "iv_pullback_overlay" / "atm_iv_percentile_panel.csv",
+            "rr": self.data_dir / "risk_reversal_sidecar" / "risk_reversal_panel.csv",
+            "term": self.data_dir / "term_structure_sidecar" / "term_structure_panel.csv",
+        }
+
+    def _load_panels(self, *, diagnostics: dict[str, Any]) -> dict[str, pd.DataFrame]:
+        if self._panel_cache is not None:
+            panels = self._panel_cache
+        else:
+            panels = {name: _read_csv(path) for name, path in self._panel_paths().items()}
+        diagnostics["panel_rows"] = {name: int(len(frame)) for name, frame in panels.items()}
+        diagnostics["panels_loaded_from_existing_files"] = True
+        return panels
+
+    def preload_panels(self) -> dict[str, pd.DataFrame]:
+        diagnostics: dict[str, Any] = {}
+        self._panel_cache = {name: _read_csv(path) for name, path in self._panel_paths().items()}
+        self._load_panels(diagnostics=diagnostics)
+        return self._panel_cache
 
     def _load_snapshot(self, date: str) -> pd.DataFrame:
         path = _snapshot_path(self.data_dir, date)
@@ -675,7 +771,7 @@ class PitSignalAppender:
             shifted_atm = grouped["atm_iv"].shift(1)
             panel["hist_iv_days_756"] = shifted_atm.groupby([panel["exchange"], panel["product"]]).rolling(DEFAULT_LOWJUMP_LOOKBACK, min_periods=1).count().reset_index(level=[0, 1], drop=True)
             panel["hist_jump5pp_rate_756"] = shifted_abs.gt(0.05).groupby([panel["exchange"], panel["product"]]).rolling(DEFAULT_LOWJUMP_LOOKBACK, min_periods=1).mean().reset_index(level=[0, 1], drop=True)
-            panel["hist_p95_abs_iv_chg_756"] = shifted_abs.groupby([panel["exchange"], panel["product"]]).rolling(DEFAULT_LOWJUMP_LOOKBACK, min_periods=1).quantile(0.95).reset_index(level=[0, 1], drop=True)
+            panel["hist_p95_abs_iv_chg_756"] = shifted_abs.groupby([panel["exchange"], panel["product"]]).rolling(DEFAULT_LOWJUMP_LOOKBACK, min_periods=20).quantile(0.95).reset_index(level=[0, 1], drop=True)
             panel["pit_low_jump_strict"] = (
                 pd.to_numeric(panel["hist_iv_days_756"], errors="coerce").ge(DEFAULT_LOWJUMP_MIN_HISTORY)
                 & pd.to_numeric(panel["hist_jump5pp_rate_756"], errors="coerce").le(0.025)
@@ -685,42 +781,119 @@ class PitSignalAppender:
         return panel
 
     def _refresh_side_flow_panel(self, date: str, snapshot: pd.DataFrame, products: tuple[str, ...] | None) -> pd.DataFrame:
+        main_cfg = self.config.get("main_sleeve", {})
+        min_dte = float(main_cfg.get("min_dte", DEFAULT_MAIN_MIN_DTE))
+        max_dte = float(main_cfg.get("max_dte", DEFAULT_MAIN_MAX_DTE))
+        min_oi = float(main_cfg.get("min_oi", 1000))
+        max_abs_delta = float(main_cfg.get("max_abs_delta", 0.08))
+        rows: list[dict[str, Any]] = []
         valid = snapshot[snapshot["exchange"].isin(EXCLUDED_EXCHANGES).eq(False)].copy()
-        side_rows = (
-            valid[valid["option_type"].isin(["P", "C"])]
-            .groupby(["trade_date", "exchange", "product", "option_type"], as_index=False)
-            .agg(option_side_oi=("close_oi", "sum"), option_side_volume=("volume", "sum"))
-            .rename(columns={"option_type": "sell_side"})
-        )
+        for (exchange, product), group in valid.groupby(["exchange", "product"], sort=False):
+            expiry = _front_expiry_if_eligible(group, min_dte, max_dte)
+            if not expiry:
+                continue
+            candidates = group[
+                group["target_expiry"].eq(expiry)
+                & _otm_mask(group)
+            ].copy()
+            candidates = ensure_signal_iv(candidates, price_col="entry_price")
+            candidates = candidates[_valid_option_mask(candidates, min_oi=min_oi, min_volume=1, max_abs_delta=max_abs_delta)].copy()
+            if candidates.empty:
+                continue
+            for side, side_group in candidates.groupby("option_type", sort=False):
+                iv_col = signal_iv_col(side_group)
+                rows.append(
+                    {
+                        "trade_date": date,
+                        "exchange": exchange,
+                        "product": product,
+                        "sell_side": side,
+                        "option_side_oi": float(pd.to_numeric(side_group["close_oi"], errors="coerce").sum()),
+                        "option_side_volume": float(pd.to_numeric(side_group["volume"], errors="coerce").sum()),
+                        "option_side_count": int(len(side_group)),
+                        "option_side_iv": float(pd.to_numeric(side_group[iv_col], errors="coerce").median()),
+                    }
+                )
+        side_rows = pd.DataFrame(rows)
+        path = self.data_dir / "reverse_lowjump" / "side_flow_guard_panel.csv"
+        if side_rows.empty:
+            side_rows = pd.DataFrame(columns=SIDE_FLOW_PANEL_COLUMNS)
+            panel = _merge_panel(path, side_rows, ["trade_date", "exchange", "product", "sell_side"])
+            write_csv(path, panel)
+            return panel
+
+        product_filter = products or tuple(sorted(p for p in side_rows["product"].dropna().astype(str).str.upper().unique() if p))
+        if not product_filter:
+            futures = pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close", "fut_settlement", "futures_flow_source_table"])
+        else:
+            futures = None
         try:
-            futures = load_underlying_daily_flow(date, self.config_path, products=products)
+            if futures is None:
+                futures = load_underlying_daily_flow(date, self.config_path, products=product_filter)
         except Exception as exc:  # pragma: no cover - Toolkit may be unavailable locally.
             futures = pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close"])
             side_rows["futures_flow_error"] = str(exc)
+        stale_futures_cols = [
+            "fut_volume",
+            "fut_open_interest",
+            "fut_close",
+            "fut_settlement",
+            "futures_flow_source_table",
+        ]
+        side_rows = side_rows.drop(columns=[c for c in stale_futures_cols if c in side_rows.columns], errors="ignore")
         if not futures.empty:
+            futures = futures.copy()
+            futures["trade_date"] = pd.to_datetime(futures["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            futures["product"] = futures["product"].astype(str).str.upper()
+            keep_cols = ["trade_date", "product", *stale_futures_cols]
+            futures = futures[[c for c in keep_cols if c in futures.columns]].drop_duplicates(["trade_date", "product"])
+            side_rows["trade_date"] = pd.to_datetime(side_rows["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            side_rows["product"] = side_rows["product"].astype(str).str.upper()
             side_rows = side_rows.merge(futures, on=["trade_date", "product"], how="left")
         else:
             for column in ("fut_volume", "fut_open_interest", "fut_close", "fut_settlement"):
                 side_rows[column] = np.nan
             side_rows["futures_flow_source_table"] = ""
-        path = self.data_dir / "reverse_lowjump" / "side_flow_guard_panel.csv"
+        for column in SIDE_FLOW_PANEL_COLUMNS:
+            if column not in side_rows.columns:
+                side_rows[column] = np.nan if column.startswith(("fut_", "option_")) else ""
         panel = _merge_panel(path, side_rows, ["trade_date", "exchange", "product", "sell_side"])
         if not panel.empty:
             panel = panel.sort_values(["exchange", "product", "sell_side", "trade_date"], kind="mergesort")
             g_side = panel.groupby(["exchange", "product", "sell_side"], sort=False)
             oi_ref = g_side["option_side_oi"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).median().reset_index(level=[0, 1, 2], drop=True)
             vol_ref = g_side["option_side_volume"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).median().reset_index(level=[0, 1, 2], drop=True)
+            oi_mean = g_side["option_side_oi"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).mean().reset_index(level=[0, 1, 2], drop=True)
+            oi_std = g_side["option_side_oi"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).std().reset_index(level=[0, 1, 2], drop=True)
+            vol_mean = g_side["option_side_volume"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).mean().reset_index(level=[0, 1, 2], drop=True)
+            vol_std = g_side["option_side_volume"].shift(1).groupby([panel["exchange"], panel["product"], panel["sell_side"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).std().reset_index(level=[0, 1, 2], drop=True)
             panel["opt_side_oi_x63"] = pd.to_numeric(panel["option_side_oi"], errors="coerce") / oi_ref.replace(0, np.nan)
             panel["opt_side_volume_x63"] = pd.to_numeric(panel["option_side_volume"], errors="coerce") / vol_ref.replace(0, np.nan)
+            panel["opt_side_oi_z63"] = (pd.to_numeric(panel["option_side_oi"], errors="coerce") - oi_mean) / oi_std.replace(0, np.nan)
+            panel["opt_side_volume_z63"] = (pd.to_numeric(panel["option_side_volume"], errors="coerce") - vol_mean) / vol_std.replace(0, np.nan)
+            panel["opt_side_oi_chg5"] = g_side["option_side_oi"].pct_change(5, fill_method=None)
+            panel["opt_side_oi_chg20"] = g_side["option_side_oi"].pct_change(20, fill_method=None)
+            panel["opt_side_volume_chg5"] = g_side["option_side_volume"].pct_change(5, fill_method=None)
+            panel["opt_side_volume_chg20"] = g_side["option_side_volume"].pct_change(20, fill_method=None)
             g_prod = panel.drop_duplicates(["trade_date", "exchange", "product"]).sort_values(["exchange", "product", "trade_date"]).groupby(["exchange", "product"], sort=False)
             prod_flow = panel[["trade_date", "exchange", "product", "fut_open_interest", "fut_volume", "fut_close"]].drop_duplicates(["trade_date", "exchange", "product"]).copy()
             prod_flow = prod_flow.sort_values(["exchange", "product", "trade_date"], kind="mergesort")
             gp = prod_flow.groupby(["exchange", "product"], sort=False)
+            prod_flow["fut_oi"] = pd.to_numeric(prod_flow["fut_open_interest"], errors="coerce")
             prod_flow["fut_oi_chg5"] = gp["fut_open_interest"].pct_change(5, fill_method=None)
             prod_flow["fut_oi_chg20"] = gp["fut_open_interest"].pct_change(20, fill_method=None)
-            prod_flow["fut_volume_x63"] = prod_flow["fut_volume"] / gp["fut_volume"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).median().reset_index(level=[0, 1], drop=True).replace(0, np.nan)
-            panel = panel.drop(columns=["fut_oi_chg5", "fut_oi_chg20", "fut_volume_x63"], errors="ignore").merge(
-                prod_flow[["trade_date", "exchange", "product", "fut_oi_chg5", "fut_oi_chg20", "fut_volume_x63"]],
+            fut_vol_ref = gp["fut_volume"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).median().reset_index(level=[0, 1], drop=True)
+            fut_vol_mean = gp["fut_volume"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).mean().reset_index(level=[0, 1], drop=True)
+            fut_vol_std = gp["fut_volume"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).std().reset_index(level=[0, 1], drop=True)
+            fut_oi_ref = gp["fut_open_interest"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).median().reset_index(level=[0, 1], drop=True)
+            fut_oi_mean = gp["fut_open_interest"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).mean().reset_index(level=[0, 1], drop=True)
+            fut_oi_std = gp["fut_open_interest"].shift(1).groupby([prod_flow["exchange"], prod_flow["product"]]).rolling(DEFAULT_FLOW_LOOKBACK, min_periods=5).std().reset_index(level=[0, 1], drop=True)
+            prod_flow["fut_volume_x63"] = pd.to_numeric(prod_flow["fut_volume"], errors="coerce") / fut_vol_ref.replace(0, np.nan)
+            prod_flow["fut_volume_z63"] = (pd.to_numeric(prod_flow["fut_volume"], errors="coerce") - fut_vol_mean) / fut_vol_std.replace(0, np.nan)
+            prod_flow["fut_oi_x63"] = pd.to_numeric(prod_flow["fut_open_interest"], errors="coerce") / fut_oi_ref.replace(0, np.nan)
+            prod_flow["fut_oi_z63"] = (pd.to_numeric(prod_flow["fut_open_interest"], errors="coerce") - fut_oi_mean) / fut_oi_std.replace(0, np.nan)
+            panel = panel.drop(columns=["fut_oi", "fut_oi_chg5", "fut_oi_chg20", "fut_volume_x63", "fut_volume_z63", "fut_oi_x63", "fut_oi_z63"], errors="ignore").merge(
+                prod_flow[["trade_date", "exchange", "product", "fut_oi", "fut_oi_chg5", "fut_oi_chg20", "fut_volume_x63", "fut_volume_z63", "fut_oi_x63", "fut_oi_z63"]],
                 on=["trade_date", "exchange", "product"],
                 how="left",
             )
@@ -741,15 +914,17 @@ class PitSignalAppender:
         max_dte = float(main_cfg.get("max_dte", DEFAULT_MAIN_MAX_DTE))
         min_oi = float(main_cfg.get("min_oi", 1000))
         for (exchange, product), group in snapshot[snapshot["exchange"].isin(EXCLUDED_EXCHANGES).eq(False)].groupby(["exchange", "product"], sort=False):
-            expiry = _nearest_expiry(group, min_dte, max_dte)
+            expiry = _front_expiry_if_eligible(group, min_dte, max_dte)
             if not expiry:
                 continue
             candidates = group[
                 group["target_expiry"].eq(expiry)
                 & _otm_mask(group)
-                & _valid_option_mask(group, min_oi=min_oi, min_volume=1, max_abs_delta=float(main_cfg.get("max_abs_delta", 0.08)))
             ].copy()
-            side_iv = candidates.groupby("option_type")["implied_vol"].median().to_dict() if not candidates.empty else {}
+            candidates = ensure_signal_iv(candidates, price_col="entry_price")
+            candidates = candidates[_valid_option_mask(candidates, min_oi=min_oi, min_volume=1, max_abs_delta=float(main_cfg.get("max_abs_delta", 0.08)))].copy()
+            iv_col = signal_iv_col(candidates)
+            side_iv = candidates.groupby("option_type")[iv_col].median().to_dict() if not candidates.empty else {}
             put_iv = _safe_float(side_iv.get("P"))
             call_iv = _safe_float(side_iv.get("C"))
             selected = ""
@@ -799,16 +974,18 @@ class PitSignalAppender:
             snapshot["exchange"].isin(set(config.get("exclude_exchanges", EXCLUDED_EXCHANGES))).eq(False)
             & pd.to_numeric(snapshot["dte"], errors="coerce").between(dte_min, dte_max)
             & pd.to_numeric(snapshot["moneyness"], errors="coerce").between(mon_min, mon_max)
-            & pd.to_numeric(snapshot["implied_vol"], errors="coerce").between(iv_min, iv_max)
             & pd.to_numeric(snapshot["entry_price"], errors="coerce").gt(0)
         ].copy()
+        work = ensure_signal_iv(work, price_col="entry_price", iv_min=iv_min, iv_max=iv_max)
+        iv_col = signal_iv_col(work)
+        work = work[pd.to_numeric(work[iv_col], errors="coerce").gt(iv_min) & pd.to_numeric(work[iv_col], errors="coerce").lt(iv_max)].copy()
         if work.empty:
             return pd.DataFrame(columns=["trade_date", "exchange", "product", "atm_iv", "atm_option_obs", "spot_close"])
         rows = (
             work.groupby(["trade_date", "exchange", "product"], as_index=False)
             .agg(
-                atm_iv=("implied_vol", "median"),
-                atm_option_obs=("implied_vol", "count"),
+                atm_iv=(iv_col, "median"),
+                atm_option_obs=(iv_col, "count"),
                 spot_close=("spot_close", "median"),
             )
         )
@@ -840,17 +1017,24 @@ class PitSignalAppender:
         sample_min = float(cfg.get("rr_sample_abs_delta_min", 0.01))
         sample_max = float(cfg.get("rr_sample_abs_delta_max", 0.30))
         for (exchange, product), group in snapshot[snapshot["exchange"].isin(set(cfg.get("exclude_exchanges", EXCLUDED_EXCHANGES))).eq(False)].groupby(["exchange", "product"], sort=False):
-            expiry = _nearest_expiry(group, float(cfg.get("rr_sample_dte_min", 10)), float(cfg.get("rr_sample_dte_max", 90)))
+            expiry = _front_expiry_if_eligible(group, float(cfg.get("rr_sample_dte_min", 10)), float(cfg.get("rr_sample_dte_max", 90)))
             if not expiry:
                 continue
             sample = group[
                 group["target_expiry"].eq(expiry)
                 & _otm_mask(group)
                 & pd.to_numeric(group["abs_delta"], errors="coerce").between(sample_min, sample_max)
-                & pd.to_numeric(group["implied_vol"], errors="coerce").between(float(cfg.get("iv_min", 0.01)), float(cfg.get("iv_max", 2.5)))
                 & pd.to_numeric(group["entry_price"], errors="coerce").gt(0)
             ].copy()
-            side_iv = sample.groupby("option_type")["implied_vol"].median().to_dict() if not sample.empty else {}
+            sample = ensure_signal_iv(sample, price_col="entry_price", iv_min=float(cfg.get("iv_min", 0.01)), iv_max=float(cfg.get("iv_max", 2.5)))
+            rr_iv_col = signal_iv_col(sample)
+            sample = sample[pd.to_numeric(sample[rr_iv_col], errors="coerce").gt(float(cfg.get("iv_min", 0.01))) & pd.to_numeric(sample[rr_iv_col], errors="coerce").lt(float(cfg.get("iv_max", 2.5)))].copy()
+            side_agg = sample.groupby("option_type")[rr_iv_col].agg(["median", "size"]) if not sample.empty else pd.DataFrame()
+            put_obs = int(side_agg.loc["P", "size"]) if "P" in side_agg.index else 0
+            call_obs = int(side_agg.loc["C", "size"]) if "C" in side_agg.index else 0
+            if put_obs < 2 or call_obs < 2:
+                continue
+            side_iv = side_agg["median"].to_dict()
             put_iv = _safe_float(side_iv.get("P"))
             call_iv = _safe_float(side_iv.get("C"))
             rr = call_iv - put_iv if np.isfinite(call_iv) and np.isfinite(put_iv) else np.nan
@@ -873,11 +1057,22 @@ class PitSignalAppender:
                     "iv_percentile": _safe_float(atm_row["iv_percentile"].iloc[-1]) if not atm_row.empty and "iv_percentile" in atm_row else np.nan,
                     "iv_prior_days": _safe_float(atm_row["iv_prior_days"].iloc[-1]) if not atm_row.empty and "iv_prior_days" in atm_row else np.nan,
                     "sample_obs": int(len(sample)),
+                    "put_obs": put_obs,
+                    "call_obs": call_obs,
                 }
             )
         path = self.data_dir / "risk_reversal_sidecar" / "risk_reversal_panel.csv"
         panel = _merge_panel(path, pd.DataFrame(rows), ["trade_date", "exchange", "product"])
         if not panel.empty:
+            panel = panel.sort_values(["exchange", "product", "trade_date"], kind="mergesort")
+            pieces = []
+            for _, g in panel.groupby(["exchange", "product"], sort=False):
+                pct, prior = _expanding_percentile_including_current(g["abs_risk_reversal"])
+                h = g.copy()
+                h["iv_percentile"] = pct
+                h["iv_prior_days"] = prior
+                pieces.append(h)
+            panel = pd.concat(pieces, ignore_index=True, sort=False)
             panel = _add_group_lags(panel, ["exchange", "product"], ["risk_reversal", "abs_risk_reversal", "put_iv", "call_iv", "iv_percentile", "iv_prior_days"], 3)
         write_csv(path, panel)
         return panel
@@ -898,14 +1093,17 @@ class PitSignalAppender:
             snapshot["exchange"].isin(set(atm_cfg["exclude_exchanges"])).eq(False)
             & pd.to_numeric(snapshot["dte"], errors="coerce").between(float(atm_cfg["atm_iv_dte_min"]), float(atm_cfg["atm_iv_dte_max"]))
             & pd.to_numeric(snapshot["moneyness"], errors="coerce").between(float(atm_cfg["atm_iv_moneyness_min"]), float(atm_cfg["atm_iv_moneyness_max"]))
-            & pd.to_numeric(snapshot["implied_vol"], errors="coerce").between(float(atm_cfg["iv_min"]), float(atm_cfg["iv_max"]))
             & pd.to_numeric(snapshot["entry_price"], errors="coerce").gt(0)
         ].copy()
+        work = ensure_signal_iv(work, price_col="entry_price", iv_min=float(atm_cfg["iv_min"]), iv_max=float(atm_cfg["iv_max"]))
+        term_iv_col = signal_iv_col(work)
+        work = work[pd.to_numeric(work[term_iv_col], errors="coerce").gt(float(atm_cfg["iv_min"])) & pd.to_numeric(work[term_iv_col], errors="coerce").lt(float(atm_cfg["iv_max"]))].copy()
+        expiry_iv_columns = ["exchange", "product", "target_expiry", "atm_iv", "dte", "spot_close"]
         expiry_iv = (
             work.groupby(["exchange", "product", "target_expiry"], as_index=False)
-            .agg(atm_iv=("implied_vol", "median"), dte=("dte", "median"), spot_close=("spot_close", "median"))
+            .agg(atm_iv=(term_iv_col, "median"), dte=("dte", "median"), spot_close=("spot_close", "median"))
             if not work.empty
-            else pd.DataFrame()
+            else pd.DataFrame(columns=expiry_iv_columns)
         )
         for (exchange, product), group in expiry_iv.groupby(["exchange", "product"], sort=False):
             ordered = group.sort_values(["dte", "target_expiry"], kind="mergesort")
@@ -913,11 +1111,32 @@ class PitSignalAppender:
                 continue
             near = ordered.iloc[0]
             nxt = ordered.iloc[1]
-            pressure = pressure_panel[
-                pressure_panel["trade_date"].eq(date)
-                & pressure_panel["exchange"].eq(exchange)
-                & pressure_panel["product"].eq(product)
-            ]
+            original = snapshot[snapshot["exchange"].eq(exchange) & snapshot["product"].eq(product)]
+            t_side = ""
+            if not original.empty:
+                expiry = _front_expiry_if_eligible(original, float(cfg.get("min_dte", 10)), None)
+                if expiry:
+                    candidates = original[
+                        original["target_expiry"].eq(expiry)
+                        & _otm_mask(original)
+                    ].copy()
+                    candidates = ensure_signal_iv(candidates, price_col="entry_price")
+                    candidates = candidates[
+                        _valid_option_mask(
+                            candidates,
+                            min_oi=float(cfg.get("min_oi", 1000)),
+                            min_volume=float(cfg.get("min_volume", 1)),
+                            max_abs_delta=float(cfg.get("max_abs_delta", 0.03)),
+                        )
+                    ].copy()
+                    side_iv_col = signal_iv_col(candidates)
+                    side_iv = candidates.groupby("option_type")[side_iv_col].median().to_dict() if not candidates.empty else {}
+                    put_iv = _safe_float(side_iv.get("P"))
+                    call_iv = _safe_float(side_iv.get("C"))
+                    if np.isfinite(put_iv) and (not np.isfinite(call_iv) or put_iv > call_iv):
+                        t_side = "P"
+                    elif np.isfinite(call_iv):
+                        t_side = "C"
             rows.append(
                 {
                     "trade_date": date,
@@ -929,7 +1148,7 @@ class PitSignalAppender:
                     "next_atm_iv": nxt["atm_iv"],
                     "term_spread": near["atm_iv"] - nxt["atm_iv"],
                     "spot_close": near["spot_close"],
-                    "t_side": str(pressure["selected_side"].iloc[-1]) if not pressure.empty else "",
+                    "t_side": t_side,
                 }
             )
         path = self.data_dir / "term_structure_sidecar" / "term_structure_panel.csv"
@@ -938,7 +1157,7 @@ class PitSignalAppender:
             panel = panel.sort_values(["exchange", "product", "trade_date"], kind="mergesort")
             pieces = []
             for _, g in panel.groupby(["exchange", "product"], sort=False):
-                pct, prior = _expanding_percentile_including_current(g["near_atm_iv"])
+                pct, prior = _expanding_percentile_including_current(g["term_spread"])
                 h = g.copy()
                 h["iv_percentile"] = pct
                 h["iv_prior_days"] = prior
@@ -969,6 +1188,8 @@ class PitSignalAppender:
             "columns": columns,
             "nav": nav,
             "current_margin_cash": current_margin_cash,
+            "same_day_overlay_opened": set(),
+            "overlay_week_layer_side_counts": {},
         }
         main_rows = self._build_main_rows(context, panels)
         rows.extend(main_rows)
@@ -984,17 +1205,70 @@ class PitSignalAppender:
             "overlay2": len(overlay2),
             "overlay3": len(overlay3),
         }
-        opportunities = pd.DataFrame(rows)
-        if not opportunities.empty:
-            opp_path = self.data_dir / "reverse_lowjump" / "product_side_opportunities.csv"
-            opp_rows = opportunities[opportunities["entry_reason"].eq("monthly")].copy()
-            if not opp_rows.empty:
-                old = _read_csv(opp_path)
-                new_panel = pd.concat([old, opp_rows], ignore_index=True, sort=False) if not old.empty else opp_rows
-                key_cols = ["entry_date", "exchange", "product", "sell_side", "target_expiry"]
-                new_panel = new_panel.drop_duplicates(key_cols, keep="last")
-                write_csv(opp_path, new_panel)
         return rows
+
+    def _overlay_product_expiry_key(self, row: dict[str, Any] | pd.Series) -> tuple[str, str, str] | None:
+        exchange = str(row.get("exchange", "") or "").upper()
+        product = str(row.get("product", row.get("product_label", "")) or "").upper()
+        expiry = str(row.get("target_expiry", row.get("expiry_date", "")) or "")[:10]
+        if not exchange or not product or not expiry:
+            return None
+        return exchange, product, expiry
+
+    def _overlay_already_opened(
+        self,
+        context: dict[str, Any],
+        row: dict[str, Any],
+        opened: set[tuple[str, str, str]],
+    ) -> bool:
+        controls = self.config.get("sidecar_risk_controls", {})
+        if not bool(controls.get("one_open_per_product_expiry", True)):
+            return False
+        key = self._overlay_product_expiry_key(row)
+        if key is None:
+            return False
+        same_day = context.setdefault("same_day_overlay_opened", set())
+        return key in opened or key in same_day
+
+    def _sidecar_weekly_cap(self, cfg: dict[str, Any]) -> int:
+        controls = self.config.get("sidecar_risk_controls", {})
+        return int(cfg.get("weekly_exchange_side_cap", controls.get("weekly_exchange_side_cap", 0)) or 0)
+
+    def _overlay_weekly_cap_reached(
+        self,
+        context: dict[str, Any],
+        cfg: dict[str, Any],
+        row: dict[str, Any],
+    ) -> bool:
+        cap = self._sidecar_weekly_cap(cfg)
+        if cap <= 0:
+            return False
+        layer = str(row.get("strategy_layer", "") or "")
+        exchange = str(row.get("exchange", "") or "").upper()
+        side = str(row.get("sell_side", row.get("option_type", "")) or "").upper()[:1]
+        if not exchange or side not in {"P", "C"}:
+            return False
+        by_layer = context.setdefault("overlay_week_layer_side_counts", {})
+        if layer not in by_layer:
+            by_layer[layer] = self._weekly_layer_side_counts(context["existing_schedule"], context["date"], layer)
+        return int(by_layer[layer].get((exchange, side), 0)) >= cap
+
+    def _remember_overlay_row(self, context: dict[str, Any], cfg: dict[str, Any], row: dict[str, Any]) -> None:
+        key = self._overlay_product_expiry_key(row)
+        if key is not None:
+            context.setdefault("same_day_overlay_opened", set()).add(key)
+        cap = self._sidecar_weekly_cap(cfg)
+        if cap <= 0:
+            return
+        layer = str(row.get("strategy_layer", "") or "")
+        exchange = str(row.get("exchange", "") or "").upper()
+        side = str(row.get("sell_side", row.get("option_type", "")) or "").upper()[:1]
+        if not exchange or side not in {"P", "C"}:
+            return
+        by_layer = context.setdefault("overlay_week_layer_side_counts", {})
+        if layer not in by_layer:
+            by_layer[layer] = self._weekly_layer_side_counts(context["existing_schedule"], context["date"], layer)
+        by_layer[layer][(exchange, side)] = int(by_layer[layer].get((exchange, side), 0)) + 1
 
     def _opened_product_expiry(
         self,
@@ -1045,59 +1319,31 @@ class PitSignalAppender:
 
     def _build_main_rows(self, context: dict[str, Any], panels: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
         date = context["date"]
-        snapshot = context["snapshot"]
         existing = context["existing_schedule"]
         columns = context["columns"]
         nav = context["nav"]
         current_margin_cash = context["current_margin_cash"]
         main_cfg = self.config.get("main_sleeve", {})
         margin_cap = float(self.config.get("margin_cap", main_cfg.get("portfolio_margin_cap_pct_nav", 0.7)))
+        selected = panels.get("main_selected", pd.DataFrame())
+        if selected.empty or "entry_date" not in selected.columns:
+            return []
+        selected = selected.copy()
+        selected["entry_date"] = _normalize_date_series(selected["entry_date"])
+        today = selected[selected["entry_date"].eq(date)].copy()
         opened = self._opened_product_expiry(existing, date, layers={""}, entry_reasons={"monthly"})
-        iv_today = panels["iv_daily"][panels["iv_daily"]["trade_date"].eq(date)].copy()
-        flow_today = panels["flow"][panels["flow"]["trade_date"].eq(date)].copy()
-        pressure_today = panels["pressure"][panels["pressure"]["trade_date"].eq(date)].copy()
         rows = []
-        for _, pressure in pressure_today.iterrows():
-            exchange = str(pressure.get("exchange", "")).upper()
-            product = str(pressure.get("product", "")).upper()
-            expiry = str(pressure.get("target_expiry", ""))[:10]
-            side = str(pressure.get("selected_side", "")).upper()
-            if not side or (exchange, product, expiry) in opened:
+        for _, signal in today.iterrows():
+            exchange = str(signal.get("exchange", "")).upper()
+            product = str(signal.get("product", signal.get("product_label", ""))).upper()
+            expiry = str(signal.get("target_expiry", signal.get("expiry_date", "")))[:10]
+            side = str(signal.get("sell_side", signal.get("option_type", ""))).upper()
+            if not side or not expiry or (exchange, product, expiry) in opened:
                 continue
-            iv_row = iv_today[iv_today["exchange"].eq(exchange) & iv_today["product"].eq(product)]
-            if iv_row.empty or not bool(iv_row.iloc[-1].get("pit_low_jump_strict", False)):
-                continue
-            flow = flow_today[
-                flow_today["exchange"].eq(exchange)
-                & flow_today["product"].eq(product)
-                & flow_today["sell_side"].eq(side)
-            ]
-            if flow.empty or not bool(flow.iloc[-1].get("flow_guard_pass", False)):
-                continue
-            diff = _safe_float(pressure.get("side_iv_pressure_diff"))
-            delta_cap = 0.04 if np.isfinite(diff) and diff < 0.02 else float(main_cfg.get("max_abs_delta", 0.08))
-            contract = _select_contract(
-                snapshot[(snapshot["exchange"].eq(exchange)) & (snapshot["product"].eq(product))],
-                side,
-                expiry,
-                max_abs_delta=delta_cap,
-                min_oi=float(main_cfg.get("min_oi", 1000)),
-                min_volume=1,
-            )
-            if contract is None:
-                continue
-            target_pct = float(main_cfg.get("target_premium_pct_nav", 0.001))
-            if np.isfinite(diff) and diff < 0.02:
-                target_pct = float(main_cfg.get("portfolio_group_new_trade_cap_after_trigger_pct_nav", 0.00075))
-            elif np.isfinite(diff) and diff >= 0.03:
-                flow_row = flow.iloc[-1]
-                if _safe_float(flow_row.get("opt_side_oi_x63")) >= 0.8 and (
-                    _safe_float(flow_row.get("fut_oi_chg5")) > 0 or _safe_float(flow_row.get("opt_side_volume_x63")) > 1.0
-                ):
-                    target_pct = 0.0015
+            target_pct = _safe_float(signal.get("target_premium_pct_override"), float(main_cfg.get("target_premium_pct_nav", 0.001)))
             row = self._row_from_contract(
                 columns,
-                contract,
+                signal,
                 date=date,
                 entry_reason="monthly",
                 strategy_layer="",
@@ -1110,17 +1356,17 @@ class PitSignalAppender:
             row.update(
                 {
                     "sell_side": side,
-                    "put_iv_pressure": pressure.get("put_iv_pressure"),
-                    "call_iv_pressure": pressure.get("call_iv_pressure"),
-                    "selected_side_iv_pressure": pressure.get("selected_side_iv_pressure"),
-                    "other_side_iv_pressure": pressure.get("other_side_iv_pressure"),
-                    "side_iv_pressure_diff": pressure.get("side_iv_pressure_diff"),
+                    "put_iv_pressure": signal.get("put_iv_pressure"),
+                    "call_iv_pressure": signal.get("call_iv_pressure"),
+                    "selected_side_iv_pressure": signal.get("selected_side_iv_pressure"),
+                    "other_side_iv_pressure": signal.get("other_side_iv_pressure"),
+                    "side_iv_pressure_diff": signal.get("side_iv_pressure_diff"),
                     "trend_20d": np.nan,
                     "budget_group": _budget_group(product, side, self.config.get("broad_sector_groups", {})),
                     "portfolio_group_margin_trigger_pct_nav": main_cfg.get("portfolio_group_margin_trigger_pct_nav", 0.45),
                     "portfolio_group_new_trade_cap_after_trigger_pct_nav": main_cfg.get("portfolio_group_new_trade_cap_after_trigger_pct_nav", 0.00075),
-                    "group_margin_trigger_margin_pct": 0.0,
-                    "capped_by_group_margin_trigger": False,
+                    "group_margin_trigger_margin_pct": signal.get("group_margin_trigger_margin_pct", 0.0),
+                    "capped_by_group_margin_trigger": bool(signal.get("capped_by_group_margin_trigger", False)),
                     "reentry_count": 0,
                 }
             )
@@ -1134,6 +1380,18 @@ class PitSignalAppender:
         date = context["date"]
         rows = []
         atm_today = panels["overlay_atm"][panels["overlay_atm"]["trade_date"].eq(date)].copy()
+        if not atm_today.empty and "term" in panels and not panels["term"].empty:
+            term_cols = ["trade_date", "exchange", "product", "trend_20d_lag1"]
+            term_today = panels["term"][panels["term"].get("trade_date", pd.Series(dtype=object)).eq(date)].copy()
+            if not term_today.empty and all(col in term_today.columns for col in term_cols):
+                atm_today = atm_today.merge(
+                    term_today[term_cols],
+                    on=["trade_date", "exchange", "product"],
+                    how="left",
+                )
+        if not atm_today.empty:
+            atm_today["_overlay_sort_iv"] = pd.to_numeric(atm_today.get("iv_percentile_lag4"), errors="coerce")
+            atm_today = atm_today.sort_values(["_overlay_sort_iv"], ascending=[False], kind="mergesort")
         opened = self._opened_product_expiry(
             context["existing_schedule"],
             date,
@@ -1146,7 +1404,9 @@ class PitSignalAppender:
             row = self._build_overlay_contract_row(context, signal, cfg, layer="", side=None, forced_side_rule="higher_iv_pressure")
             if row is None:
                 continue
-            if (str(row["exchange"]).upper(), str(row["product"]).upper(), str(row["target_expiry"])[:10]) in opened:
+            if self._overlay_already_opened(context, row, opened):
+                continue
+            if self._overlay_weekly_cap_reached(context, cfg, row):
                 continue
             row.update(
                 {
@@ -1174,19 +1434,31 @@ class PitSignalAppender:
                     "overlay_signal_family": "iv_extreme_pullback",
                     "overlay_side_rule": "higher_iv_pressure",
                     "overlay_priority": 1,
+                    "t1_trend_20d": signal.get("trend_20d_lag1"),
                 }
             )
+            self._remember_overlay_row(context, cfg, row)
             rows.append(row)
         return rows
 
     def _overlay1_trigger(self, signal: pd.Series, cfg: dict[str, Any]) -> bool:
-        return (
+        base_trigger = (
             _safe_float(signal.get("iv_prior_days_lag4")) >= float(cfg.get("min_iv_history_days", 252))
             and _safe_float(signal.get("iv_percentile_lag4")) >= float(cfg.get("iv_percentile_threshold", 0.95))
             and _safe_float(signal.get("atm_iv_lag3")) < _safe_float(signal.get("atm_iv_lag4"))
             and _safe_float(signal.get("atm_iv_lag2")) < _safe_float(signal.get("atm_iv_lag3"))
             and _safe_float(signal.get("atm_iv_lag1")) < _safe_float(signal.get("atm_iv_lag2"))
         )
+        if not base_trigger:
+            return False
+        lag1_iv_max = _safe_float(cfg.get("lag1_iv_percentile_max"))
+        if np.isfinite(lag1_iv_max) and not _safe_float(signal.get("iv_percentile_lag1")) < lag1_iv_max:
+            return False
+        lag1_trend_abs_max = _safe_float(cfg.get("lag1_trend20_abs_max"))
+        lag1_trend = _safe_float(signal.get("trend_20d_lag1"))
+        if np.isfinite(lag1_trend_abs_max) and np.isfinite(lag1_trend) and abs(lag1_trend) > lag1_trend_abs_max:
+            return False
+        return True
 
     def _build_overlay2_rows(self, context: dict[str, Any], panels: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
         cfg = self.config.get("risk_reversal_sidecar", {})
@@ -1194,6 +1466,9 @@ class PitSignalAppender:
             return []
         date = context["date"]
         rr_today = panels["rr"][panels["rr"]["trade_date"].eq(date)].copy()
+        if not rr_today.empty:
+            rr_today["_overlay_sort_iv"] = pd.to_numeric(rr_today.get("iv_percentile_lag3"), errors="coerce")
+            rr_today = rr_today.sort_values(["_overlay_sort_iv"], ascending=[False], kind="mergesort")
         opened = self._opened_product_expiry(
             context["existing_schedule"],
             date,
@@ -1215,7 +1490,9 @@ class PitSignalAppender:
             )
             if row is None:
                 continue
-            if (str(row["exchange"]).upper(), str(row["product"]).upper(), str(row["target_expiry"])[:10]) in opened:
+            if self._overlay_already_opened(context, row, opened):
+                continue
+            if self._overlay_weekly_cap_reached(context, cfg, row):
                 continue
             row.update(
                 {
@@ -1242,6 +1519,7 @@ class PitSignalAppender:
                     "overlay_trigger_iv_percentile": signal.get("iv_percentile_lag3"),
                 }
             )
+            self._remember_overlay_row(context, cfg, row)
             rows.append(row)
         return rows
 
@@ -1264,29 +1542,28 @@ class PitSignalAppender:
             return []
         date = context["date"]
         layer = "overlay3_term_structure_cluster_cap2"
-        counts = self._weekly_layer_side_counts(context["existing_schedule"], date, layer)
         opened = self._opened_product_expiry(
             context["existing_schedule"],
             date,
             layers={"", "overlay2_risk_reversal_same_sign", "overlay3_term_structure_cluster_cap2"},
             entry_reasons={"iv_extreme_overlay"},
         )
-        cap = int(cfg.get("weekly_exchange_side_cap", 2))
         term_today = panels["term"][panels["term"]["trade_date"].eq(date)].copy()
+        if not term_today.empty:
+            term_today["_overlay_sort_iv"] = pd.to_numeric(term_today.get("iv_percentile_lag3"), errors="coerce")
+            term_today = term_today.sort_values(["_overlay_sort_iv"], ascending=[False], kind="mergesort")
         rows = []
         for _, signal in term_today.iterrows():
             triggered, side, conflict, reason = self._overlay3_trigger(signal, cfg)
             if not triggered:
                 continue
-            exchange = str(signal.get("exchange", "")).upper()
-            if counts.get((exchange, side), 0) >= cap:
-                continue
             row = self._build_overlay_contract_row(context, signal, cfg, layer=layer, side=side, forced_side_rule="term_structure_t1_high_iv_pressure")
             if row is None:
                 continue
-            if (str(row["exchange"]).upper(), str(row["product"]).upper(), str(row["target_expiry"])[:10]) in opened:
+            if self._overlay_already_opened(context, row, opened):
                 continue
-            counts[(exchange, side)] = counts.get((exchange, side), 0) + 1
+            if self._overlay_weekly_cap_reached(context, cfg, row):
+                continue
             row.update(
                 {
                     "entry_reason": "iv_extreme_overlay",
@@ -1313,6 +1590,7 @@ class PitSignalAppender:
                     "overlay_trigger_iv_percentile": signal.get("iv_percentile_lag3"),
                 }
             )
+            self._remember_overlay_row(context, cfg, row)
             rows.append(row)
         return rows
 
@@ -1330,7 +1608,8 @@ class PitSignalAppender:
             and _safe_float(signal.get("iv_percentile_lag3")) >= float(cfg.get("iv_percentile_threshold", 0.95))
             and _safe_float(signal.get("term_spread_lag3")) > 0
             and _safe_float(signal.get("term_spread_lag2")) < _safe_float(signal.get("term_spread_lag3"))
-            and _safe_float(signal.get("term_spread_lag1")) < _safe_float(signal.get("term_spread_lag2"))
+            and _safe_float(signal.get("term_spread_lag1")) <= _safe_float(signal.get("term_spread_lag2"))
+            and _safe_float(signal.get("term_spread_lag1")) > 0
         )
         return triggered, side, False, ""
 
@@ -1350,7 +1629,7 @@ class PitSignalAppender:
         group = snapshot[snapshot["exchange"].eq(exchange) & snapshot["product"].eq(product)].copy()
         if group.empty:
             return None
-        expiry = _nearest_expiry(group, float(cfg.get("min_dte", 10)), None)
+        expiry = _front_expiry_if_eligible(group, float(cfg.get("min_dte", 10)), None)
         if not expiry:
             return None
         selected_side = side
@@ -1359,14 +1638,18 @@ class PitSignalAppender:
             candidates = group[
                 group["target_expiry"].eq(expiry)
                 & _otm_mask(group)
-                & _valid_option_mask(
-                    group,
+            ].copy()
+            candidates = ensure_signal_iv(candidates, price_col="entry_price")
+            candidates = candidates[
+                _valid_option_mask(
+                    candidates,
                     min_oi=float(cfg.get("min_oi", 1000)),
                     min_volume=float(cfg.get("min_volume", 1)),
                     max_abs_delta=float(cfg.get("max_abs_delta", 0.04)),
                 )
             ].copy()
-            side_iv = candidates.groupby("option_type")["implied_vol"].median().to_dict() if not candidates.empty else {}
+            iv_col = signal_iv_col(candidates)
+            side_iv = candidates.groupby("option_type")[iv_col].median().to_dict() if not candidates.empty else {}
             put_iv = _safe_float(side_iv.get("P"))
             call_iv = _safe_float(side_iv.get("C"))
             if np.isfinite(put_iv) and (not np.isfinite(call_iv) or put_iv > call_iv):
@@ -1426,22 +1709,28 @@ class PitSignalAppender:
     ) -> dict[str, Any]:
         row = _base_schedule_row(columns)
         one_lot_margin = _estimate_margin(contract, self.config)
+        product = str(contract.get("product", contract.get("product_label", ""))).upper()
+        entry_price = contract.get("entry_price", contract.get("close"))
+        target_expiry = contract.get("target_expiry")
+        if pd.isna(target_expiry) or not str(target_expiry).strip():
+            target_expiry = contract.get("expiry_date")
+        target_expiry = _normalize_date_series(pd.Series([target_expiry])).iloc[0]
         row.update(
             {
                 "entry_date": date,
-                "product": str(contract.get("product", "")).upper(),
+                "product": product,
                 "exchange": str(contract.get("exchange", "")).upper(),
                 "contract_code": contract.get("contract_code"),
                 "option_type": contract.get("option_type"),
-                "target_expiry": contract.get("target_expiry"),
+                "target_expiry": target_expiry,
                 "dte": contract.get("dte"),
                 "delta": contract.get("delta"),
                 "close_oi": contract.get("close_oi"),
                 "volume": contract.get("volume"),
-                "entry_price": contract.get("entry_price"),
+                "entry_price": entry_price,
                 "strike": contract.get("strike"),
                 "spot_close": contract.get("spot_close"),
-                "sell_side": contract.get("option_type"),
+                "sell_side": contract.get("sell_side", contract.get("option_type")),
                 "side_rule": side_rule,
                 "entry_reason": entry_reason,
                 "strategy_layer": strategy_layer,

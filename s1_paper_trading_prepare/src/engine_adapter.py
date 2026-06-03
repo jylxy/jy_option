@@ -158,7 +158,7 @@ def _orders_from_signals(signals: pd.DataFrame, signal_date: str, execute_date: 
     for column in ("overlay_strategy", "overlay_signal_rule", "overlay_side_rule", "overlay_priority"):
         if column not in out.columns:
             out[column] = ""
-    out["l1_rule"] = "rule_l1_oi03_flow_guard"
+    out["l1_rule"] = "rule_l1_hsafe_addon025"
     out["l2_rule"] = "high_iv_pressure_side"
     out["l3_rule"] = "l3eff015_budget_tilt_and_margin45_new075"
     out["l4_rule"] = out["side_rule"].fillna("").replace("", "l4_diff02_delta04_l3eff015")

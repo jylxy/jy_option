@@ -1,7 +1,7 @@
 # Incremental Signal Update Design
 
 This note defines the production path for keeping
-`data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv`
+`data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv`
 fresh without rerunning the full historical backtest every day.
 
 ## Objective
@@ -31,7 +31,8 @@ python s1_paper_trading_prepare/scripts/append_daily_signals.py --start-date 202
 
 ## Canonical Historical Reference
 
-The current committed schedule is the gold reference for historical parity.
+The current committed hsafe_addon025 + sidecar1 T-1<95% schedule is the gold
+reference for historical parity.
 
 The source-key audit command is self-integrity only by default:
 

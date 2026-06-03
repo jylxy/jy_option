@@ -9,7 +9,7 @@ D:/工作实验/期权卖权策略相关研究/docs/s1_overlay2_overlay3_ruleboo
 These rules are part of the current paper-trading S1 line:
 
 ```text
-s1_strict_main_overlay1_plus_overlay23_20260531
+s1_hsafe_addon025_sidecar1_t1lt95_20260603
 ```
 
 The two sidecars scan the full non-ETF option universe. `SSE` and `SZSE` are excluded; commodity options and CFFEX index options remain eligible. They are signal sidecars, not broker execution adapters. A T signal is generated after the T daily Toolkit snapshot is available and is executed in paper mode on T+1 through Toolkit minute replay.

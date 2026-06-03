@@ -151,24 +151,37 @@ def main() -> int:
 
     overlay1 = schedule[entry_reason.eq("iv_extreme_overlay") & layer.eq("")].copy()
     if not overlay1.empty:
+        overlay1_cfg = snapshot.config.get("iv_pullback_sidecar", {})
+        iv_threshold = float(overlay1_cfg.get("iv_percentile_threshold", 0.95))
+        lag1_iv_max_value = overlay1_cfg.get("lag1_iv_percentile_max")
+        lag1_iv_max = float(lag1_iv_max_value) if lag1_iv_max_value is not None else None
+        lag1_trend_max_value = overlay1_cfg.get("lag1_trend20_abs_max")
+        lag1_trend_max = float(lag1_trend_max_value) if lag1_trend_max_value is not None else None
+        trend_lag1 = _num(overlay1, "t1_trend_20d")
         cond = (
-            _num(overlay1, "overlay_iv_percentile_lag4").ge(0.95)
+            _num(overlay1, "overlay_iv_percentile_lag4").ge(iv_threshold)
             & _num(overlay1, "overlay_atm_iv_lag3").lt(_num(overlay1, "overlay_atm_iv_lag4"))
             & _num(overlay1, "overlay_atm_iv_lag2").lt(_num(overlay1, "overlay_atm_iv_lag3"))
             & _num(overlay1, "overlay_atm_iv_lag1").lt(_num(overlay1, "overlay_atm_iv_lag2"))
         )
+        if lag1_iv_max is not None:
+            cond &= _num(overlay1, "overlay_iv_percentile_lag1").lt(lag1_iv_max)
+        if lag1_trend_max is not None:
+            cond &= trend_lag1.abs().le(lag1_trend_max) | trend_lag1.isna()
         _record_failures(
             failures,
             overlay1,
             ~cond,
             "overlay1_lag_only_pullback",
-            "Overlay1 must trigger from T-4 through T-1 lagged ATM IV and percentile fields only.",
+            "Overlay1 must trigger from T-4 through T-1 lagged ATM IV, percentile, and trend fields only.",
             [
                 "overlay_iv_percentile_lag4",
+                "overlay_iv_percentile_lag1",
                 "overlay_atm_iv_lag1",
                 "overlay_atm_iv_lag2",
                 "overlay_atm_iv_lag3",
                 "overlay_atm_iv_lag4",
+                "t1_trend_20d",
             ],
         )
 

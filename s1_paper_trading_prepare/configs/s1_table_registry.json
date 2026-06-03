@@ -1,7 +1,7 @@
 {
-  "registry_version": "2026-06-01",
+  "registry_version": "2026-06-03",
   "scope": "current S1 paper-trading line only",
-  "current_mainline": "s1_strict_main_overlay1_plus_overlay23_20260531",
+  "current_mainline": "s1_hsafe_addon025_sidecar1_t1lt95_20260603",
   "tables": [
     {
       "name": "option_chain_daily_snapshot",
@@ -172,7 +172,7 @@
       "source": "Approved S1 daily signal builder output",
       "config_gate_key": "s1_external_intent_minute_replay_enabled",
       "config_gate_expected": true,
-      "paper_path": "data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv",
+      "paper_path": "data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv",
       "paper_action": "Clean S1-only handoff into order review and Toolkit minute replay. Generated schedules are local data artifacts."
     }
   ]

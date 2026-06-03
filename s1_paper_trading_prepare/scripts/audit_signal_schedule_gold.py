@@ -171,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gold",
         default=None,
-        help="Gold schedule path. Defaults to external_signal_path in the paper config.",
+        help="Gold schedule path. Defaults to validation_gold_signal_path, then external_signal_path in the paper config.",
     )
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
@@ -190,7 +190,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     snapshot = load_effective_config(args.config)
-    gold_path = resolve_path(args.gold or snapshot.config.get("external_signal_path"))
+    gold_path = resolve_path(
+        args.gold
+        or snapshot.config.get("validation_gold_signal_path")
+        or snapshot.config.get("external_signal_path")
+    )
     generated_path = resolve_path(args.generated or gold_path)
     output_dir = resolve_path(args.output_dir)
 

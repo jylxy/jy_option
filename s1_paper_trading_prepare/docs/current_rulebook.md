@@ -3,7 +3,7 @@
 Version:
 
 ```text
-s1_strict_main_overlay1_plus_overlay23_20260531
+s1_hsafe_addon025_sidecar1_t1lt95_20260603
 ```
 
 This document is the source-of-truth description for the current paper-trading engineering line. It describes the rule implemented by `configs/s1_paper_mainline.json` and consumed by the external-intent order generator and Toolkit minute replay.
@@ -17,6 +17,17 @@ This document is the source-of-truth description for the current paper-trading e
 - Future-function guard: all signal fields must be available on or before T. Label or path-outcome fields can be used only after their horizon has matured and only for post-trade audit.
 
 ## Main Sleeve L0-L4
+
+The main sleeve is not a free daily scan. It first builds one product-month
+opportunity for each product after the previous monthly expiry:
+
+```text
+entry window = first tradable date in (previous_expiry, previous_expiry + 7 calendar days]
+target expiry = nearest live expiry on that entry date
+side = high_iv_pressure on that nearest expiry
+```
+
+Only this product-month opportunity table is then passed through L1/L2/L3/L4.
 
 ### L0 Data And Tradability
 
@@ -42,31 +53,57 @@ total margin / NAV <= 70%
 Current L1 rule:
 
 ```text
-rule_l1_oi03_flow_guard
+rule_l1_hsafe_addon025
 ```
 
 Expanded PIT expression:
 
 ```text
-pit_low_jump_strict
-AND opt_side_oi_x63 >= 0.3
-AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.0)
+rule_l1_hsafe_core OR addon025
 ```
 
 Where:
 
 ```text
 pit_low_jump_strict =
-  hist_iv_days_756 >= min_history_days
+  hist_iv_days_756 >= 120
   AND hist_jump5pp_rate_756 <= 0.025
   AND hist_p95_abs_iv_chg_756 <= 0.040
+
+rule_l1_hsafe_core =
+  hist_iv_days_756 >= 120
+  AND hist_jump5pp_rate_756 <= 0.005
+  AND hist_p95_abs_iv_chg_756 <= 0.030
+  AND opt_side_oi_x63 >= 0.3
+  AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.5)
+  AND rolling_cs_rank <= 20
+  AND (side_iv_pressure_diff <= 0.06 OR side_iv_pressure_diff is missing)
+  AND (side_iv_pressure_diff is present OR fut_oi_chg5 > 0)
+
+addon025 =
+  hist_iv_days_756 >= 120
+  AND hist_jump5pp_rate_756 <= 0.025
+  AND hist_p95_abs_iv_chg_756 <= 0.030
+  AND opt_side_oi_x63 >= 0.5
+  AND (fut_oi_chg5 > 0 OR opt_side_volume_x63 <= 1.3)
+  AND rolling_cs_rank <= 15
 ```
+
+`opt_side_oi_x63` and `opt_side_volume_x63` are computed from the same
+main-line near-month eligible candidate pool used for side pressure, not from
+all listed contracts on that side. The pool is commodity options only, OTM,
+nearest valid expiry, `abs(delta) <= 0.08`, `OI >= 1000`, positive volume,
+positive price, and valid IV.
 
 Interpretation:
 
-- First keep product-sides whose own historical IV jump profile is clean.
-- Require the selected option side to have enough relative open-interest depth.
-- Avoid states where option-side volume is spiking while underlying futures open interest is not confirming.
+- The hsafe core keeps very clean historical IV-jump products, limits weak
+  side-pressure states, and requires either direct pressure evidence or futures
+  OI confirmation.
+- The addon branch admits a slightly wider low-jump set only when side OI depth
+  and cross-sectional rank are stronger.
+- Both branches remain point-in-time: same-day pressure/flow is available after
+  the T close snapshot, while rolling IV history is trailing.
 
 ### L2 Side Choice
 
@@ -182,13 +219,15 @@ close > 0
 ATM IV = median implied_vol
 ```
 
-Trigger `t4_p95_pullback_3d`:
+Trigger `t4_p90_pullback_3d_lag1_ivpct_lt95_trend15`:
 
 ```text
-T-4 IV percentile >= 95%
+T-4 IV percentile >= 90%
 T-3 ATM IV < T-4 ATM IV
 T-2 ATM IV < T-3 ATM IV
 T-1 ATM IV < T-2 ATM IV
+T-1 IV percentile < 95%
+abs(T-1 20d futures trend) <= 15% when the lagged trend is available
 min historical IV observations = 252
 ```
 

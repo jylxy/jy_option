@@ -3,7 +3,7 @@
 This workspace is the clean paper-trading preparation project for the current S1 line:
 
 ```text
-s1_strict_main_overlay1_plus_overlay23_20260531
+s1_hsafe_addon025_sidecar1_t1lt95_20260603
 ```
 
 It contains only the approved S1 external-intent order flow:
@@ -54,7 +54,7 @@ be rebuilt only after the prior opportunity has matured.
 Main sleeve:
 
 ```text
-L1: rule_l1_oi03_flow_guard
+L1: rule_l1_hsafe_addon025
 L2: sell the higher-IV-pressure side
 L3: l3eff015 budget tilt, broad-sector margin45 new075
 L4: l4_diff02_delta04_l3eff015
@@ -63,7 +63,8 @@ L4: l4_diff02_delta04_l3eff015
 Overlay sidecar:
 
 ```text
-Overlay1: T-4 IV percentile >= 95%, then ATM IV pulls back for 3 days.
+Overlay1: T-4 IV percentile >= 90%, ATM IV pulls back for 3 days,
+          T-1 IV percentile < 95%, and |T-1 20d trend| <= 15% when available.
 Overlay2: T-3 risk-reversal percentile >= 95%, same-sign RR repairs for 2 days.
 Overlay3: T-3 near-minus-next ATM IV percentile >= 95%, term spread repairs for 2 days,
           with T-1 side pressure and 20d trend-conflict filter.
@@ -134,6 +135,12 @@ Strictly audit a generated schedule against the committed gold schedule:
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated path/to/generated_open_signals.csv
 ```
 
+The current gold schedule is:
+
+```text
+data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
+```
+
 Audit point-in-time guardrails for the current schedule:
 
 ```powershell
@@ -161,6 +168,21 @@ Full PIT appender backfill command:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/append_daily_signals.py --start-date 2022-01-01 --end-date 2026-03-31 --fetch-missing --output-schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
+```
+
+## Current Validation Replay
+
+Current frozen validation replay:
+
+```text
+output/backtest_current/hsafe_addon025_sidecar1_t1lt95_full_20260603/
+```
+
+Key metrics from 2022-01-01 through 2026-03-31:
+
+```text
+final NAV 63.244m, annual return 4.998%, annual vol 2.127%,
+max drawdown -2.397%, Sharpe 1.41, S1 PnL 13.465m.
 ```
 
 ## Local Artifacts

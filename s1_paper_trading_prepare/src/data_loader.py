@@ -271,6 +271,91 @@ def load_underlying_daily_flow(
     return grouped
 
 
+def load_underlying_daily_flow_range(
+    start_date: str,
+    end_date: str,
+    config_path: str | Path | None = None,
+    *,
+    products: tuple[str, ...] | None = None,
+    product_chunk_size: int = 32,
+) -> pd.DataFrame:
+    """Fetch product-level futures flow for a date range.
+
+    This is the batch equivalent of :func:`load_underlying_daily_flow` and is
+    used only for historical panel rebuilds. It keeps the production daily path
+    unchanged while avoiding thousands of one-day Toolkit round trips.
+    """
+    ensure_server_deploy_importable()
+    from contract_provider import ContractInfo
+    from query_filters import build_product_like_sql
+    from strategy_rules import DEFAULT_PARAMS
+    from config_loader import load_engine_config
+    from toolkit.selector import select_bars_sql
+
+    ci = ContractInfo()
+    ci.load()
+    path = resolve_path(config_path, default=DEFAULT_PAPER_CONFIG)
+    config = load_engine_config(str(path), DEFAULT_PARAMS)
+    product_pool = products or config.get("product_pool") or config.get("products") or ci.get_all_products()
+    if isinstance(product_pool, str):
+        product_pool = [p.strip() for p in product_pool.split(",") if p.strip()]
+    product_list = sorted({str(p).upper().strip() for p in product_pool if str(p).strip()})
+    if not product_list:
+        return pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close", "fut_settlement", "futures_flow_source_table"])
+
+    start = str(start_date)[:10]
+    end = str(end_date)[:10]
+    parts: list[pd.DataFrame] = []
+    for chunk in _chunks(product_list, product_chunk_size):
+        like_sql = build_product_like_sql(chunk, ci._cache, ci.get_product_codes)
+        for table_name in ("future_daily_quote", "future_history_quote"):
+            query = f"""
+                SELECT
+                    toString(date) AS trade_date,
+                    ths_code AS underlying_code,
+                    toFloat64OrZero(toString(volume)) AS fut_volume,
+                    toFloat64OrZero(toString(open_interest)) AS fut_open_interest,
+                    toFloat64OrZero(toString(close)) AS fut_close,
+                    toFloat64OrZero(toString(settlement)) AS fut_settlement
+                FROM {table_name}
+                WHERE date >= toDate('{start}')
+                  AND date <= toDate('{end}')
+                  AND ({like_sql})
+            """
+            frame = select_bars_sql(query)
+            if frame is not None and not frame.empty:
+                frame["source_table"] = table_name
+                frame["source_rank"] = 0 if table_name == "future_daily_quote" else 1
+                parts.append(frame)
+    if not parts:
+        return pd.DataFrame(columns=["trade_date", "product", "fut_volume", "fut_open_interest", "fut_close", "fut_settlement", "futures_flow_source_table"])
+
+    out = pd.concat(parts, ignore_index=True, sort=False)
+    out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["underlying_code"] = out["underlying_code"].fillna("").astype(str)
+    out = out.sort_values(["trade_date", "underlying_code", "source_rank"], kind="mergesort")
+    out = out.drop_duplicates(["trade_date", "underlying_code"], keep="first")
+    out["product"] = out["underlying_code"].map(_product_from_underlying_code)
+    out["is_continuous_future"] = out["underlying_code"].map(_is_continuous_future_code)
+    for column in ("fut_volume", "fut_open_interest", "fut_close", "fut_settlement"):
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    if not out.empty:
+        has_dated = out.groupby(["trade_date", "product"])["is_continuous_future"].transform(lambda x: (~x).any())
+        out = out[(~out["is_continuous_future"]) | (~has_dated)].copy()
+    grouped = (
+        out[out["product"].ne("")]
+        .groupby(["trade_date", "product"], as_index=False)
+        .agg(
+            fut_volume=("fut_volume", "sum"),
+            fut_open_interest=("fut_open_interest", "sum"),
+            fut_close=("fut_close", "median"),
+            fut_settlement=("fut_settlement", "median"),
+            futures_flow_source_table=("source_table", lambda x: ",".join(sorted({str(v) for v in x if str(v)}))),
+        )
+    )
+    return grouped
+
+
 def _product_from_underlying_code(code: str) -> str:
     base = str(code or "").split(".", 1)[0].upper()
     match = re.match(r"([A-Z]+)", base)

@@ -250,6 +250,8 @@ def match_input_to_rolling(input_entry: pd.DataFrame, rolling: pd.DataFrame, rol
         col
         for col in (
             "has_immature_shadow_context",
+            "rule_l1_hsafe_addon025",
+            "rule_l1_hsafe_core",
             "rule_l1_oi03_flow_guard",
             "rule_pit_shadow_rank20",
             "rule_pit_shadow_rank20_hiqual",
@@ -313,6 +315,8 @@ def main() -> int:
 
     rule_rows = []
     for rule in [
+        "rule_l1_hsafe_addon025",
+        "rule_l1_hsafe_core",
         "rule_l1_oi03_flow_guard",
         "rule_pit_shadow_rank20",
         "rule_pit_shadow_rank20_hiqual",

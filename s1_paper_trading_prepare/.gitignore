@@ -3,6 +3,7 @@ output/orders/*
 output/diagnostics/*
 output/audit/*
 output/backtest_analysis/*
+output/backtest_current/*
 data/daily_snapshots/*
 data/reverse_lowjump/*
 data/iv_pullback_overlay/*
@@ -17,14 +18,16 @@ logs/
 !output/orders/.gitkeep
 !output/diagnostics/.gitkeep
 !output/audit/.gitkeep
+!output/backtest_current/.gitkeep
 !data/daily_snapshots/.gitkeep
 !data/reverse_lowjump/.gitkeep
+!data/reverse_lowjump/product_side_opportunities.csv
 !data/iv_pullback_overlay/.gitkeep
 !data/risk_reversal_sidecar/.gitkeep
 !data/term_structure_sidecar/.gitkeep
 !data/manifests/.gitkeep
 !data/external_signals/.gitkeep
-!data/external_signals/strict_main_overlay1_plus_overlay23_open_signals.csv
+!data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
 !state/.gitkeep
 
 # Large or sensitive data

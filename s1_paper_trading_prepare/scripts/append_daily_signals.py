@@ -33,6 +33,8 @@ def main() -> int:
     parser.add_argument("--signal-date", default=None)
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
+    parser.add_argument("--signals-start-date", default=None, help="Warm up panels before this date without mutating the schedule.")
+    parser.add_argument("--signals-end-date", default=None, help="Refresh panels after this date without mutating the schedule.")
     parser.add_argument("--config", default=str(DEFAULT_PAPER_CONFIG))
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
@@ -46,6 +48,8 @@ def main() -> int:
     parser.add_argument("--current-margin-cash", type=float, default=None)
     parser.add_argument("--tag", default=None)
     parser.add_argument("--no-replace-date", action="store_true")
+    parser.add_argument("--skip-panel-refresh", action="store_true", help="Use already rebuilt PIT panel files and only regenerate schedule rows.")
+    parser.add_argument("--progress-every", type=int, default=25)
     args = parser.parse_args()
 
     if not args.signal_date and not (args.start_date and args.end_date):
@@ -63,6 +67,8 @@ def main() -> int:
             dates = [d.strftime("%Y-%m-%d") for d in pd.date_range(start=start, end=end, freq="D")]
     else:
         dates = [str(args.signal_date)[:10]]
+    signals_start = str(args.signals_start_date or dates[0])[:10]
+    signals_end = str(args.signals_end_date or dates[-1])[:10]
 
     if args.fetch_missing:
         update_daily_data(
@@ -82,11 +88,14 @@ def main() -> int:
         output_dir=args.output_dir,
         schedule_path=args.source_schedule or None,
     )
+    if args.skip_panel_refresh:
+        appender.preload_panels()
     source_schedule = args.source_schedule
     output_schedule = args.output_schedule
     result = None
-    for date in dates:
+    for idx, date in enumerate(dates, start=1):
         tag = args.tag if len(dates) == 1 else f"{args.tag or 'incremental_backfill'}_{date.replace('-', '')}"
+        update_schedule = signals_start <= date <= signals_end
         result = appender.append_date(
             date,
             source_schedule=source_schedule,
@@ -95,10 +104,21 @@ def main() -> int:
             nav=args.nav,
             current_margin_cash=args.current_margin_cash,
             replace_existing_date=not args.no_replace_date,
+            update_schedule=update_schedule,
+            refresh_panels=not args.skip_panel_refresh,
             tag=tag,
         )
-        source_schedule = output_schedule or str(result.schedule_path)
-        output_schedule = output_schedule or str(result.schedule_path)
+        if update_schedule:
+            source_schedule = output_schedule or str(result.schedule_path)
+            output_schedule = output_schedule or str(result.schedule_path)
+        if idx == 1 or idx == len(dates) or idx % max(1, int(args.progress_every or 1)) == 0 or result.rows_for_date:
+            print(
+                "[append "
+                f"{idx}/{len(dates)}] {date} "
+                f"schedule_updated={update_schedule} rows={result.rows_for_date} "
+                f"output_rows={result.output_rows}",
+                flush=True,
+            )
     assert result is not None
     print(
         "APPEND_DAILY_SIGNALS "
