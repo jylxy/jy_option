@@ -29,6 +29,7 @@ RULE_KEYS = (
     "external_open_farther_contract_reroute_enabled",
     "external_open_farther_contract_max_contracts",
     "external_open_farther_contract_max_qty_pct",
+    "main_pre_expiry_itm_exit",
     "margin_cap",
     "s1_margin_cap",
     "main_sleeve",

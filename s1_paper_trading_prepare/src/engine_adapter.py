@@ -9,8 +9,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .account_state import DEFAULT_STATE_DIR, expected_account_state_files
 from .config_snapshot import important_rules, load_effective_config
+from .data_loader import load_signal_day_snapshot
 from .diagnostics import write_csv, write_json
+from .main_pre_expiry_itm_exit import (
+    calendar_dte,
+    config_enabled as main_pre_expiry_itm_exit_enabled,
+    exit_reason as main_pre_expiry_itm_exit_reason,
+    intrinsic_value,
+    is_main_monthly_mapping,
+    scan_dte_lt as main_pre_expiry_itm_scan_dte_lt,
+    safe_float,
+    safe_text,
+)
 from .paths import DEFAULT_OUTPUT_DIR, DEFAULT_PAPER_CONFIG, resolve_path
 from .schemas import ORDER_FRONT_COLUMNS, PaperTradingRunRequest
 
@@ -71,6 +83,38 @@ def _frontload_columns(frame: pd.DataFrame, front_columns: list[str]) -> pd.Data
 
 def _safe_numeric(frame: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(frame[column], errors="coerce") if column in frame else pd.Series(np.nan, index=frame.index)
+
+
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _signed_quantity(row: pd.Series) -> float:
+    qty = safe_float(row.get("quantity", 0.0), 0.0)
+    side = safe_text(row.get("position_side", row.get("role", ""))).lower()
+    if side in {"short", "sell", "sold"} and qty > 0:
+        return -qty
+    if side in {"long", "buy", "bought"} and qty < 0:
+        return abs(qty)
+    return qty
+
+
+def _option_mark_lookup(snapshot: pd.DataFrame) -> dict[str, pd.Series]:
+    if snapshot.empty:
+        return {}
+    work = snapshot.copy()
+    code_col = "option_code" if "option_code" in work.columns else "ths_code" if "ths_code" in work.columns else ""
+    if not code_col:
+        return {}
+    work[code_col] = work[code_col].astype(str)
+    work = work[work[code_col].ne("")]
+    work = work.drop_duplicates(code_col, keep="last")
+    return {str(row[code_col]): row for _, row in work.iterrows()}
 
 
 def _next_execution_date(signal_date: str, lag: str) -> str:
@@ -215,6 +259,178 @@ def _diagnostics_from_orders(orders: pd.DataFrame) -> pd.DataFrame:
     return diag
 
 
+def _orders_from_main_pre_expiry_itm_exit(
+    *,
+    signal_date: str,
+    execute_date: str,
+    config: dict[str, Any],
+    config_path: Path,
+    state_dir: Path,
+    products: tuple[str, ...] | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    reason = main_pre_expiry_itm_exit_reason(config)
+    diagnostics: list[dict[str, Any]] = []
+    if not main_pre_expiry_itm_exit_enabled(config):
+        return pd.DataFrame(columns=ORDER_FRONT_COLUMNS), pd.DataFrame()
+
+    files = expected_account_state_files(state_dir, signal_date)
+    positions = _read_optional_csv(files["positions"])
+    if positions.empty:
+        diagnostics.append({
+            "signal_date": signal_date,
+            "entry_reason": "monthly",
+            "strategy_layer": "main_monthly",
+            "reason": "main_pre_expiry_itm_exit_no_positions_state",
+            "positions_path": str(files["positions"]),
+        })
+        return pd.DataFrame(columns=ORDER_FRONT_COLUMNS), pd.DataFrame(diagnostics)
+
+    work = positions.copy()
+    work["_signed_quantity"] = work.apply(_signed_quantity, axis=1)
+    work["_is_main_monthly"] = work.apply(is_main_monthly_mapping, axis=1)
+    work = work[work["_signed_quantity"].lt(0) & work["_is_main_monthly"]].copy()
+    if products:
+        product_set = {str(product).upper() for product in products}
+        work = work[work.get("product", pd.Series("", index=work.index)).astype(str).str.upper().isin(product_set)].copy()
+    if work.empty:
+        diagnostics.append({
+            "signal_date": signal_date,
+            "entry_reason": "monthly",
+            "strategy_layer": "main_monthly",
+            "reason": "main_pre_expiry_itm_exit_no_active_main_short_positions",
+            "positions_path": str(files["positions"]),
+        })
+        return pd.DataFrame(columns=ORDER_FRONT_COLUMNS), pd.DataFrame(diagnostics)
+
+    active_products = tuple(sorted({
+        safe_text(x).upper()
+        for x in work.get("product", pd.Series(dtype=object)).dropna().tolist()
+        if safe_text(x)
+    }))
+    try:
+        snapshot = load_signal_day_snapshot(
+            signal_date,
+            config_path=config_path,
+            products=products or active_products or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - daily orders should still emit diagnostics.
+        diagnostics.append({
+            "signal_date": signal_date,
+            "entry_reason": "monthly",
+            "strategy_layer": "main_monthly",
+            "reason": "main_pre_expiry_itm_exit_snapshot_load_failed",
+            "error": str(exc),
+        })
+        return pd.DataFrame(columns=ORDER_FRONT_COLUMNS), pd.DataFrame(diagnostics)
+
+    mark_lookup = _option_mark_lookup(snapshot)
+    threshold = main_pre_expiry_itm_scan_dte_lt(config)
+    rows: list[dict[str, Any]] = []
+    for _, row in work.iterrows():
+        code = safe_text(row.get("code", ""))
+        option_type = safe_text(row.get("option_type", "")).upper()[:1]
+        strike = safe_float(row.get("strike"), np.nan)
+        expiry = safe_text(row.get("expiry", ""))[:10]
+        signed_qty = safe_float(row.get("_signed_quantity"), 0.0)
+        quantity = int(abs(signed_qty))
+        if not code or option_type not in {"P", "C"} or quantity <= 0:
+            continue
+        mark_row = mark_lookup.get(code)
+        if mark_row is None:
+            diagnostics.append({
+                "signal_date": signal_date,
+                "product": row.get("product", ""),
+                "code": code,
+                "entry_reason": "monthly",
+                "strategy_layer": "main_monthly",
+                "reason": "main_pre_expiry_itm_exit_missing_option_snapshot",
+                "expiry": expiry,
+            })
+            continue
+        dte = safe_float(mark_row.get("dte"), np.nan)
+        if not np.isfinite(dte):
+            dte = calendar_dte(expiry, signal_date)
+        spot = safe_float(mark_row.get("spot_close"), np.nan)
+        intrinsic = intrinsic_value(option_type, strike, spot)
+        option_close = safe_float(mark_row.get("option_close"), np.nan)
+        if not np.isfinite(option_close) or option_close <= 0:
+            option_close = safe_float(row.get("mark_price"), np.nan)
+        triggered = bool(np.isfinite(dte) and dte < threshold and np.isfinite(intrinsic) and intrinsic > 0)
+        diagnostics.append({
+            "signal_date": signal_date,
+            "product": row.get("product", ""),
+            "code": code,
+            "entry_reason": "monthly",
+            "strategy_layer": "main_monthly",
+            "reason": reason if triggered else "main_pre_expiry_itm_exit_not_triggered",
+            "scan_dte": dte,
+            "scan_dte_lt": threshold,
+            "option_type": option_type,
+            "strike": strike,
+            "spot_close": spot,
+            "intrinsic": intrinsic,
+            "option_close": option_close,
+            "expiry": expiry,
+        })
+        if not triggered:
+            continue
+        multiplier = safe_float(row.get("multiplier"), 1.0)
+        if not np.isfinite(multiplier) or multiplier <= 0:
+            multiplier = 1.0
+        close_value_cash = option_close * multiplier * quantity if np.isfinite(option_close) else np.nan
+        base_row = row.drop(labels=["_signed_quantity", "_is_main_monthly"], errors="ignore").to_dict()
+        rows.append({
+            **base_row,
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+            "order_status": "planned_main_pre_expiry_itm_exit",
+            "action": "buy_close",
+            "strategy": "S1",
+            "entry_reason": "monthly",
+            "strategy_layer": "main_monthly",
+            "product": safe_text(row.get("product", "")),
+            "exchange": safe_text(row.get("exchange", "")),
+            "code": code,
+            "source_contract_code": code,
+            "option_type": option_type,
+            "strike": strike,
+            "expiry": expiry,
+            "dte": dte,
+            "quantity": quantity,
+            "signal_ref_price": option_close,
+            "gross_premium_cash": close_value_cash,
+            "net_premium_cash": -close_value_cash if np.isfinite(close_value_cash) else np.nan,
+            "target_premium_cash": np.nan,
+            "target_premium_pct": np.nan,
+            "margin": safe_float(row.get("margin"), np.nan),
+            "one_contract_margin": np.nan,
+            "budget_group": safe_text(row.get("budget_group", "")),
+            "side_rule": reason,
+            "forced_sell_side": "",
+            "selected_side_iv_pressure": np.nan,
+            "other_side_iv_pressure": np.nan,
+            "side_iv_pressure_diff": np.nan,
+            "overlay_strategy": "",
+            "overlay_signal_family": "",
+            "overlay_signal_rule": "",
+            "overlay_side_rule": "",
+            "overlay_priority": "",
+            "l1_rule": "main_pre_expiry_itm_exit",
+            "l2_rule": "dte_lt_2_and_itm",
+            "l3_rule": "risk_exit",
+            "l4_rule": "buy_close_next_trading_day",
+            "exit_rule": reason,
+            "exit_scan_date": signal_date,
+            "exit_execute_date": execute_date,
+            "exit_scan_dte": dte,
+            "exit_scan_dte_lt": threshold,
+            "exit_scan_spot_close": spot,
+            "exit_intrinsic": intrinsic,
+        })
+    orders = _frontload_columns(pd.DataFrame(rows), ORDER_FRONT_COLUMNS)
+    return orders, pd.DataFrame(diagnostics)
+
+
 class PaperTradingOrderGenerator:
     """Generate T+1 paper orders from the approved external S1 intent schedule."""
 
@@ -228,6 +444,7 @@ class PaperTradingOrderGenerator:
             raise ValueError(f"invalid signal_date: {request.signal_date}")
         config_path = resolve_path(request.config_path, default=self.config_path)
         output_dir = resolve_path(request.output_dir, default=self.output_dir)
+        state_dir = resolve_path(request.state_dir, default=DEFAULT_STATE_DIR)
         tag = request.tag or f"s1_external_intents_{signal_date.replace('-', '')}"
 
         snapshot = load_effective_config(config_path)
@@ -247,8 +464,27 @@ class PaperTradingOrderGenerator:
             products = {str(product).upper() for product in request.products}
             day_signals = day_signals[day_signals["product"].astype(str).str.upper().isin(products)].copy()
         execute_date = _next_execution_date(signal_date, str(config.get("external_signal_default_execution_lag", "T_plus_1")))
-        orders = _orders_from_signals(day_signals, signal_date, execute_date)
-        diagnostics = _diagnostics_from_orders(orders)
+        open_orders = _orders_from_signals(day_signals, signal_date, execute_date)
+        exit_orders, exit_diagnostics = _orders_from_main_pre_expiry_itm_exit(
+            signal_date=signal_date,
+            execute_date=execute_date,
+            config=config,
+            config_path=config_path,
+            state_dir=state_dir,
+            products=request.products,
+        )
+        order_parts = [frame for frame in (exit_orders, open_orders) if not frame.empty]
+        orders = (
+            pd.concat(order_parts, ignore_index=True, sort=False)
+            if order_parts
+            else pd.DataFrame(columns=ORDER_FRONT_COLUMNS)
+        )
+        diagnostic_parts = [frame for frame in (_diagnostics_from_orders(open_orders), exit_diagnostics) if not frame.empty]
+        diagnostics = (
+            pd.concat(diagnostic_parts, ignore_index=True, sort=False)
+            if diagnostic_parts
+            else pd.DataFrame()
+        )
         schedule_dates = all_signals["signal_date_key"].dropna().astype(str)
         schedule_min = schedule_dates.min() if not schedule_dates.empty else ""
         schedule_max = schedule_dates.max() if not schedule_dates.empty else ""
@@ -290,12 +526,15 @@ class PaperTradingOrderGenerator:
             "execute_date": execute_date,
             "config_path": str(config_path),
             "config_sha256": snapshot.sha256,
+            "state_dir": str(state_dir),
             "external_signal_path": str(signal_path),
             "external_signal_rows": int(len(all_signals)),
             "external_signal_min_date": schedule_min,
             "external_signal_max_date": schedule_max,
             "external_signal_schedule_status": schedule_status,
             "generated_order_count": int(len(orders)),
+            "generated_open_order_count": int(len(open_orders)),
+            "generated_main_pre_expiry_itm_exit_order_count": int(len(exit_orders)),
             "diagnostic_row_count": int(len(diagnostics)),
             "products": list(request.products) if request.products else None,
             "important_rules": important_rules(config),

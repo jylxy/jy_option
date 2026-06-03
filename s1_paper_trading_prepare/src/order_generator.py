@@ -15,6 +15,7 @@ def generate_orders(
     products: tuple[str, ...] | None = None,
     config_path: str | Path | None = None,
     output_dir: str | Path | None = None,
+    state_dir: str | Path | None = None,
     tag: str | None = None,
 ) -> PaperTradingRunResult:
     generator = PaperTradingOrderGenerator(config_path=config_path, output_dir=output_dir)
@@ -24,8 +25,8 @@ def generate_orders(
         products=products,
         config_path=generator.config_path,
         output_dir=generator.output_dir,
+        state_dir=Path(state_dir) if state_dir is not None else None,
         tag=tag,
         write_outputs=True,
     )
     return generator.generate(request)
-

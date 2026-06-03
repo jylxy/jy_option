@@ -31,6 +31,7 @@ def main() -> int:
     parser.add_argument("--products", default=None, help="Optional comma-separated product list.")
     parser.add_argument("--config", default=None, help="Optional config path. Defaults to configs/s1_paper_mainline.json.")
     parser.add_argument("--output-dir", default=None, help="Optional output directory.")
+    parser.add_argument("--state-dir", default=None, help="Optional paper-account state directory.")
     parser.add_argument("--tag", default=None, help="Optional output tag.")
     args = parser.parse_args()
 
@@ -40,6 +41,7 @@ def main() -> int:
         products=parse_products(args.products),
         config_path=args.config,
         output_dir=args.output_dir,
+        state_dir=args.state_dir,
         tag=args.tag,
     )
     print(f"signal_date={result.signal_date}")

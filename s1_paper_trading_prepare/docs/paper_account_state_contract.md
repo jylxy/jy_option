@@ -86,3 +86,9 @@ output/audit/close_mark_summary_YYYYMMDD.json
 For forced exits and expiry replay, stale marks are not treated as executable
 prices.  Expiry settlement uses same-day underlying close to compute intrinsic
 value and is blocked with diagnostics if that price is missing.
+
+The main-sleeve pre-expiry ITM fallback uses the marked T close state only as a
+signal source.  If a main monthly short has `DTE < 2` and positive intrinsic
+value at T close, the daily order generator emits a T+1 `buy_close` plan.  The
+minute replay still requires a fresh T+1 option mark before closing; stale marks
+are never used as executable fallback prices.

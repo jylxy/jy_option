@@ -15,6 +15,7 @@ class PaperTradingRunRequest:
     products: tuple[str, ...] | None = None
     config_path: Path = DEFAULT_PAPER_CONFIG
     output_dir: Path = DEFAULT_OUTPUT_DIR
+    state_dir: Path | None = None
     tag: str | None = None
     write_outputs: bool = True
 

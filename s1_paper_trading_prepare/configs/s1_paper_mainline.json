@@ -48,6 +48,16 @@
   "s1_factor_exit_enabled": false,
   "s1_holiday_risk_enabled": false,
   "s1_deferred_intent_enabled": false,
+  "main_pre_expiry_itm_exit": {
+    "enabled": true,
+    "scope": "main_monthly_only",
+    "scan_timing": "T_close_for_T_plus_1_execution",
+    "scan_dte_lt": 2,
+    "condition": "short option is ITM at T close",
+    "action": "buy_close_next_trading_day",
+    "exit_reason": "main_pre_expiry_itm_exit",
+    "require_fresh_execution_mark": true
+  },
   "pre_expiry_exit_dte": 0,
   "expiry_dte": 0,
   "expiry_underlying_price_priority": [

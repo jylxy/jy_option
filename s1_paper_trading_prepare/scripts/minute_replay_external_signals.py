@@ -33,6 +33,18 @@ DEFAULT_SIGNALS = (
     / "s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv"
 )
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from s1_paper_trading_prepare.src.main_pre_expiry_itm_exit import (  # noqa: E402
+    config_enabled as main_pre_expiry_itm_exit_enabled,
+    exit_reason as main_pre_expiry_itm_exit_reason,
+    intrinsic_value,
+    is_main_monthly_position,
+    parsed_date,
+    scan_dte_lt as main_pre_expiry_itm_scan_dte_lt,
+)
+
 EXCHANGE_TO_SUFFIX = {
     "DCE": "DCE",
     "SHFE": "SHF",
@@ -282,6 +294,8 @@ def make_external_engine_class(base_cls, estimate_margin_func):
             self._unqueued_signals: list[dict[str, Any]] = []
             self._unresolved_signal_codes: list[dict[str, Any]] = []
             self._queued_signal_count = 0
+            self._pending_main_pre_expiry_itm_exits: list[dict[str, Any]] = []
+            self._next_trading_date_by_date: dict[str, str] = {}
 
         def _set_position_mark_meta(
             self,
@@ -338,6 +352,155 @@ def make_external_engine_class(base_cls, estimate_margin_func):
             })
             return False
 
+        def _position_scan_dte(self, pos, date_str: str) -> float:
+            scan_date = parsed_date(date_str)
+            if scan_date is not None:
+                try:
+                    dte = self.ci.calc_dte(pos.code, scan_date)
+                except Exception:
+                    dte = np.nan
+                if np.isfinite(safe_float(dte, np.nan)):
+                    return float(dte)
+            expiry_date = parsed_date(getattr(pos, "expiry", ""))
+            if scan_date is None or expiry_date is None:
+                return np.nan
+            return float((expiry_date - scan_date).days)
+
+        def _main_pre_expiry_itm_exit_position_match(self, pos, pending: dict[str, Any]) -> bool:
+            if safe_text(getattr(pos, "code", "")) != safe_text(pending.get("code", "")):
+                return False
+            if safe_text(getattr(pos, "open_date", "")) != safe_text(pending.get("open_date", "")):
+                return False
+            pending_signal_id = safe_text(pending.get("external_signal_id", ""))
+            if pending_signal_id:
+                meta = getattr(pos, "entry_meta", {}) or {}
+                return safe_text(meta.get("external_signal_id")) == pending_signal_id
+            return True
+
+        def _scan_main_pre_expiry_itm_exit(self, date_str: str, daily_df: pd.DataFrame | None = None) -> None:
+            if not main_pre_expiry_itm_exit_enabled(self.config) or not self.positions:
+                return
+            execute_date = self._next_trading_date_by_date.get(str(date_str)[:10], "")
+            if not execute_date:
+                return
+            threshold = main_pre_expiry_itm_scan_dte_lt(self.config)
+            reason = main_pre_expiry_itm_exit_reason(self.config)
+            pending_keys = {
+                (item.get("scan_date"), item.get("execute_date"), item.get("external_signal_id"), item.get("code"), item.get("open_date"))
+                for item in self._pending_main_pre_expiry_itm_exits
+            }
+            for pos in list(self.positions):
+                if getattr(pos, "role", "") != "sell":
+                    continue
+                if not is_main_monthly_position(pos):
+                    continue
+                dte = self._position_scan_dte(pos, date_str)
+                if not np.isfinite(dte) or dte <= 0 or dte >= threshold:
+                    continue
+                spot = safe_float(getattr(pos, "cur_spot", np.nan), np.nan)
+                spot_source = "daily_underlying_close"
+                spot_lookup_code = safe_text(getattr(pos, "underlying_code", ""))
+                if not np.isfinite(spot) or spot <= 0:
+                    spot, spot_source, spot_lookup_code = self._expiry_spot_close(pos, date_str, daily_df)
+                intrinsic = intrinsic_value(getattr(pos, "opt_type", ""), getattr(pos, "strike", np.nan), spot)
+                if not np.isfinite(intrinsic) or intrinsic <= 0:
+                    continue
+                meta = getattr(pos, "entry_meta", {}) or {}
+                signal_id = safe_text(meta.get("external_signal_id"))
+                key = (date_str, execute_date, signal_id, safe_text(getattr(pos, "code", "")), safe_text(getattr(pos, "open_date", "")))
+                if key in pending_keys:
+                    continue
+                pending = {
+                    "scan_date": date_str,
+                    "execute_date": execute_date,
+                    "reason": reason,
+                    "external_signal_id": signal_id,
+                    "product": safe_text(getattr(pos, "product", "")),
+                    "code": safe_text(getattr(pos, "code", "")),
+                    "option_type": safe_text(getattr(pos, "opt_type", "")),
+                    "strike": safe_float(getattr(pos, "strike", np.nan), np.nan),
+                    "expiry": safe_text(getattr(pos, "expiry", ""))[:10],
+                    "open_date": safe_text(getattr(pos, "open_date", "")),
+                    "quantity": int(getattr(pos, "n", 0) or 0),
+                    "scan_dte": float(dte),
+                    "scan_spot": float(spot),
+                    "scan_spot_source": spot_source,
+                    "scan_spot_lookup_code": spot_lookup_code,
+                    "scan_intrinsic": float(intrinsic),
+                }
+                self._pending_main_pre_expiry_itm_exits.append(pending)
+                self.diagnostics_records.append({
+                    "date": date_str,
+                    "scope": "external_intent_minute_replay",
+                    "name": reason,
+                    "stage": "scan_triggered",
+                    **pending,
+                })
+
+        def _execute_pending_main_pre_expiry_itm_exits(self, date_str: str, fee: float) -> None:
+            if not self._pending_main_pre_expiry_itm_exits:
+                return
+            reason = main_pre_expiry_itm_exit_reason(self.config)
+            remaining: list[dict[str, Any]] = []
+            for pending in self._pending_main_pre_expiry_itm_exits:
+                execute_date = safe_text(pending.get("execute_date", ""))
+                if execute_date and execute_date > str(date_str)[:10]:
+                    remaining.append(pending)
+                    continue
+                if execute_date and execute_date < str(date_str)[:10]:
+                    self.diagnostics_records.append({
+                        "date": date_str,
+                        "scope": "external_intent_minute_replay",
+                        "name": reason,
+                        "stage": "stale_pending_exit_dropped",
+                        **pending,
+                    })
+                    continue
+                matches = [
+                    pos for pos in list(self.positions)
+                    if self._main_pre_expiry_itm_exit_position_match(pos, pending)
+                ]
+                if not matches:
+                    self.diagnostics_records.append({
+                        "date": date_str,
+                        "scope": "external_intent_minute_replay",
+                        "name": reason,
+                        "stage": "pending_position_not_found",
+                        **pending,
+                    })
+                    continue
+                if not self._require_fresh_option_marks(matches, date_str, reason):
+                    self.diagnostics_records.append({
+                        "date": date_str,
+                        "scope": "external_intent_minute_replay",
+                        "name": reason,
+                        "stage": "execute_blocked_missing_fresh_mark",
+                        **pending,
+                    })
+                    continue
+                for pos in matches:
+                    meta = getattr(pos, "entry_meta", {}) or {}
+                    meta.update({
+                        "external_main_pre_expiry_itm_exit_scan_date": pending.get("scan_date", ""),
+                        "external_main_pre_expiry_itm_exit_execute_date": date_str,
+                        "external_main_pre_expiry_itm_exit_scan_dte": pending.get("scan_dte", np.nan),
+                        "external_main_pre_expiry_itm_exit_scan_spot": pending.get("scan_spot", np.nan),
+                        "external_main_pre_expiry_itm_exit_scan_intrinsic": pending.get("scan_intrinsic", np.nan),
+                        "external_main_pre_expiry_itm_exit_spot_source": pending.get("scan_spot_source", ""),
+                        "external_main_pre_expiry_itm_exit_spot_lookup_code": pending.get("scan_spot_lookup_code", ""),
+                    })
+                    pos.entry_meta = meta
+                self.diagnostics_records.append({
+                    "date": date_str,
+                    "scope": "external_intent_minute_replay",
+                    "name": reason,
+                    "stage": "execute_buy_close",
+                    "closed_positions": len(matches),
+                    **pending,
+                })
+                self._close_positions(matches, date_str, reason, fee, exec_time="close")
+            self._pending_main_pre_expiry_itm_exits = remaining
+
         def products_from_signals(self) -> list[str]:
             return sorted({str(x).upper() for x in self.external_signals["product"].dropna().unique()})
 
@@ -347,6 +510,11 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 date: trading_dates[i - 1]
                 for i, date in enumerate(trading_dates)
                 if i > 0
+            }
+            self._next_trading_date_by_date = {
+                date: trading_dates[i + 1]
+                for i, date in enumerate(trading_dates)
+                if i + 1 < len(trading_dates)
             }
             self._signals_by_queue_date.clear()
             self._unqueued_signals.clear()
@@ -948,8 +1116,10 @@ def make_external_engine_class(base_cls, estimate_margin_func):
                 check_tp=False,
                 check_expiry=False,
             )
+            self._execute_pending_main_pre_expiry_itm_exits(date_str, fee)
             self._apply_external_expiry(date_str, fee, daily_df)
             self._apply_overlay_portfolio_loss_stop(date_str, fee)
+            self._scan_main_pre_expiry_itm_exit(date_str, daily_df)
             for row in self._signals_by_queue_date.get(date_str, []):
                 item = self._build_external_pending_item(row, date_str)
                 if item is not None:

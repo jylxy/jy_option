@@ -7,7 +7,7 @@
 3. Rebuild PIT panels and the new-month main selected table from stored raw snapshots.
 4. Append T rows into the external S1 intent schedule from the rebuilt PIT panels.
 5. Mark the paper account to the T close and calculate daily return.
-6. Generate T+1 paper orders for review.
+6. Generate T+1 paper orders for review, including any main-sleeve pre-expiry ITM fallback `buy_close` orders.
 7. Optionally replay the date through Toolkit minute bars to audit fill, pending, reroute, expiry, and overlay stop.
 8. Carry unfilled or partial orders forward in paper state.
 
@@ -72,5 +72,6 @@ python s1_paper_trading_prepare/scripts/minute_replay_external_signals.py --conf
 - The main selected source is rebuilt from `data/daily_snapshots/option_chain_*.csv`; do not copy research wide tables into `data/reverse_lowjump/live_product_side_opportunities.csv`.
 - Generated schedules and replay outputs are local artifacts and are not committed.
 - The order generator does not place broker orders.
+- Main-sleeve fallback exit: after the T close mark, the order generator scans active monthly short positions. If `DTE < 2` and the option is ITM at T close, it emits a T+1 `buy_close` plan with `exit_rule=main_pre_expiry_itm_exit`.
 - Minute replay is the only fill simulator in this project.
 - Stale marks are allowed only for valuation reporting and are flagged; forced exits and expiry settlement require same-day marks or same-day underlying close.

@@ -98,6 +98,7 @@ def main() -> int:
         products=products,
         config_path=args.config,
         output_dir=output_dir,
+        state_dir=args.state_dir,
         tag=tag,
     )
 

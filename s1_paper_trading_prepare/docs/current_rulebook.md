@@ -354,6 +354,12 @@ Main sleeve:
 
 ```text
 hold to expiry / settlement
+pre-expiry ITM fallback exit:
+    at T close, scan main-monthly short positions only
+    if DTE < 2 and the short option is ITM:
+        generate a T+1 buy_close fallback order
+        minute replay executes it only with a fresh T+1 option mark
+        if no fresh executable mark exists, do not use stale cached price
 no take profit
 no premium stop
 no Greeks stop

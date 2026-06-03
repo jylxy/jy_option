@@ -142,6 +142,16 @@
       "paper_action": "Persist product+expiry keys so the sidecars open at most once per product expiry."
     },
     {
+      "name": "main_pre_expiry_itm_exit_scan",
+      "status": "paper_required",
+      "layer": "Main risk state",
+      "source": "Paper account positions and Toolkit T-day option daily snapshot",
+      "config_gate_key": "main_pre_expiry_itm_exit.enabled",
+      "config_gate_expected": true,
+      "paper_path": "output/diagnostics/diagnostics_YYYYMMDD.csv and output/orders/orders_YYYYMMDD.csv",
+      "paper_action": "At T close, scan main monthly short positions only; if DTE < 2 and intrinsic value is positive, emit a T+1 buy_close fallback order. Stale marks are not executable."
+    },
+    {
       "name": "expiry_underlying_settlement_price",
       "status": "paper_required",
       "layer": "Expiry settlement",
