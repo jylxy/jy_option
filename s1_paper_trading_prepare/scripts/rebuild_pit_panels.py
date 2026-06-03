@@ -35,6 +35,7 @@ from s1_paper_trading_prepare.src.pit_signal_appender import (
     _snapshot_path,
     _valid_option_mask,
     sanitize_main_selected_for_production,
+    strip_forbidden_columns_for_production,
 )
 from s1_paper_trading_prepare.src.reverse_lowjump_main import build_current_main_intents
 from s1_paper_trading_prepare.src.signal_feature_utils import ensure_signal_iv, signal_iv_col
@@ -529,7 +530,7 @@ def main() -> int:
     write_csv(paths["iv_daily"], iv_panel)
     write_csv(paths["flow"], flow_panel)
     write_csv(paths["pressure"], pressure_panel)
-    write_csv(paths["main_opportunities"], main_opps)
+    write_csv(paths["main_opportunities"], strip_forbidden_columns_for_production(main_opps))
     write_csv(paths["main_selected"], sanitize_main_selected_for_production(main_selected))
     write_csv(paths["overlay_atm"], overlay_panel)
     write_csv(paths["rr"], rr_panel)

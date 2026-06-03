@@ -7,10 +7,10 @@ This module is the production-facing path for:
 3. generating T-day external intent rows for T+1 paper orders, and
 4. replacing the same T rows in the unified external signal schedule.
 
-It intentionally does not consume research `shadow_*`, path, or outcome label
-fields. If a future historical-performance feature is added, it must be built
-from matured prior opportunities with an explicit maturity-date guard before it
-can be admitted here.
+It intentionally does not consume research `shadow_*`, internal `histperf_*`,
+path, or outcome label fields. Historical-performance features must be built
+from matured prior opportunities with an explicit maturity-date guard inside
+the monthly builder and must be stripped before a live selected table is read.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from .signal_feature_utils import ensure_signal_iv, signal_iv_col
 
 
 EXCLUDED_EXCHANGES = {"SSE", "SZSE"}
-FORBIDDEN_INPUT_PREFIXES = ("shadow_",)
+FORBIDDEN_INPUT_PREFIXES = ("shadow_", "histperf_")
 FORBIDDEN_INPUT_TOKENS = (
     "expiry_pnl",
     "terminal_otm",
@@ -322,6 +322,21 @@ def _assert_no_forbidden_columns(frame: pd.DataFrame, source: str) -> None:
         )
 
 
+def strip_forbidden_columns_for_production(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop internal research/label columns before writing production data files."""
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    drop_cols = []
+    for column in out.columns:
+        lower = str(column).lower()
+        if lower.startswith(FORBIDDEN_INPUT_PREFIXES) or any(token in lower for token in FORBIDDEN_INPUT_TOKENS):
+            drop_cols.append(column)
+    out = out.drop(columns=drop_cols, errors="ignore")
+    _assert_no_forbidden_columns(out, "production data frame")
+    return out
+
+
 def sanitize_main_selected_for_production(frame: pd.DataFrame) -> pd.DataFrame:
     """Keep only PIT fields needed by the live main-sleeve order builder."""
     if frame.empty:
@@ -346,10 +361,9 @@ def apply_matured_history_guard(
 ) -> pd.DataFrame:
     """Return only rows whose prior opportunity had matured before signal_date.
 
-    This is intentionally strict and unused by the current production factors,
-    because the current L1/L2/L3/L4 appender avoids label-derived history
-    entirely. It is kept here as the only admissible entry point if a future
-    historical-performance factor is added.
+    This is intentionally strict: historical-performance fields are admissible
+    only inside the monthly builder after this maturity check, and they must be
+    stripped before writing production live selected files.
     """
     if maturity_col not in frame.columns:
         raise ValueError(f"{source} missing required maturity guard column: {maturity_col}")
@@ -720,10 +734,11 @@ class PitSignalAppender:
             "source_schedule": str(source_read_path),
             "output_schedule": str(output_path),
             "snapshot_rows": int(len(snapshot)),
-            "shadow_input_policy": "blocked",
+            "forbidden_input_policy": "blocked_shadow_histperf_path_label",
             "maturity_guard_policy": (
-                "No shadow/outcome history is consumed. Any future historical-performance factor must filter "
-                "prior rows where target_expiry/open outcome maturity date is strictly before signal_date."
+                "Live inputs cannot contain shadow_*, histperf_*, path labels, or outcome labels. The monthly "
+                "builder may use internal histperf_* fields only when prior target_expiry is strictly before "
+                "signal_date, then strip them before writing live selected."
             ),
         }
 

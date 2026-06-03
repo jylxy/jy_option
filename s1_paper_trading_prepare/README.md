@@ -42,12 +42,16 @@ docs/incremental_signal_update_design.md
 Daily signal refresh from Toolkit raw snapshots:
 
 ```powershell
-python s1_paper_trading_prepare/scripts/append_daily_signals.py --signal-date 2026-03-31 --fetch-missing
+python s1_paper_trading_prepare/scripts/update_daily_data.py --signal-date 2026-03-31
+python s1_paper_trading_prepare/scripts/rebuild_pit_panels.py --start-date 2018-01-01 --end-date 2026-03-31 --signals-start-date 2026-03-01 --signals-end-date 2026-03-31 --tag pit_rebuild_20260331
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --signal-date 2026-03-31 --skip-panel-refresh --tag signal_append_20260331
 ```
 
 This appender is the production path for L1/L2/L3/L4 factor refresh. It rejects
-`shadow_*`, path, and outcome-label inputs; historical-performance fields must
-be rebuilt only after the prior opportunity has matured.
+research `shadow_*`, internal `histperf_*`, path, and outcome-label inputs.
+The monthly builder may calculate `histperf_*` fields only from opportunities
+whose target expiry is strictly before the current entry date, and those fields
+must be stripped before the live selected table is read by production.
 
 ## Current Rule Summary
 
@@ -150,18 +154,14 @@ data/external_signals/live_current_open_signals.csv
 The live file may be initialized from the gold schedule, but the gold schedule
 itself is not overwritten by daily updates.
 
+The live main selected source is rebuilt from Toolkit raw snapshots through
+`rebuild_pit_panels.py`. Do not copy research wide tables into
+`data/reverse_lowjump/live_product_side_opportunities.csv`.
+
 Audit point-in-time guardrails for the current schedule:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py
-```
-
-Run the deeper factor-lineage audit. This checks that the final schedule does
-not carry shadow/path/label columns, and that historical `shadow_*` lineage
-fields are not treated as live inputs unless their prior outcomes have matured:
-
-```powershell
-python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py
 ```
 
 Rebuild the unified external-intent handoff table and validate it:
@@ -170,7 +170,6 @@ Rebuild the unified external-intent handoff table and validate it:
 python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-date 2022-01-01 --end-date 2026-03-31 --output s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
-python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule s1_paper_trading_prepare/data/external_signals/regenerated_open_signals.csv
 ```
 
 Full PIT appender backfill command:

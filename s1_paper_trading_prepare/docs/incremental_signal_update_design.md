@@ -69,40 +69,23 @@ The point-in-time guard audit command is:
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule path/to/generated_open_signals.csv
 ```
 
-The deeper factor-lineage audit command is:
-
-```powershell
-python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule path/to/generated_open_signals.csv
-```
-
-This audit intentionally separates three cases:
-
-1. Final schedule columns. Any shadow/path/label column here is a blocker.
-2. Research lineage tables. They may contain labels for audit, but cannot be
-   consumed by the daily generator.
-3. Historical `shadow_*` summaries. They are shifted historical means, not the
-   current row's outcome, but they are still unsafe for live generation unless
-   every prior outcome included in the rolling window had already matured by
-   the current signal date.
-
-The current lineage audit found that the committed handoff schedule is clean,
-while the old research opportunity table contains a small number of rows where
-an unfinished prior opportunity could enter `shadow_*` history. The current
-0.15% boost rows are not hit by that subset, but the production generator must
-avoid `shadow_*` entirely or rebuild any historical-performance feature with an
-explicit maturity-date guard.
+The monthly builder may calculate internal `histperf_*` fields for L3 sizing,
+but those fields are built only from prior opportunities whose target expiry is
+strictly before the current entry date. They are then stripped by
+`sanitize_main_selected_for_production()` before the live selected table is
+written. Production input guards reject both research `shadow_*` columns and
+internal `histperf_*` columns if either appears in a live selected source.
 
 `PitSignalAppender` enforces this in code:
 
-- raw inputs are rejected if they contain `shadow_*`, path label, terminal label,
-  or expiry-PnL style columns;
+- raw inputs are rejected if they contain `shadow_*`, `histperf_*`, path label,
+  terminal label, or expiry-PnL style columns;
 - main L1 low-jump history uses shifted prior ATM-IV observations;
 - overlay triggers use only lag columns (`T-1` through `T-4`, depending on the
   sidecar);
-- if a future historical-performance feature is added, the input rows must first
-  pass `prior_maturity_date < signal_date`, and the resulting feature must be
-  written as a new point-in-time panel field rather than read from old research
-  `shadow_*` columns.
+- any historical-performance feature must use prior opportunities with
+  `target_expiry < signal_date`; it must not be copied from old research wide
+  tables into live.
 
 Current Toolkit note: `future_hf_1min` in the H200 environment does not expose a
 futures open-interest column, only OHLC/volume-style fields. The appender
@@ -173,7 +156,7 @@ generate_orders(T)
   selection can use the completed `T` snapshot.
 - Rolling history that summarizes prior labels must be shifted and maturity
   guarded before scoring `T`. The current production appender does not consume
-  any label-derived or `shadow_*` history.
+  any label-derived or unsanitized `histperf_*` history.
 - Overlay1 trigger uses `T-4` through `T-1` ATM IV and percentile fields.
 - Overlay2 trigger uses `lag3` through `lag1` risk-reversal fields and `lag3` percentile.
 - Overlay3 trigger uses `lag3` through `lag1` term-spread fields; side choice and trend conflict use `T-1`.
@@ -199,7 +182,6 @@ python s1_paper_trading_prepare/scripts/update_daily_data.py --start-date 2022-0
 python s1_paper_trading_prepare/scripts/build_daily_signal_schedule.py --start-date 2022-01-01 --end-date 2026-03-31 --output data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_future_function_guards.py --schedule data/external_signals/regenerated_open_signals.csv
 python s1_paper_trading_prepare/scripts/audit_signal_schedule_gold.py --generated data/external_signals/regenerated_open_signals.csv
-python s1_paper_trading_prepare/scripts/audit_factor_construction_future_leakage.py --schedule data/external_signals/regenerated_open_signals.csv
 ```
 
 After these pass, rerun the full minute replay from `2022-01-01` through

@@ -541,7 +541,13 @@ def intrinsic_value(option_type: object, strike: float, spot: float) -> float:
     return max(strike - spot, 0.0) if str(option_type).upper() == "P" else max(spot - strike, 0.0)
 
 
-def add_matured_shadow_stats(opps: pd.DataFrame, option_data: pd.DataFrame) -> pd.DataFrame:
+def add_matured_history_stats(opps: pd.DataFrame, option_data: pd.DataFrame) -> pd.DataFrame:
+    """Attach prior matured opportunity outcomes for PIT sizing.
+
+    The feature for an entry date only uses opportunities whose target expiry is
+    strictly before that entry date. These fields are internal builder features;
+    they are not written to the production live selected table.
+    """
     if opps.empty:
         return opps.copy()
     data = _normalize_options(option_data)
@@ -598,39 +604,39 @@ def add_matured_shadow_stats(opps: pd.DataFrame, option_data: pd.DataFrame) -> p
 
         metrics.append(pack(past) + pack(past_side))
     cols = [
-        "shadow_prod_n12",
-        "shadow_prod_pnl_nonnegative",
-        "shadow_prod_terminal_otm",
-        "shadow_prod_stop25_safe",
-        "shadow_prod_stop2_safe",
-        "shadow_prod_pnlprem",
-        "shadow_side_n12",
-        "shadow_side_pnl_nonnegative",
-        "shadow_side_terminal_otm",
-        "shadow_side_stop25_safe",
-        "shadow_side_stop2_safe",
-        "shadow_side_pnlprem",
+        "histperf_prod_n12",
+        "histperf_prod_pnl_nonnegative",
+        "histperf_prod_terminal_otm",
+        "histperf_prod_stop25_safe",
+        "histperf_prod_stop2_safe",
+        "histperf_prod_pnlprem",
+        "histperf_side_n12",
+        "histperf_side_pnl_nonnegative",
+        "histperf_side_terminal_otm",
+        "histperf_side_stop25_safe",
+        "histperf_side_stop2_safe",
+        "histperf_side_pnlprem",
     ]
     out[cols] = metrics
 
     def choose(row: pd.Series, name: str) -> float:
-        side_value = row[f"shadow_side_{name}"]
-        prod_value = row[f"shadow_prod_{name}"]
-        if row["shadow_side_n12"] >= 3 and pd.notna(side_value):
+        side_value = row[f"histperf_side_{name}"]
+        prod_value = row[f"histperf_prod_{name}"]
+        if row["histperf_side_n12"] >= 3 and pd.notna(side_value):
             return float(side_value)
         return float(prod_value) if pd.notna(prod_value) else np.nan
 
-    out["shadow_pnl_nonnegative_blend"] = out.apply(lambda r: choose(r, "pnl_nonnegative"), axis=1)
-    out["shadow_terminal_otm_blend"] = out.apply(lambda r: choose(r, "terminal_otm"), axis=1)
-    out["shadow_stop25_blend"] = out.apply(lambda r: choose(r, "stop25_safe"), axis=1)
-    out["shadow_stop2_blend"] = out.apply(lambda r: choose(r, "stop2_safe"), axis=1)
-    out["shadow_pnlprem_blend"] = out.apply(lambda r: choose(r, "pnlprem"), axis=1)
-    out["shadow_score"] = (
-        0.30 * out["shadow_pnl_nonnegative_blend"]
-        + 0.25 * out["shadow_terminal_otm_blend"]
-        + 0.25 * out["shadow_stop25_blend"]
-        + 0.10 * out["shadow_stop2_blend"]
-        + 0.10 * ((out["shadow_pnlprem_blend"].clip(-1, 1) + 1.0) / 2.0)
+    out["histperf_pnl_nonnegative_blend"] = out.apply(lambda r: choose(r, "pnl_nonnegative"), axis=1)
+    out["histperf_terminal_otm_blend"] = out.apply(lambda r: choose(r, "terminal_otm"), axis=1)
+    out["histperf_stop25_blend"] = out.apply(lambda r: choose(r, "stop25_safe"), axis=1)
+    out["histperf_stop2_blend"] = out.apply(lambda r: choose(r, "stop2_safe"), axis=1)
+    out["histperf_pnlprem_blend"] = out.apply(lambda r: choose(r, "pnlprem"), axis=1)
+    out["histperf_score"] = (
+        0.30 * out["histperf_pnl_nonnegative_blend"]
+        + 0.25 * out["histperf_terminal_otm_blend"]
+        + 0.25 * out["histperf_stop25_blend"]
+        + 0.10 * out["histperf_stop2_blend"]
+        + 0.10 * ((out["histperf_pnlprem_blend"].clip(-1, 1) + 1.0) / 2.0)
     )
     return out
 
@@ -695,16 +701,16 @@ def add_rule_flags(opps: pd.DataFrame, *, min_history_days: int = 120) -> pd.Dat
 
 def l3eff015_target_pct(record: dict[str, object], *, weak_pressure_threshold: float = 0.02) -> float:
     rank = _safe_float(record.get("rolling_cs_rank"))
-    shadow = _safe_float(record.get("shadow_score"))
+    histperf = _safe_float(record.get("histperf_score"))
     pressure_diff = _safe_float(record.get("side_iv_pressure_diff"))
     selected_iv_pressure = _safe_float(record.get("selected_side_iv_pressure"))
     premium_margin = _safe_float(record.get("premium_margin"))
     candidate_pm = _safe_float(record.get("candidate_pm_median_252"))
-    shadow_stop25 = _safe_float(record.get("shadow_stop25_blend"))
-    shadow_stop2 = _safe_float(record.get("shadow_stop2_blend"))
-    shadow_pnlprem = _safe_float(record.get("shadow_pnlprem_blend"))
-    shadow_prod_n = _safe_float(record.get("shadow_prod_n12"))
-    shadow_side_n = _safe_float(record.get("shadow_side_n12"))
+    histperf_stop25 = _safe_float(record.get("histperf_stop25_blend"))
+    histperf_stop2 = _safe_float(record.get("histperf_stop2_blend"))
+    histperf_pnlprem = _safe_float(record.get("histperf_pnlprem_blend"))
+    histperf_prod_n = _safe_float(record.get("histperf_prod_n12"))
+    histperf_side_n = _safe_float(record.get("histperf_side_n12"))
     opt_volume_x63 = _safe_float(record.get("opt_side_volume_x63"))
     opt_oi_chg5 = _safe_float(record.get("opt_side_oi_chg5"))
     fut_oi_chg5 = _safe_float(record.get("fut_oi_chg5"))
@@ -713,17 +719,17 @@ def l3eff015_target_pct(record: dict[str, object], *, weak_pressure_threshold: f
     crowded_fast_oi = bool(np.isfinite(opt_oi_chg5) and opt_oi_chg5 > 1.0 and (not np.isfinite(pressure_diff) or pressure_diff < 0.04))
     has_pressure_edge = bool((np.isfinite(pressure_diff) and pressure_diff >= 0.02) or (not np.isfinite(pressure_diff) and np.isfinite(selected_iv_pressure) and selected_iv_pressure >= 0.30))
     has_efficiency_edge = bool((np.isfinite(premium_margin) and premium_margin >= 0.02) or (np.isfinite(candidate_pm) and candidate_pm >= 0.025))
-    score = int(np.isfinite(rank) and rank <= 9) + int(np.isfinite(shadow) and shadow >= 0.94) + int(has_pressure_edge) + int(has_efficiency_edge)
-    has_shadow_sample = bool(np.isfinite(shadow_prod_n) and shadow_prod_n >= 6)
+    score = int(np.isfinite(rank) and rank <= 9) + int(np.isfinite(histperf) and histperf >= 0.94) + int(has_pressure_edge) + int(has_efficiency_edge)
+    has_histperf_sample = bool(np.isfinite(histperf_prod_n) and histperf_prod_n >= 6)
     severe_path_risk = bool(
-        has_shadow_sample
+        has_histperf_sample
         and (
-            (np.isfinite(shadow_stop2) and shadow_stop2 < 0.65)
-            or (np.isfinite(shadow_stop25) and shadow_stop25 < 0.75)
-            or (np.isfinite(shadow_pnlprem) and shadow_pnlprem < 0.50)
+            (np.isfinite(histperf_stop2) and histperf_stop2 < 0.65)
+            or (np.isfinite(histperf_stop25) and histperf_stop25 < 0.75)
+            or (np.isfinite(histperf_pnlprem) and histperf_pnlprem < 0.50)
         )
     )
-    thin_side_low_efficiency = bool(np.isfinite(shadow_side_n) and shadow_side_n < 3 and not np.isfinite(pressure_diff) and np.isfinite(premium_margin) and premium_margin < 0.012)
+    thin_side_low_efficiency = bool(np.isfinite(histperf_side_n) and histperf_side_n < 3 and not np.isfinite(pressure_diff) and np.isfinite(premium_margin) and premium_margin < 0.012)
     low_eff_low_pressure = bool(np.isfinite(premium_margin) and premium_margin < 0.020 and np.isfinite(selected_iv_pressure) and selected_iv_pressure < 0.30 and (not np.isfinite(pressure_diff) or pressure_diff < 0.03))
     path_risk_without_enough_edge = bool(severe_path_risk and (weak_pressure or not has_efficiency_edge or (np.isfinite(premium_margin) and premium_margin < 0.020)))
     if weak_pressure and (option_flow_stress or crowded_fast_oi):
@@ -843,7 +849,7 @@ def build_current_main_intents(
             suffixes=("", "_flow"),
         )
         opps = opps.drop(columns=["product_flow"], errors="ignore")
-    opps = add_matured_shadow_stats(opps, option_data)
+    opps = add_matured_history_stats(opps, option_data)
     opps = add_rule_flags(opps, min_history_days=min_history_days)
     if rule not in opps.columns:
         raise KeyError(f"main opportunity rule not found: {rule}")

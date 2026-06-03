@@ -279,7 +279,7 @@
     "external_intent_schedule"
   ],
   "future_function_guards": {
-    "daily_signal_features": "Use only same-day close snapshots and lagged or expanding historical features available by the signal timestamp; production appender must not read research shadow_* columns.",
+    "daily_signal_features": "Use only same-day close snapshots and lagged or expanding historical features available by the signal timestamp; production appender must not read research shadow_* or internal histperf_* columns from live inputs.",
     "rolling_history": "Shift label-derived rolling statistics before scoring the current signal date, and admit them only when every prior row in the window has matured before the signal date.",
     "iv_pullback_overlay": "Trigger uses T-4 through T-1 ATM IV and percentile columns only; T ATM IV is diagnostic unless explicitly used after close for next-day paper trading.",
     "risk_reversal_sidecar": "Trigger uses lag3-lag1 risk-reversal repair fields and lag3 IV percentile only; sell side is forced from lag1 risk_reversal sign.",

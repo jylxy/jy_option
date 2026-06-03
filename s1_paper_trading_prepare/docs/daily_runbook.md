@@ -4,8 +4,8 @@
 
 1. Refresh or validate the paper-account state for T.
 2. Fetch missing Toolkit daily snapshots for T.
-3. Recompute current-line daily signal tables.
-4. Update the external S1 intent schedule.
+3. Rebuild PIT panels and the new-month main selected table from stored raw snapshots.
+4. Append T rows into the external S1 intent schedule from the rebuilt PIT panels.
 5. Mark the paper account to the T close and calculate daily return.
 6. Generate T+1 paper orders for review.
 7. Optionally replay the date through Toolkit minute bars to audit fill, pending, reroute, expiry, and overlay stop.
@@ -23,6 +23,18 @@ Refresh T data:
 
 ```powershell
 python s1_paper_trading_prepare/scripts/update_daily_data.py --signal-date 2026-05-29
+```
+
+Rebuild PIT panels and the monthly main selected table from Toolkit snapshots:
+
+```powershell
+python s1_paper_trading_prepare/scripts/rebuild_pit_panels.py --start-date 2018-01-01 --end-date 2026-05-29 --signals-start-date 2026-05-01 --signals-end-date 2026-05-29 --tag pit_rebuild_20260529
+```
+
+Append T signal rows from the rebuilt PIT panels:
+
+```powershell
+python s1_paper_trading_prepare/scripts/append_daily_signals.py --signal-date 2026-05-29 --skip-panel-refresh --tag signal_append_20260529
 ```
 
 Mark T close PnL:
@@ -57,6 +69,7 @@ python s1_paper_trading_prepare/scripts/minute_replay_external_signals.py --conf
 ## Operating Notes
 
 - The approved external intent schedule is the order handoff.
+- The main selected source is rebuilt from `data/daily_snapshots/option_chain_*.csv`; do not copy research wide tables into `data/reverse_lowjump/live_product_side_opportunities.csv`.
 - Generated schedules and replay outputs are local artifacts and are not committed.
 - The order generator does not place broker orders.
 - Minute replay is the only fill simulator in this project.
