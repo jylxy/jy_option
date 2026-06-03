@@ -21,7 +21,6 @@ logs/
 !output/backtest_current/.gitkeep
 !data/daily_snapshots/.gitkeep
 !data/reverse_lowjump/.gitkeep
-!data/reverse_lowjump/product_side_opportunities.csv
 !data/iv_pullback_overlay/.gitkeep
 !data/risk_reversal_sidecar/.gitkeep
 !data/term_structure_sidecar/.gitkeep

@@ -145,7 +145,7 @@ the product-month opportunity table, not from a free daily scan.
 Path:
 
 ```text
-data/reverse_lowjump/product_side_opportunities.csv
+data/reverse_lowjump/live_product_side_opportunities.csv
 ```
 
 Required fields include:
@@ -470,7 +470,7 @@ Purpose: clean handoff from daily signal generation to order review and minute r
 Configured path:
 
 ```text
-data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
+data/external_signals/live_current_open_signals.csv
 ```
 
 Generated schedules are local data artifacts and are not committed.

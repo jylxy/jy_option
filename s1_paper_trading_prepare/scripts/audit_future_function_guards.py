@@ -106,6 +106,10 @@ def main() -> int:
     args = parse_args()
     snapshot = load_effective_config(args.config)
     schedule_path = resolve_path(args.schedule or snapshot.config.get("external_signal_path"))
+    if not schedule_path.exists() and not args.schedule and snapshot.config.get("validation_gold_signal_path"):
+        gold_path = resolve_path(snapshot.config.get("validation_gold_signal_path"))
+        if gold_path.exists():
+            schedule_path = gold_path
     output_dir = resolve_path(args.output_dir)
     schedule = _read_csv(schedule_path)
     failures: list[dict[str, Any]] = []

@@ -10,7 +10,7 @@
   "s1_overlay2_risk_reversal_enabled": true,
   "s1_overlay3_term_structure_enabled": true,
   "external_replay_disable_intraday_exit_scans": true,
-  "external_signal_path": "s1_paper_trading_prepare/data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv",
+  "external_signal_path": "s1_paper_trading_prepare/data/external_signals/live_current_open_signals.csv",
   "validation_gold_signal_path": "s1_paper_trading_prepare/data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv",
   "external_signal_date_column": "entry_date",
   "external_signal_default_execution_lag": "T_plus_1",
@@ -79,7 +79,7 @@
     "portfolio_margin_cap_pct_nav": 0.7,
     "portfolio_group_margin_trigger_pct_nav": 0.45,
     "portfolio_group_new_trade_cap_after_trigger_pct_nav": 0.00075,
-    "source_opportunity_file": "s1_paper_trading_prepare/data/reverse_lowjump/product_side_opportunities.csv"
+    "source_opportunity_file": "s1_paper_trading_prepare/data/reverse_lowjump/live_product_side_opportunities.csv"
   },
   "iv_pullback_sidecar": {
     "enabled": true,

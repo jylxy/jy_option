@@ -236,6 +236,10 @@ class PaperTradingOrderGenerator:
         if not signal_path_value:
             raise ValueError("s1 paper config must define external_signal_path")
         signal_path = resolve_path(signal_path_value)
+        if not signal_path.exists() and config.get("validation_gold_signal_path"):
+            gold_path = resolve_path(config.get("validation_gold_signal_path"))
+            if gold_path.exists():
+                signal_path = gold_path
         date_col = str(config.get("external_signal_date_column", "entry_date") or "entry_date")
         all_signals = _load_external_signals(signal_path, date_col)
         day_signals = all_signals[all_signals["signal_date_key"].eq(signal_date)].copy()

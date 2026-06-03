@@ -1570,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="2022-01-04")
     parser.add_argument("--end-date", default="2026-03-31")
     parser.add_argument("--products", default="")
-    parser.add_argument("--tag", default="s1_strict_main_overlay123_extintent_minute_20260531")
+    parser.add_argument("--tag", default="s1_hsafe_addon025_sidecar1_t1lt95_minute")
     parser.add_argument(
         "--same-day-execution",
         action="store_true",
@@ -1589,6 +1589,8 @@ def main() -> None:
     config_data = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
     config_signal_path = config_data.get("external_signal_path")
     signals_path = resolve_repo_path(args.signals or config_signal_path, DEFAULT_SIGNALS)
+    if not signals_path.exists() and not args.signals and config_data.get("validation_gold_signal_path"):
+        signals_path = resolve_repo_path(config_data.get("validation_gold_signal_path"), DEFAULT_SIGNALS)
     signal_date_column = args.signal_date_column or config_data.get("external_signal_date_column", "entry_date")
     signals = load_signal_schedule(signals_path, signal_date_column)
 

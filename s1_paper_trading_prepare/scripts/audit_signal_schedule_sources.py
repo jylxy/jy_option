@@ -230,6 +230,10 @@ def main() -> int:
     args = parse_args()
     snapshot = load_effective_config(args.config)
     schedule_path = resolve_path(args.schedule or snapshot.config.get("external_signal_path"))
+    if not schedule_path.exists() and not args.schedule and snapshot.config.get("validation_gold_signal_path"):
+        gold_path = resolve_path(snapshot.config.get("validation_gold_signal_path"))
+        if gold_path.exists():
+            schedule_path = gold_path
     main_ref_path = resolve_path(args.main_overlay1_reference) if args.main_overlay1_reference else None
     overlay23_ref_path = resolve_path(args.overlay23_reference) if args.overlay23_reference else None
     output_dir = resolve_path(args.output_dir)

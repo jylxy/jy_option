@@ -141,6 +141,15 @@ The current gold schedule is:
 data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
 ```
 
+Daily production reads and updates the mutable live schedule:
+
+```text
+data/external_signals/live_current_open_signals.csv
+```
+
+The live file may be initialized from the gold schedule, but the gold schedule
+itself is not overwritten by daily updates.
+
 Audit point-in-time guardrails for the current schedule:
 
 ```powershell

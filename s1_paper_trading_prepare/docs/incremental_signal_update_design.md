@@ -1,7 +1,7 @@
 # Incremental Signal Update Design
 
 This note defines the production path for keeping
-`data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv`
+`data/external_signals/live_current_open_signals.csv`
 fresh without rerunning the full historical backtest every day.
 
 ## Objective
@@ -33,6 +33,17 @@ python s1_paper_trading_prepare/scripts/append_daily_signals.py --start-date 202
 
 The current committed hsafe_addon025 + sidecar1 T-1<95% schedule is the gold
 reference for historical parity.
+
+The live production schedule is separate from the frozen gold schedule:
+
+```text
+live: data/external_signals/live_current_open_signals.csv
+gold: data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv
+```
+
+Daily production appends or replaces rows in the live file only. The gold file
+is read-only validation evidence for the frozen 2022-01-01 through 2026-03-31
+replay.
 
 The source-key audit command is self-integrity only by default:
 
@@ -124,7 +135,7 @@ data/daily_snapshots/option_chain_YYYYMMDD.csv
 data/reverse_lowjump/iv_daily_panel.csv
 data/reverse_lowjump/side_flow_guard_panel.csv
 data/reverse_lowjump/side_iv_pressure_panel.csv
-data/reverse_lowjump/product_side_opportunities.csv
+data/reverse_lowjump/live_product_side_opportunities.csv
 data/iv_pullback_overlay/atm_iv_percentile_panel.csv
 data/iv_pullback_overlay/contract_candidates_YYYYMMDD.csv
 data/risk_reversal_sidecar/risk_reversal_panel.csv

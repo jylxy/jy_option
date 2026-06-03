@@ -173,6 +173,10 @@ def main() -> int:
     args = parse_args()
     snapshot = load_effective_config(args.config)
     source_path = resolve_path(args.source_schedule or snapshot.config.get("external_signal_path"))
+    if not source_path.exists() and not args.source_schedule and snapshot.config.get("validation_gold_signal_path"):
+        gold_path = resolve_path(snapshot.config.get("validation_gold_signal_path"))
+        if gold_path.exists():
+            source_path = gold_path
     output_path = resolve_path(args.output)
     output_dir = resolve_path(args.output_dir)
 

@@ -22,7 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from s1_paper_trading_prepare.src.diagnostics import write_csv  # noqa: E402
 from s1_paper_trading_prepare.src.paths import DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, DEFAULT_PAPER_CONFIG, resolve_path  # noqa: E402
-from s1_paper_trading_prepare.src.pit_signal_appender import PitSignalAppender  # noqa: E402
+from s1_paper_trading_prepare.src.pit_signal_appender import PitSignalAppender, sanitize_main_selected_for_production  # noqa: E402
 from s1_paper_trading_prepare.src.reverse_lowjump_main import build_current_main_intents  # noqa: E402
 
 
@@ -114,7 +114,7 @@ def main() -> int:
 
     if args.write_data_panels:
         write_csv(data_dir / "reverse_lowjump" / "product_month_opportunities.csv", opps)
-        write_csv(data_dir / "reverse_lowjump" / "product_side_opportunities.csv", selected)
+        write_csv(appender._panel_paths()["main_selected"], sanitize_main_selected_for_production(selected))
 
     summary = {
         "tag": args.tag,

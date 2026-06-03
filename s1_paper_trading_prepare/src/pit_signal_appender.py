@@ -43,6 +43,81 @@ FORBIDDEN_INPUT_TOKENS = (
     "forward_label",
 )
 
+PRODUCTION_MAIN_SELECTED_COLUMNS = [
+    "product_key",
+    "exchange",
+    "product",
+    "product_label",
+    "entry_date",
+    "prev_expiry",
+    "target_expiry",
+    "expiry_date",
+    "trade_date",
+    "contract_code",
+    "option_type",
+    "strike",
+    "dte",
+    "close",
+    "entry_price",
+    "volume",
+    "close_oi",
+    "implied_vol",
+    "delta",
+    "abs_delta",
+    "moneyness",
+    "spot_close",
+    "multiplier",
+    "premium_margin",
+    "one_contract_margin",
+    "one_lot_margin_cash",
+    "gross_premium_cash_1lot",
+    "put_iv_pressure",
+    "call_iv_pressure",
+    "put_candidate_count",
+    "call_candidate_count",
+    "sell_side",
+    "selected_side_iv_pressure",
+    "other_side_iv_pressure",
+    "side_iv_pressure_diff",
+    "hist_iv_days_756",
+    "hist_jump5pp_rate_756",
+    "hist_p95_abs_iv_chg_756",
+    "candidate_signal_days_252",
+    "candidate_pm_median_252",
+    "candidate_oi_median_252",
+    "rolling_cs_score",
+    "rolling_cs_rank",
+    "rolling_cs_count",
+    "option_side_oi",
+    "option_side_volume",
+    "option_side_count",
+    "option_side_iv",
+    "opt_side_oi_x63",
+    "opt_side_volume_x63",
+    "opt_side_oi_chg5",
+    "opt_side_volume_chg5",
+    "fut_oi",
+    "fut_oi_chg5",
+    "fut_oi_chg20",
+    "fut_volume_x63",
+    "fut_oi_x63",
+    "futures_flow_source_table",
+    "pit_low_jump_strict",
+    "rule_l1_hsafe_core",
+    "rule_l1_hsafe_addon025",
+    "side_rule",
+    "extra_contract_mode",
+    "target_premium_pct_override",
+    "l3eff015_tier",
+    "l4_diff02_weak_pressure",
+    "l4_diff02_delta_cap",
+    "l3_weak_pressure_threshold",
+    "l4_weak_pressure_threshold",
+    "group_margin_trigger_margin_pct",
+    "group_margin_trigger_budget_cash",
+    "capped_by_group_margin_trigger",
+]
+
 DEFAULT_MAIN_MIN_DTE = 15
 DEFAULT_MAIN_MAX_DTE = 90
 DEFAULT_LOWJUMP_LOOKBACK = 756
@@ -245,6 +320,21 @@ def _assert_no_forbidden_columns(frame: pd.DataFrame, source: str) -> None:
         raise ValueError(
             f"{source} contains research outcome/shadow columns that are forbidden in production signal generation: {bad[:20]}"
         )
+
+
+def sanitize_main_selected_for_production(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep only PIT fields needed by the live main-sleeve order builder."""
+    if frame.empty:
+        return frame.copy()
+    out = frame[[column for column in PRODUCTION_MAIN_SELECTED_COLUMNS if column in frame.columns]].copy()
+    if "entry_price" not in out.columns and "close" in out.columns:
+        out["entry_price"] = out["close"]
+    if "one_lot_margin_cash" not in out.columns and "one_contract_margin" in out.columns:
+        out["one_lot_margin_cash"] = out["one_contract_margin"]
+    if "product" not in out.columns and "product_label" in out.columns:
+        out["product"] = out["product_label"]
+    _assert_no_forbidden_columns(out, "main selected PIT source")
+    return out
 
 
 def apply_matured_history_guard(
@@ -610,7 +700,13 @@ class PitSignalAppender:
         date = str(signal_date)[:10]
         source_path = resolve_path(source_schedule, default=self.schedule_path)
         output_path = resolve_path(output_schedule, default=self.schedule_path)
-        schedule = _read_csv(source_path)
+        source_read_path = source_path
+        if not source_read_path.exists():
+            gold_value = self.config.get("validation_gold_signal_path")
+            gold_path = resolve_path(gold_value) if gold_value else None
+            if gold_path is not None and gold_path.exists():
+                source_read_path = gold_path
+        schedule = _read_csv(source_read_path)
         columns = _schedule_columns(schedule)
         snapshot = self._load_snapshot(date)
         if products:
@@ -621,7 +717,7 @@ class PitSignalAppender:
             "signal_date": date,
             "config_path": str(self.config_path),
             "config_sha256": self.config_snapshot.sha256,
-            "source_schedule": str(source_path),
+            "source_schedule": str(source_read_path),
             "output_schedule": str(output_path),
             "snapshot_rows": int(len(snapshot)),
             "shadow_input_policy": "blocked",
@@ -700,7 +796,7 @@ class PitSignalAppender:
             "main_opportunities": self.data_dir / "reverse_lowjump" / "product_month_opportunities.csv",
             "main_selected": resolve_path(
                 main_cfg.get("source_opportunity_file"),
-                default=self.data_dir / "reverse_lowjump" / "product_side_opportunities.csv",
+                default=self.data_dir / "reverse_lowjump" / "live_product_side_opportunities.csv",
             ),
             "overlay_atm": self.data_dir / "iv_pullback_overlay" / "atm_iv_percentile_panel.csv",
             "rr": self.data_dir / "risk_reversal_sidecar" / "risk_reversal_panel.csv",
@@ -712,6 +808,8 @@ class PitSignalAppender:
             panels = self._panel_cache
         else:
             panels = {name: _read_csv(path) for name, path in self._panel_paths().items()}
+        if "main_selected" in panels and not panels["main_selected"].empty:
+            _assert_no_forbidden_columns(panels["main_selected"], "main selected PIT source")
         diagnostics["panel_rows"] = {name: int(len(frame)) for name, frame in panels.items()}
         diagnostics["panels_loaded_from_existing_files"] = True
         return panels
@@ -744,6 +842,9 @@ class PitSignalAppender:
         panels["overlay_atm"] = self._refresh_overlay_atm_panel(date, snapshot)
         panels["rr"] = self._refresh_risk_reversal_panel(date, snapshot, panels["overlay_atm"])
         panels["term"] = self._refresh_term_structure_panel(date, snapshot, panels["pressure"])
+        panels["main_selected"] = _read_csv(self._panel_paths()["main_selected"])
+        if not panels["main_selected"].empty:
+            _assert_no_forbidden_columns(panels["main_selected"], "main selected PIT source")
         diagnostics["panel_rows"] = {name: int(len(frame)) for name, frame in panels.items()}
         flow_today = panels["flow"][panels["flow"].get("trade_date", pd.Series(dtype=object)).eq(date)] if not panels["flow"].empty else pd.DataFrame()
         diagnostics["futures_oi_available_for_l1"] = bool(

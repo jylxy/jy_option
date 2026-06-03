@@ -28,7 +28,7 @@
       "source": "Daily reverse-lowjump/high-IV-pressure signal builder",
       "config_gate_key": "s1_reverse_lowjump_enabled",
       "config_gate_expected": true,
-      "paper_path": "data/reverse_lowjump/product_side_opportunities.csv",
+      "paper_path": "data/reverse_lowjump/live_product_side_opportunities.csv",
       "paper_action": "Append T product-side opportunities and write approved external S1 sell intents from PIT panels only; do not consume shadow/path/label research fields."
     },
     {
@@ -172,8 +172,8 @@
       "source": "Approved S1 daily signal builder output",
       "config_gate_key": "s1_external_intent_minute_replay_enabled",
       "config_gate_expected": true,
-      "paper_path": "data/external_signals/s1_hsafe_addon025_sidecar1_t1lt95_20220104_20260331_20260603.csv",
-      "paper_action": "Clean S1-only handoff into order review and Toolkit minute replay. Generated schedules are local data artifacts."
+      "paper_path": "data/external_signals/live_current_open_signals.csv",
+      "paper_action": "Clean S1-only live handoff into order review and Toolkit minute replay. Historical parity uses validation_gold_signal_path; daily production must update the live schedule, not the frozen gold schedule."
     }
   ]
 }
